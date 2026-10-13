@@ -190,21 +190,43 @@ pub(crate) fn rewrite(
     // Reserve the space first (§19.8), so a full disk or a file-size limit refuses the rewrite
     // before any byte changes.
     reserve(&file, raw.len() as u64).map_err(io)?;
-    let written = (&file)
-        .seek(SeekFrom::Start(0))
-        .and_then(|_| (&file).write_all(&raw))
-        .and_then(|()| file.set_len(raw.len() as u64))
-        .and_then(|()| file.sync_all());
-    if let Err(e) = written {
-        // Put the old bytes back (they fit before) rather than leave a half-rewritten part.
-        let _ = (&file)
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| (&file).write_all(&old))
-            .and_then(|()| file.set_len(old.len() as u64))
-            .and_then(|()| file.sync_all());
-        return Err(io(e));
-    }
+    replace(path, &raw, &old, |bytes| put(&file, bytes))?;
     Ok(Some(true))
+}
+
+/// Make `bytes` the whole content of `file`, from offset 0, and sync it.
+fn put(file: &File, bytes: &[u8]) -> io::Result<()> {
+    let mut f = file;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync_all()
+}
+
+/// Put `new` in place of `old` with `put`. When that fails, put the old bytes back (they fit
+/// before) rather than leave a half-rewritten part; when that fails too, the part holds
+/// neither, and the error says so, as TSVZ.py's does ("the part is damaged").
+fn replace(
+    path: &Path,
+    new: &[u8],
+    old: &[u8],
+    mut put: impl FnMut(&[u8]) -> io::Result<()>,
+) -> Result<(), Error> {
+    let Err(e) = put(new) else {
+        return Ok(());
+    };
+    match put(old) {
+        Ok(()) => Err(Error::io(path, e)),
+        Err(again) => Err(Error::io(
+            path,
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{e}; putting its old bytes back failed too ({again}): the part is damaged"
+                ),
+            ),
+        )),
+    }
 }
 
 /// Reserve `len` bytes from the start of `file` before it is rewritten. A file system that
@@ -1098,5 +1120,36 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "mode {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn a_rewrite_whose_old_bytes_cannot_be_put_back_says_the_part_is_damaged() {
+        let p = Path::new("s.tsvz");
+        let full = || io::Error::new(io::ErrorKind::StorageFull, "no space left");
+        let mut calls = Vec::new();
+        replace(p, b"new", b"old", |b| {
+            calls.push(b.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, [b"new".to_vec()], "a rewrite that works writes once");
+        calls.clear();
+        let e = replace(p, b"new", b"old", |b| {
+            calls.push(b.to_vec());
+            if b == b"new" { Err(full()) } else { Ok(()) }
+        })
+        .unwrap_err();
+        assert_eq!(
+            calls,
+            [b"new".to_vec(), b"old".to_vec()],
+            "the old bytes go back"
+        );
+        assert!(!e.to_string().contains("damaged"), "{e}");
+        let e = replace(p, b"new", b"old", |_| Err(full())).unwrap_err();
+        let text = e.to_string();
+        assert!(
+            text.contains("s.tsvz") && text.contains("the part is damaged"),
+            "{text}"
+        );
     }
 }
