@@ -900,11 +900,17 @@ mod tests {
         assert_eq!(ask(&e, "len").lines, ["0"]);
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
         let r = ask(&e, "scrub");
-        assert_eq!(r.status, 1, "a multi-part store is refused: {r:?}");
+        assert_eq!(
+            r.status, 0,
+            "a snapshot of the parts before the active one: {r:?}"
+        );
         assert_eq!(ask(&e, "get\tb").lines, ["b\t2"]);
         let r = ask(&e, "parts");
-        assert_eq!(r.lines.len(), 2);
-        assert!(r.lines[1].ends_with("s.tsvz.1\tactive"), "{r:?}");
+        assert_eq!(r.lines.len(), 3);
+        assert!(r.lines[1].contains("s.tsvz.0\t"), "{r:?}");
+        assert!(r.lines[2].ends_with("s.tsvz.1\tactive"), "{r:?}");
+        let r = ask(&e, "scrub");
+        assert_eq!(r.status, 1, "no ordinal is free between .0 and .1: {r:?}");
     }
 
     #[test]
