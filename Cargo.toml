@@ -1,0 +1,40 @@
+[package]
+name = "tsvz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+description = "Fast tool and library for tsvz-spec-v1 key-value stores: append-only TSV/CSV/NSV/PSV logs"
+repository = "https://github.com/yufei-pan/tsvz-rs"
+authors = ["Yufei Pan <pan@zopyr.us>"]
+readme = "README.md"
+keywords = ["tsv", "key-value", "append-only", "log", "cli"]
+categories = ["command-line-utilities", "database", "parser-implementations"]
+
+[features]
+default = ["cli", "bzip2", "xz", "zstd"]
+cli = []
+bzip2 = ["dep:bzip2"]
+xz = ["dep:liblzma"]
+zstd = ["dep:zstd"]
+
+[dependencies]
+memchr = "2.8"
+hashbrown = "0.17"
+libc = "0.2"
+crc32fast = "1.5"
+crc32c = "0.6"
+sha2 = "0.11"
+blake3 = { version = "1.8", features = ["pure"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+bzip2 = { version = "0.6", optional = true }
+liblzma = { version = "0.4", features = ["static"], optional = true }
+zstd = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
