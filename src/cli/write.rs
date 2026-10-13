@@ -203,7 +203,10 @@ pub(crate) fn setdefault(ctx: &mut Ctx) -> Result<i32, Error> {
         values: values.clone(),
     }])?;
     let written = Cells::from_values(values.iter().map(|v| trim(v)));
-    let cells = Row::new(&written, &markers.defaults, markers.fill_empty).to_vec();
+    // The row a reader then returns: padded to the store's width, or, in a store with no data
+    // row yet, to the width this row sets (its own cells or the defaults, which Row covers).
+    let width = store.as_ref().map_or(0, |s| s.width());
+    let cells = Row::new(&written, &markers.defaults, markers.fill_empty, width).to_vec();
     print(ctx, &key, &cells)?;
     Ok(0)
 }

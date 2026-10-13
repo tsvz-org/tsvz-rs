@@ -291,7 +291,13 @@ mod tests {
         assert_eq!(f("notes.tsvz.txt"), None);
         assert_eq!(f("s.tsvz.damaged-20261012T101010"), None);
         assert_eq!(f("s.tsvz.damaged-20261012T101010.1"), None);
-        assert_eq!(f("s.tsvz.1f"), Some(Format { delimiter: b'\t', strict: true }));
+        assert_eq!(
+            f("s.tsvz.1f"),
+            Some(Format {
+                delimiter: b'\t',
+                strict: true
+            })
+        );
     }
 
     #[test]

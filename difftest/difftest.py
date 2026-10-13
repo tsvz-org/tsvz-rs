@@ -3,16 +3,21 @@
 
 Each seed builds a store from random lines (markers valid and invalid, tokens and bare `<`,
 CRLF, zero fill, invalid UTF-8, tombstones, empty keys, checksum segments right and wrong,
-a byte-order mark, a torn tail), split over one to three parts, some of them gzip parts with
-members cut short, corrupted or padded. Both tools then answer the same reads; rows are
-compared with trailing empty cells removed (§3.6 lets a reader pad), everything else exactly.
+a byte-order mark, a torn tail), split over one to three parts, some of them compressed
+(gzip, bzip2, xz, and zstd when this Python has it) with members cut short, corrupted or, for
+gzip, padded. Both tools then answer the same reads, compared byte for byte: tsvz-rs pads
+rows to the store's width as TSVZ.py does (§3.6 lets a reader pad). `read`, `verify` and
+`parts` are also run on a pseudo-terminal of fixed width, and their tables compared exactly
+(design section 7.3).
 
 usage: python3 difftest/difftest.py --rust target/release/tsvz [--tsvz ../TSVZ/TSVZ.py]
                                     [--seeds 0:200] [--keep DIR]
 Exit status: 0 when every seed agrees, 1 when one does not (its files are kept).
 """
 import argparse
+import bz2
 import gzip
+import lzma
 import os
 import random
 import shutil
@@ -20,6 +25,19 @@ import subprocess
 import sys
 import tempfile
 import zlib
+
+try:
+    from compression import zstd as _zstd  # Python 3.14+
+except ImportError:
+    _zstd = None
+
+CODECS = {
+    'gz': lambda data: gzip.compress(data, mtime=0),
+    'bz2': bz2.compress,
+    'xz': lzma.compress,
+}
+if _zstd is not None:
+    CODECS['zst'] = lambda data: _zstd.compress(data, options={_zstd.CompressionParameter.checksum_flag: 1})
 
 DELIMITERS = {'tsvz': '\t', 'csvz': ',', 'psvz': '|', 'nsvz': '\0'}
 TOKENS = ['<sep>', '<LF>', '<CR>', '<NUL>', '<lt>', '<#>', '<TAB>', '<', '<lf>']
@@ -90,11 +108,11 @@ def body(rng, d, n, checksums):
     return data
 
 
-def gzip_part(rng, data):
+def compressed_part(rng, data, suffix):
     cuts = sorted(rng.sample(range(len(data) + 1), min(2, len(data) + 1)))
     out, prev = b'', 0
     for cut in cuts + [len(data)]:
-        member = gzip.compress(data[prev:cut], mtime=0)
+        member = CODECS[suffix](data[prev:cut])
         prev = cut
         r = rng.random()
         if r < 0.1:
@@ -104,7 +122,7 @@ def gzip_part(rng, data):
             b[rng.randrange(len(b))] ^= 0xff  # corrupt
             member = bytes(b)
         out += member
-        if rng.random() < 0.1:
+        if suffix == 'gz' and rng.random() < 0.1:
             out += b'\0' * rng.randint(1, 20)  # padding
     return out
 
@@ -118,11 +136,45 @@ def make(rng, directory):
     names += ['s.%s.%s' % (ext, o) for o in rng.sample(['1', 'a', 'B', '10', '002', 'ff'], count)]
     for name in names[:count]:
         data = body(rng, d, rng.randint(0, 25), checksums=count == 1)
-        if rng.random() < 0.25:
-            name, data = name + '.gz', gzip_part(rng, data)
+        if rng.random() < 0.3:
+            suffix = rng.choice(sorted(CODECS))
+            name, data = name + '.' + suffix, compressed_part(rng, data, suffix)
         with open(os.path.join(directory, name), 'wb') as f:
             f.write(data)
     return store, d
+
+
+def ask_tty(command, store, op, columns=72):
+    """(exit status, output) of an operation whose stdout is a terminal `columns` wide: its table."""
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, columns, 0, 0))
+    proc = subprocess.Popen(command + ['-q', op[0], store] + op[1:], stdin=subprocess.DEVNULL, stdout=slave,
+                            stderr=subprocess.DEVNULL)
+    os.close(slave)
+    chunks = []
+    while True:
+        ready, _, _ = select.select([master], [], [], 60)
+        if not ready:
+            break
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(master)
+    try:
+        code = proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return ('timeout', b'')
+    return (code, b''.join(chunks).replace(b'\r\n', b'\n'))
 
 
 def ask(command, store, op):
@@ -146,11 +198,6 @@ def known(op, rs, py):
     return next((reason for reason, test in KNOWN if test(op, rs, py)), None)
 
 
-def rows(out, d):
-    """Records with trailing empty cells removed (§3.6)."""
-    return [line.rstrip(d.encode()) for line in out.split(b'\n')]
-
-
 def main():
     parser = argparse.ArgumentParser(description='Differential test of tsvz-rs against TSVZ.py.')
     here = os.path.dirname(os.path.abspath(__file__))
@@ -170,11 +217,14 @@ def main():
         rng = random.Random(seed)
         directory = tempfile.mkdtemp(prefix='seed%d-' % seed)
         try:
-            store, d = make(rng, directory)
+            store, _ = make(rng, directory)
             problems = []
-            for op in ops:
-                a, b = ask(rust, store, op), ask(python, store, op)
-                same = a[0] == b[0] and (rows(a[1], d) == rows(b[1], d) if op[0] in ('read', 'get') else a[1] == b[1])
+            for op in ops + [['table', 'read'], ['table', 'verify'], ['table', 'parts']]:
+                if op[0] == 'table':
+                    a, b = ask_tty(rust, store, op[1:]), ask_tty(python, store, op[1:])
+                else:
+                    a, b = ask(rust, store, op), ask(python, store, op)
+                same = a == b
                 if not same and known(op, a, b):
                     seen[known(op, a, b)] = seen.get(known(op, a, b), 0) + 1
                 elif not same:

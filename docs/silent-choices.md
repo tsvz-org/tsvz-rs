@@ -10,6 +10,8 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | xz parts | A member may be an `.xz` stream or a legacy `.lzma` stream (auto-detected) | `lzma.LZMADecompressor()` |
 | xz stream padding | Zero bytes after an xz stream are judged a member cut short (a warning; every line is read, under any policy) | `decompress_items` |
 | zstd skippable frames | Decoded as frames with no output | `ZstdDecompressor` |
+| A corrupt member's output (`recover`) | What its bytes decode, fed one at a time, before the byte that fails; what that byte decodes is dropped with it | `_decodeAlone` |
+| Row width | Rows, and a missing key's defaults, padded to the store's width (§3.6 lets a reader pad): the count of the defaults active at the first data row when there are any, else that row's written cells. A longer row keeps every cell | `_specPadRow` |
 | Appending after a torn tail | The uncommitted bytes after the last newline are cut first, with a warning, so the new record cannot join them | `_lockedAppend(…, 'truncate')` |
 | `scrub` markers | `#_version_#` written as `1`; then strip, fill-empty, return-defaults, rotate, write-ack, member-size and on-corruption when not default; `#_defaults_#` last | `_specPreamble` |
 | `scrub` rows | Fully resolved, padded with empty cells to the final defaults' width; the §19.4 compensating layout only when a row would not read back the same | `_specScrubCells`, `_specRoundTrips` |
@@ -25,7 +27,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | Long options | A unique prefix is accepted (`--delim`), as argparse did | `_cliParseArgs` |
 | `setdefault` with a marker key | Usage error (2), as §21.7.3 asks of a handler | `_ServeStore` |
 | Bulk input | Lines with an empty key are skipped (a reader would ignore them) | `_cliStdinBatch` |
-| Loose files | Design section 5.6's simple rule; TSVZ.py uses its 3.39 rules instead (§20.2.4 allows both) | — |
+| Loose files | Design section 5.6's simple rule; TSVZ.py uses its 3.39 rules instead (§20.2.4 allows both), which also cut a row longer than the first to its width | — |
 | `-V` | `tsvz-rs 0.1.0` | — |
 
 ## Where TSVZ.py departs from the spec

@@ -65,6 +65,27 @@ fn read_get_has_len_keys() {
 }
 
 #[test]
+fn rows_print_at_the_store_width() {
+    let d = store("a\t1\t2\t3\na\nb\tx\n");
+    assert_eq!(records(d.path(), &["read", "s.tsvz"]).1, "b\tx\t\t\n");
+    assert_eq!(
+        records(d.path(), &["get", "s.tsvz", "zz"]),
+        (3, "zz\t\t\t\n".into(), String::new())
+    );
+    assert_eq!(
+        records(d.path(), &["setdefault", "s.tsvz", "n", "v"]).1,
+        "n\tv\t\t\n"
+    );
+    assert_eq!(records(d.path(), &["pop", "s.tsvz", "b"]).1, "b\tx\t\t\n");
+    // A loose file pads the same way, and keeps the cells of a longer row.
+    fs::write(d.path().join("l.tsv"), "a\t1\t2\nb\tx\nc\tp\tq\tr\n").unwrap();
+    assert_eq!(
+        records(d.path(), &["read", "l.tsv"]).1,
+        "a\t1\t2\nb\tx\t\nc\tp\tq\tr\n"
+    );
+}
+
+#[test]
 fn verify_and_parts() {
     let d = store("#_checksum_crc32_#\na\tx\n#_checksum_crc32_#\tDEADBEEF\n");
     let (code, out, _) = records(d.path(), &["verify", "s.tsvz"]);
@@ -212,7 +233,11 @@ fn set_append_delete_write_records() {
         records(dir, &["set", "-v", "s.tsvz", "--", "carol", "-5"]).0,
         0
     );
-    assert_eq!(records(dir, &["get", "s.tsvz", "carol"]).1, "carol\t-5\n");
+    // Padded to the width of the first data row, `#k` (§3.6), as TSVZ.py pads it.
+    assert_eq!(
+        records(dir, &["get", "s.tsvz", "carol"]).1,
+        "carol\t-5\t\t\n"
+    );
 }
 
 #[test]

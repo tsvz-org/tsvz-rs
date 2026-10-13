@@ -165,6 +165,10 @@ pub struct Replay {
     pub damaged: bool,
     /// The first committed line of the first part, when it is a comment (§19.2.3c).
     pub header: Option<String>,
+    /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
+    /// set by the first data row, as TSVZ.py sets it, to the count of the defaults then active
+    /// when there are any, else to that row's written cells. None before any data row.
+    pub width: Option<usize>,
     first_line: bool,
     part: PathBuf,
     warn: Option<WarnFn>,
@@ -212,6 +216,7 @@ impl Replay {
             stopped: None,
             damaged: false,
             header: None,
+            width: None,
             first_line: false,
             part: PathBuf::new(),
             warn,
@@ -460,6 +465,7 @@ impl Replay {
             sink.delete(&key); // a tombstone (§7.6, §7.8)
             return;
         };
+        self.set_width(rest);
         let binding = self.binding();
         let mut cells = Cells::default();
         if sink.wants_cells(&key) {
@@ -471,6 +477,15 @@ impl Replay {
             }
         }
         sink.put(&key, cells, &binding);
+    }
+
+    /// Set the width at the first data row, whose value fields are `rest` (see `width`).
+    fn set_width(&mut self, rest: &str) {
+        if self.width.is_none() {
+            let written = memchr::memchr_iter(self.format.delimiter, rest.as_bytes()).count() + 1;
+            let defaults = self.markers.defaults.len();
+            self.width = Some(if defaults > 0 { defaults } else { written });
+        }
     }
 
     /// A loose file: lines split on the delimiter, no markers, escaping or stripping (§5.2).
@@ -489,6 +504,7 @@ impl Replay {
             sink.delete(key);
             return;
         };
+        self.set_width(rest);
         let binding = self.binding();
         let mut cells = Cells::default();
         if sink.wants_cells(key) {

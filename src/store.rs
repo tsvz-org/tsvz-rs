@@ -49,26 +49,37 @@ pub struct PartInfo {
     pub active: bool,
 }
 
-/// A live key's resolved row (§14.2, §14.3), or a missing key's defaults (§14.5).
+/// A live key's resolved row (§14.2, §14.3), or a missing key's defaults (§14.5), padded to
+/// the store's width as TSVZ.py pads it (§3.6): the count of the defaults active at the first
+/// data row when there were any, else that row's written cells. Cells past the written ones
+/// take the row's defaults, then the empty string; no cell is ever cut.
 #[derive(Clone, Copy)]
 pub struct Row<'a> {
     cells: &'a Cells,
     defaults: &'a [String],
     fill: bool,
+    width: usize,
 }
 
 impl<'a> Row<'a> {
-    /// A row resolved from `cells` under `defaults` and a fill-empty setting (§14.2, §14.3).
-    pub(crate) fn new(cells: &'a Cells, defaults: &'a [String], fill: bool) -> Row<'a> {
+    /// A row resolved from `cells` under `defaults` and a fill-empty setting (§14.2, §14.3),
+    /// padded to `width` value columns.
+    pub(crate) fn new(
+        cells: &'a Cells,
+        defaults: &'a [String],
+        fill: bool,
+        width: usize,
+    ) -> Row<'a> {
         Row {
             cells,
             defaults,
             fill,
+            width,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.cells.len().max(self.defaults.len())
+        self.cells.len().max(self.defaults.len()).max(self.width)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -110,12 +121,13 @@ struct Slot {
     binding: Arc<Binding>,
 }
 
-fn row_of(slot: &Slot) -> Row<'_> {
-    Row {
-        cells: &slot.cells,
-        defaults: &slot.binding.defaults,
-        fill: slot.binding.fill_empty,
-    }
+fn row_of(slot: &Slot, width: usize) -> Row<'_> {
+    Row::new(
+        &slot.cells,
+        &slot.binding.defaults,
+        slot.binding.fill_empty,
+        width,
+    )
 }
 
 /// Live rows in first-appearance order (§3.4): slots plus an index; freed slots are compacted.
@@ -419,7 +431,8 @@ impl Store {
 
     pub fn get(&self, key: &str) -> Option<Row<'_>> {
         let i = *self.table.index.get(key)?;
-        self.table.slots[i].as_ref().map(row_of)
+        let width = self.width();
+        self.table.slots[i].as_ref().map(|s| row_of(s, width))
     }
 
     /// What a read of a missing key returns (§14.5): the current defaults, or None (not-found).
@@ -427,20 +440,27 @@ impl Store {
         if self.format.strict && !self.replay.markers.return_missing {
             return None;
         }
-        Some(Row {
-            cells: &EMPTY_CELLS,
-            defaults: &self.replay.markers.defaults,
-            fill: false,
-        })
+        Some(Row::new(
+            &EMPTY_CELLS,
+            &self.replay.markers.defaults,
+            false,
+            self.width(),
+        ))
+    }
+
+    /// The width rows are padded to, in value columns: see [`Row`]. 0 before any data row.
+    pub fn width(&self) -> usize {
+        self.replay.width.unwrap_or(0)
     }
 
     /// Live keys and rows in first-appearance order (§3.4).
     pub fn iter(&self) -> impl Iterator<Item = (&str, Row<'_>)> {
+        let width = self.width();
         self.table
             .slots
             .iter()
             .flatten()
-            .map(|s| (&*s.key, row_of(s)))
+            .map(move |s| (&*s.key, row_of(s, width)))
     }
 
     pub fn first(&self) -> Option<(&str, Row<'_>)> {
@@ -448,13 +468,14 @@ impl Store {
     }
 
     pub fn last(&self) -> Option<(&str, Row<'_>)> {
+        let width = self.width();
         self.table
             .slots
             .iter()
             .rev()
             .flatten()
             .next()
-            .map(|s| (&*s.key, row_of(s)))
+            .map(|s| (&*s.key, row_of(s, width)))
     }
 
     pub fn stopped(&self) -> Option<&Damage> {
@@ -621,13 +642,52 @@ mod tests {
         let p = write(dir.path(), "s.tsvz", b"#_defaults_#\tguest\t0\nalice\tAlice\t30\nbob\tBob\ncarol\t\t25\n#_defaults_#\tnew\nbob\tBob\n");
         let s = Store::open(&p, Options::default()).unwrap();
         assert_eq!(s.get("carol").unwrap().to_vec(), v(&["", "25"]));
-        assert_eq!(s.get("bob").unwrap().to_vec(), v(&["Bob"]));
-        assert_eq!(s.missing().unwrap().to_vec(), v(&["new"]));
+        assert_eq!(s.get("bob").unwrap().to_vec(), v(&["Bob", ""]));
+        assert_eq!(s.missing().unwrap().to_vec(), v(&["new", ""]));
         assert!(s.get("dave").is_none());
         let q = write(dir.path(), "q.tsvz", b"#_fill_empty_with_default_#\ttrue\n#_defaults_#\td1\td2\na\t\tq\n#_return_defaults_when_missing_#\tfalse\n");
         let s = Store::open(&q, Options::default()).unwrap();
         assert_eq!(s.get("a").unwrap().to_vec(), v(&["d1", "q"]));
         assert!(s.missing().is_none());
+    }
+
+    #[test]
+    fn rows_pad_to_the_width_of_the_first_data_row() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first data row sets the width even when a tombstone later removes it.
+        let p = write(
+            dir.path(),
+            "s.tsvz",
+            b"z\n#_defaults_#\na\t1\t2\t3\na\nb\tx\nc\tp\tq\tr\ts\n",
+        );
+        let s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(s.get("b").unwrap().to_vec(), v(&["x", "", ""]));
+        assert_eq!(s.get("b").unwrap().written(), 1);
+        assert_eq!(s.get("c").unwrap().to_vec(), v(&["p", "q", "r", "s"]));
+        assert_eq!(s.missing().unwrap().to_vec(), v(&["", "", ""]));
+        // With defaults active at the first data row, their count is the width.
+        let q = write(
+            dir.path(),
+            "q.tsvz",
+            b"#_defaults_#\td1\nk\tv\tw\tz\n#_defaults_#\nm\tq\n",
+        );
+        let s = Store::open(&q, Options::default()).unwrap();
+        assert_eq!(s.get("m").unwrap().to_vec(), v(&["q"]));
+        assert_eq!(s.missing().unwrap().to_vec(), v(&[""]));
+        // An empty defaults field still counts, and padding takes the defaults bound to the row.
+        let e = write(
+            dir.path(),
+            "e.tsvz",
+            b"#_defaults_#\t\t\nk\tv\n#_defaults_#\tn1\nm\tq\n",
+        );
+        let s = Store::open(&e, Options::default()).unwrap();
+        assert_eq!(s.get("k").unwrap().to_vec(), v(&["v", ""]));
+        assert_eq!(s.get("m").unwrap().to_vec(), v(&["q", ""]));
+        assert_eq!(s.missing().unwrap().to_vec(), v(&["n1", ""]));
+        // No data row: no width, so a missing key is its defaults alone.
+        let n = write(dir.path(), "n.tsvz", b"#_defaults_#\td\n");
+        let s = Store::open(&n, Options::default()).unwrap();
+        assert_eq!(s.missing().unwrap().to_vec(), v(&["d"]));
     }
 
     #[test]
@@ -708,7 +768,7 @@ mod tests {
         assert_eq!(some.len(), 1);
         assert_eq!(
             some.get(some.lookup_key("b \t")).unwrap().to_vec(),
-            v(&["z"])
+            v(&["z", ""])
         );
     }
 
