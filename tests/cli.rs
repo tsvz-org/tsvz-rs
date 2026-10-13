@@ -234,3 +234,36 @@ fn table_format_on_request() {
     let (_, empty, _) = run_in(d.path(), &["--format", "table", "verify", "s.tsvz"], b"");
     assert_eq!(empty, "");
 }
+
+#[test]
+fn loose_files_by_the_simple_rule() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("s.csv"), "#name,age\nalice,30\nbob,40\nbob\ncarol,<lt>\n").unwrap();
+    assert_eq!(records(dir, &["read", "s.csv"]).1, "alice,30\ncarol,<lt>\n");
+    let (code, _, err) = records(dir, &["set", "s.csv", "dave", "a,b"]);
+    assert!(code == 1 && err.contains("loose file"), "{err}");
+    assert_eq!(records(dir, &["set", "s.csv", "dave", "41"]).0, 0);
+    assert_eq!(records(dir, &["verify", "s.csv"]), (0, String::new(), String::new()));
+    assert_eq!(records(dir, &["parts", "s.csv"]).1, "0\t\ts.csv\tactive\n");
+    assert_eq!(records(dir, &["scrub", "s.csv"]).0, 0);
+    assert_eq!(file(dir, "s.csv"), "#name,age\nalice,30\ncarol,<lt>\ndave,41\n");
+    assert_eq!(records(dir, &["clear", "s.csv"]).0, 0);
+    assert_eq!(file(dir, "s.csv"), "#name,age\n");
+}
+
+#[test]
+fn the_delimiter_option() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("t.tsv"), "k;v\n").unwrap();
+    assert_eq!(records(dir, &["-d", ";", "get", "t.tsv", "k"]).1, "k;v\n");
+    assert_eq!(records(dir, &["-d", ";", "set", "t.tsv", "j", "w\tx"]).0, 0);
+    assert_eq!(file(dir, "t.tsv"), "k;v\nj;w\tx\n");
+    fs::write(dir.join("s.tsvz"), "k\tv\n").unwrap();
+    let (code, out, err) = records(dir, &["-d", ";", "get", "s.tsvz", "k"]);
+    assert_eq!((code, out.as_str()), (0, "k\tv\n"));
+    assert!(err.contains("-d ignored"), "{err}");
+    let (_, _, quiet) = records(dir, &["-q", "-d", ";", "get", "s.tsvz", "k"]);
+    assert_eq!(quiet, "");
+}
