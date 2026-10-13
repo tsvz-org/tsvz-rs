@@ -12,7 +12,7 @@ use crate::frame::Framer;
 use crate::name::Format;
 use crate::replay::{Cells, Markers};
 use crate::store::Row;
-use crate::write::{Record, encode_record, tombstones};
+use crate::write::{Record, encode_record, name_key, strippable, tombstones};
 use crate::{Error, Store, WarnFn, Warning, parts};
 
 /// Where an operation's output goes: the command line's records or table, or the lines of a
@@ -83,12 +83,12 @@ pub fn get(store: &Store, keys: &[String], out: &mut impl Out) -> Result<i32, Er
     let mut missing = false;
     for requested in keys {
         let key = store.lookup_key(requested);
-        match store.get(key) {
-            Some(row) => out.row(key, row.cells())?,
+        match store.get(&key) {
+            Some(row) => out.row(&key, row.cells())?,
             None => {
                 missing = true;
                 if let Some(row) = store.missing() {
-                    out.row(key, row.cells())?;
+                    out.row(&key, row.cells())?;
                 }
             }
         }
@@ -98,7 +98,7 @@ pub fn get(store: &Store, keys: &[String], out: &mut impl Out) -> Result<i32, Er
 
 /// `has KEY`: 0 when KEY is live, 3 when not.
 pub fn has(store: &Store, key: &str) -> i32 {
-    let live = store.get(store.lookup_key(key)).is_some();
+    let live = store.get(&store.lookup_key(key)).is_some();
     status(store, if live { 0 } else { 3 })
 }
 
@@ -194,8 +194,8 @@ pub fn pop(store: &Store, requested: &str) -> Plan {
         return Plan::Exit(1);
     }
     let key = store.lookup_key(requested);
-    match store.get(key) {
-        Some(row) => take(store, key, row.to_vec()),
+    match store.get(&key) {
+        Some(row) => take(store, &key, row.to_vec()),
         None => Plan::Exit(3),
     }
 }
@@ -233,7 +233,10 @@ pub fn setdefault(
             s.to_string()
         }
     };
-    let key = trim(requested);
+    let key = match store {
+        Some(s) => s.lookup_key(requested).into_owned(),
+        None => name_key(requested, format.delimiter, strip, |_| false).into_owned(),
+    };
     if let Some(row) = store.and_then(|s| s.get(&key)) {
         let cells = row.to_vec();
         return Plan::Show { key, cells };
@@ -250,6 +253,56 @@ pub fn setdefault(
         },
         member_size: markers.member_size,
     }
+}
+
+/// Whether naming the keys of a `delete` needs the store (§20.2.7): a data key that a reader
+/// would strip names a key that depends on what is live.
+pub fn delete_needs_store(records: &[Record], delimiter: u8) -> bool {
+    records
+        .iter()
+        .any(|r| matches!(r, Record::Tombstone { key } if strippable(key, delimiter)))
+}
+
+/// The batch `delete` appends for `records` (tombstones and marker resets, §20.2, §20.3). Every
+/// key names a key of the store as it was before the batch (§20.2.7): one whose final stripping
+/// was `strip` and whose live keys `live` tells. A tombstone a reader would strip is written
+/// with stripping off around it (§9.6); a reset of `#_strip_trailing_whites_#` in the batch
+/// turns stripping back on (§10.3, §12.1).
+pub fn delete_records(
+    records: &[Record],
+    delimiter: u8,
+    strip: bool,
+    live: impl Fn(&str) -> bool,
+) -> Vec<Record> {
+    let set_strip = |value: &str| Record::Marker {
+        key: "#_strip_trailing_whites_#".into(),
+        values: vec![value.into()],
+    };
+    let mut batch = Vec::with_capacity(records.len() + 2);
+    let mut stripping = strip;
+    let mut guarded = false;
+    for record in records {
+        let Record::Tombstone { key } = record else {
+            if let Record::Marker { key, values } = record {
+                if values.is_empty() && key.eq_ignore_ascii_case("#_strip_trailing_whites_#") {
+                    stripping = true;
+                    guarded = false;
+                }
+            }
+            batch.push(record.clone());
+            continue;
+        };
+        let key = name_key(key, delimiter, strip, &live).into_owned();
+        if stripping && !guarded && strippable(&key, delimiter) {
+            batch.push(set_strip("false"));
+            guarded = true;
+        }
+        batch.push(Record::Tombstone { key });
+    }
+    if guarded {
+        batch.push(set_strip("true"));
+    }
+    batch
 }
 
 /// Records read from bulk input in `format` (§20.3.1, §21.7.2): a line is a record; a marker
@@ -573,6 +626,50 @@ mod tests {
             setdefault(Some(&stopped), TSVZ, "n", &strings(&["v"])),
             Plan::Exit(1)
         ));
+    }
+
+    fn tomb(k: &str) -> Record {
+        Record::Tombstone { key: k.into() }
+    }
+
+    fn strip(value: Option<&str>) -> Record {
+        Record::Marker {
+            key: "#_strip_trailing_whites_#".into(),
+            values: value.map(|v| vec![v.to_string()]).unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn delete_names_its_keys_against_the_store_before_it() {
+        let live = |k: &str| k == "k " || k == "k";
+        let d = b'\t';
+        assert!(!delete_needs_store(&[tomb("k"), strip(None)], d));
+        assert!(delete_needs_store(&[tomb("k ")], d));
+        // Both k<space> and k live, stripping on: each KEY names its own key, guarded (§9.6).
+        assert_eq!(
+            delete_records(&[tomb("k "), tomb("k "), tomb("k")], d, true, live),
+            [
+                strip(Some("false")),
+                tomb("k "),
+                tomb("k "),
+                tomb("k"),
+                strip(Some("true"))
+            ]
+        );
+        // A key that is not live names what a reader resolves it to: no guard is needed.
+        assert_eq!(delete_records(&[tomb("x ")], d, true, live), [tomb("x")]);
+        // Stripping off before the batch: KEYs name themselves; a reset inside the batch turns
+        // stripping back on, so a later tombstone that needs it is guarded.
+        assert_eq!(
+            delete_records(&[tomb("k "), strip(None), tomb("k ")], d, false, live),
+            [
+                tomb("k "),
+                strip(None),
+                strip(Some("false")),
+                tomb("k "),
+                strip(Some("true"))
+            ]
+        );
     }
 
     #[test]

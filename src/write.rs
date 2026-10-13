@@ -1,5 +1,6 @@
 //! Appending records (§13.3, §16.4, §16.7, §17.7, §18.2).
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
@@ -71,11 +72,7 @@ pub fn tombstones<'k>(
         .into_iter()
         .map(|k| Record::Tombstone { key: k.to_string() })
         .collect();
-    let exposed = |r: &Record| {
-        matches!(r, Record::Tombstone { key }
-            if key.ends_with([' ', '\t'])
-                && escape::encode(key, delimiter, true).ends_with([' ', '\t']))
-    };
+    let exposed = |r: &Record| matches!(r, Record::Tombstone { key } if strippable(key, delimiter));
     if strip && records.iter().any(exposed) {
         let set = |value: &str| Record::Marker {
             key: "#_strip_trailing_whites_#".into(),
@@ -85,6 +82,40 @@ pub fn tombstones<'k>(
         records.push(set("true"));
     }
     records
+}
+
+/// Whether a reader that strips (§7.7) would change `key` in a store with this `delimiter`:
+/// its encoded form (§13) ends in a space or tab.
+pub fn strippable(key: &str, delimiter: u8) -> bool {
+    key.ends_with([' ', '\t']) && escape::encode(key, delimiter, true).ends_with([' ', '\t'])
+}
+
+/// What a reader that strips resolves `key` to (§7.7): the key without the trailing spaces and
+/// tabs of its encoded form.
+pub fn resolve(key: &str, delimiter: u8) -> Cow<'_, str> {
+    if !strippable(key, delimiter) {
+        return Cow::Borrowed(key);
+    }
+    let encoded = escape::encode(key, delimiter, true);
+    let trimmed = encoded.trim_end_matches([' ', '\t']);
+    Cow::Owned(escape::decode(trimmed, delimiter).into_owned())
+}
+
+/// The key a requested `key` names (§20.2.7) in a strict store whose final stripping is
+/// `strip` and whose live keys `live` tells: while stripping is on, a key a reader would strip
+/// names the live key equal to it if there is one, else what a reader resolves it to; while it
+/// is off, a key names itself.
+pub fn name_key<'k>(
+    key: &'k str,
+    delimiter: u8,
+    strip: bool,
+    live: impl Fn(&str) -> bool,
+) -> Cow<'k, str> {
+    if !strip || live(key) {
+        Cow::Borrowed(key)
+    } else {
+        resolve(key, delimiter)
+    }
 }
 
 /// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file has no
@@ -502,5 +533,31 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
+    }
+
+    #[test]
+    fn a_key_names_itself_unless_a_reader_would_strip_it() {
+        let live = |k: &str| k == "k ";
+        assert!(strippable("k ", b'\t') && strippable("k\t", b','));
+        assert!(!strippable("k\t", b'\t'), "written k<sep>");
+        assert!(!strippable("k", b'\t'));
+        assert_eq!(resolve("#k \t ", b','), "#k");
+        assert_eq!(
+            resolve("k\t ", b'\t'),
+            "k\t",
+            "only the encoded form's white space"
+        );
+        assert_eq!(
+            name_key("k ", b'\t', true, live),
+            "k ",
+            "the live key equal to it"
+        );
+        assert_eq!(name_key("x  ", b'\t', true, live), "x");
+        assert_eq!(
+            name_key("x  ", b'\t', false, live),
+            "x  ",
+            "stripping is off"
+        );
+        assert_eq!(name_key("k\t", b'\t', true, live), "k\t");
     }
 }

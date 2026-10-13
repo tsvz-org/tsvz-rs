@@ -706,3 +706,50 @@ fn an_unreadable_part_exits_1_naming_it() {
         "{err}"
     );
 }
+
+#[test]
+fn a_key_ending_in_white_space_names_the_live_key_equal_to_it() {
+    // §20.2.7: k<space> was written while stripping was off; stripping is on at the end.
+    let both = "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n";
+    let d = store(both);
+    assert_eq!(records(d.path(), &["get", "s.tsvz", "k "]).1, "k \tv1\n");
+    assert_eq!(records(d.path(), &["get", "s.tsvz", "k"]).1, "k\tv2\n");
+    assert_eq!(
+        records(d.path(), &["setdefault", "s.tsvz", "k ", "z"]).1,
+        "k \tv1\n"
+    );
+    assert_eq!(records(d.path(), &["pop", "s.tsvz", "k "]).1, "k \tv1\n");
+    assert_eq!(records(d.path(), &["read", "s.tsvz"]).1, "k\tv2\n");
+    let d = store(both);
+    assert_eq!(records(d.path(), &["delete", "s.tsvz", "k ", "k "]).0, 0);
+    assert_eq!(records(d.path(), &["read", "s.tsvz"]).1, "k\tv2\n");
+    let d = store(both);
+    let keys = records(d.path(), &["keys", "s.tsvz"]).1;
+    assert_eq!(keys, "k \nk\n");
+    assert_eq!(
+        run_in(d.path(), &["delete", "s.tsvz", "-"], keys.as_bytes()).0,
+        0
+    );
+    assert_eq!(records(d.path(), &["len", "s.tsvz"]).1, "0\n");
+    let d = store("k\tplain\nk<sep>\ttab\n");
+    assert_eq!(
+        records(d.path(), &["get", "s.tsvz", "k\t"]).1,
+        "k<sep>\ttab\n"
+    );
+    assert_eq!(records(d.path(), &["delete", "s.tsvz", "k\t"]).0, 0);
+    assert_eq!(records(d.path(), &["read", "s.tsvz"]).1, "k\tplain\n");
+}
+
+#[test]
+fn a_delete_that_must_read_the_store_writes_nothing_when_it_cannot() {
+    let content = "#_on_corruption_#\tstop\nk\t1\n\0\0c\t3\n";
+    let d = store(content);
+    let (code, out, err) = records(d.path(), &["delete", "s.tsvz", "k "]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert_eq!(file(d.path(), "s.tsvz"), content);
+    assert_eq!(
+        records(d.path(), &["delete", "s.tsvz", "k"]).0,
+        0,
+        "k names itself: no read"
+    );
+}

@@ -34,8 +34,10 @@ pub(crate) fn set(ctx: &mut Ctx) -> Result<i32, Error> {
 }
 
 /// `delete` (§20.2): one tombstone per key (a marker key is reset), or the keys on standard input.
+/// A key that a reader would strip names a key of the store (§20.2.7), so the store is read
+/// first; when it cannot be read whole, nothing is written and the exit status is 1.
 pub(crate) fn delete(ctx: &mut Ctx) -> Result<i32, Error> {
-    let records = if ctx.args.args == ["-"] {
+    let mut records = if ctx.args.args == ["-"] {
         bulk(ctx, true)?
     } else {
         ctx.args
@@ -44,6 +46,25 @@ pub(crate) fn delete(ctx: &mut Ctx) -> Result<i32, Error> {
             .map(|k| Record::from_args(k, &[]))
             .collect()
     };
+    let d = ctx.format.delimiter;
+    if ctx.format.strict && ops::delete_needs_store(&records, d) {
+        records = match ctx.open(Scope::KeysOnly, false) {
+            Ok(store) if store.incomplete() => {
+                diag!(
+                    "tsvz: {}: could not read every part of the store; nothing was written",
+                    ctx.store.display()
+                );
+                return Ok(1);
+            }
+            Ok(store) => {
+                let strip = store.markers().strip;
+                ops::delete_records(&records, d, strip, |k| store.get(k).is_some())
+            }
+            // A store delete creates starts with stripping on (§10.3).
+            Err(Error::Missing(_)) => ops::delete_records(&records, d, true, |_| false),
+            Err(e) => return Err(e),
+        };
+    }
     writer(ctx, None)?.append(&records)?;
     ctx.info(&format!("appended {} tombstones", records.len()));
     Ok(0)

@@ -1,5 +1,6 @@
 //! A store: the ordered map of live rows after replaying its parts (§3, §14, §17).
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -145,11 +146,20 @@ struct Table {
 }
 
 impl Table {
-    fn new(scope: &Scope) -> Table {
+    /// A table for `scope`; under `Scope::Keys` it keeps each requested key and, for a strict
+    /// store, the key a reader resolves it to (§20.2.7).
+    fn new(scope: &Scope, format: Format) -> Table {
         let wanted = match scope {
             Scope::Keys(keys) => Some(
                 keys.iter()
-                    .flat_map(|k| [k.clone(), k.trim_end_matches([' ', '\t']).to_string()])
+                    .flat_map(|k| {
+                        let resolved = if format.strict {
+                            crate::write::resolve(k, format.delimiter).into_owned()
+                        } else {
+                            k.clone()
+                        };
+                        [k.clone(), resolved]
+                    })
                     .collect(),
             ),
             _ => None,
@@ -300,7 +310,7 @@ impl Store {
         }
         let mut store = Store {
             replay: Replay::new(format, options.verify, options.warnings.clone()),
-            table: Table::new(&options.scope),
+            table: Table::new(&options.scope, format),
             path,
             format,
             options,
@@ -476,14 +486,14 @@ impl Store {
         &self.replay.markers
     }
 
-    /// A requested key as §7.7 resolves a key: trailing space and tab removed while the final
-    /// stripping is on (§20.2 `get`).
-    pub fn lookup_key<'k>(&self, requested: &'k str) -> &'k str {
-        if self.format.strict && self.replay.markers.strip {
-            requested.trim_end_matches([' ', '\t'])
-        } else {
-            requested
-        }
+    /// The key a requested KEY names (§20.2.7): while the final stripping is on, a key a reader
+    /// would strip names the live key equal to it, else what a reader resolves it to (§7.7).
+    /// A loose file's keys name themselves.
+    pub fn lookup_key<'k>(&self, requested: &'k str) -> Cow<'k, str> {
+        let strip = self.format.strict && self.replay.markers.strip;
+        crate::write::name_key(requested, self.format.delimiter, strip, |k| {
+            self.table.index.contains_key(k)
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<Row<'_>> {
@@ -774,7 +784,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, false), (1, false), (2, true)]
         );
-        assert_eq!(s.lookup_key("k \t"), "k");
+        assert_eq!(s.lookup_key("k  "), "k");
+        assert_eq!(
+            s.lookup_key("k \t"),
+            "k \t",
+            "a tab written <sep> is not stripped (§20.2.7)"
+        );
     }
 
     #[test]
@@ -829,14 +844,14 @@ mod tests {
         let some = Store::open(
             &p,
             Options {
-                scope: Scope::Keys(vec!["b \t".into(), "zz".into()]),
+                scope: Scope::Keys(vec!["b  ".into(), "zz".into()]),
                 ..Options::default()
             },
         )
         .unwrap();
         assert_eq!(some.len(), 1);
         assert_eq!(
-            some.get(some.lookup_key("b \t")).unwrap().to_vec(),
+            some.get(&some.lookup_key("b  ")).unwrap().to_vec(),
             v(&["z", ""])
         );
     }
@@ -1103,6 +1118,49 @@ mod tests {
         assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
         assert_eq!(keys(&s), vec!["a"]);
         assert!(s.stopped().is_some());
+    }
+
+    #[test]
+    fn a_requested_key_names_a_key_of_the_store() {
+        // §20.2.7: k<space> was written while stripping was off; stripping is on at the end.
+        let dir = tempfile::tempdir().unwrap();
+        let both = b"#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\nt<sep>\tw\n";
+        let p = write(dir.path(), "s.tsvz", both);
+        for scope in [
+            Scope::All,
+            Scope::KeysOnly,
+            Scope::Keys(vec!["k ".into(), "t\t ".into()]),
+        ] {
+            let s = Store::open(
+                &p,
+                Options {
+                    scope: scope.clone(),
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(s.lookup_key("k "), "k ", "{scope:?}");
+            assert_eq!(s.lookup_key("k"), "k");
+            assert_eq!(s.lookup_key("t\t "), "t\t", "{scope:?}");
+            assert!(s.get(&s.lookup_key("t\t ")).is_some(), "{scope:?}");
+        }
+        let s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(
+            s.lookup_key("k  "),
+            "k",
+            "no key k<space><space>: what a reader resolves"
+        );
+        let off = write(
+            dir.path(),
+            "o.tsvz",
+            b"#_strip_trailing_whites_#\tfalse\nk\tv\n",
+        );
+        let s = Store::open(&off, Options::default()).unwrap();
+        assert_eq!(
+            s.lookup_key("k "),
+            "k ",
+            "stripping is off: a key names itself"
+        );
     }
 
     #[test]
