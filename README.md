@@ -25,9 +25,28 @@ tsvz verify people.tsvz
 tsvz --help
 ```
 
-Every operation of §20 is supported except `serve` and `stop`; the handler (§21) comes in a
-later release. Stores may be compressed (gzip, bzip2, xz, zstd) and split into parts; all four
-digests (crc32, crc32c, sha256, blake3) are verified.
+Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz, zstd) and split
+into parts; all four digests (crc32, crc32c, sha256, blake3) are verified.
+
+## Handler
+
+`tsvz serve STORE` runs a write handler (§21) in the foreground: one process keeps the store
+loaded and appends every write, so that many producers share one appender. While it runs, every
+`tsvz` command on that store goes through it and prints what it would print on the files;
+`--x-direct` works on the files instead. `tsvz stop STORE` (or Ctrl-C, SIGTERM, SIGHUP) makes
+every acknowledged write durable and stops it.
+
+```bash
+tsvz serve people.tsvz &              # --x-idle-timeout 600 stops it after 10 idle minutes
+tsvz set people.tsvz bob Bob 41       # through the handler
+tsvz -v get people.tsvz bob           # -v names the handler it used
+tsvz stop people.tsvz
+```
+
+The handler and TSVZ.py's (`tsvz serve`, `TSVZClient`) speak the same protocol: either tool's
+commands go through either tool's handler. It serves strict stores (`.tsvz .csvz .nsvz .psvz`).
+Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode M` sets the
+socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`.
 
 ## Library
 
@@ -53,8 +72,9 @@ Build without the command line and C libraries with
 
 ## Conformance and compatibility
 
-tsvz-rs passes the reader, writer and cli classes of the TSVZ conformance suite with every
-codec and digest claimed, and is checked against TSVZ.py on random stores. Rust and Python
+tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
+every codec and digest claimed, and is checked against TSVZ.py on random stores, with and
+without its handler. Rust and Python
 writers can share a store: they take the same file locks. Where the specification leaves a
 choice open, tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md)
 lists those choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).

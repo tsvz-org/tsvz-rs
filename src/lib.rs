@@ -5,8 +5,10 @@
 //! ## API
 //!
 //! The library's interface is what these docs show: [`Store`] to read, [`Writer`] and
-//! [`Record`] to append, [`maint`] to clear and scrub, and the types they use. The modules
-//! hidden from these docs (codecs, framing, replay, file names, locks, the command line) are
+//! [`Record`] to append, [`maint`] to clear and scrub, [`handler::Client`] to talk to a
+//! store's handler (§21), and the types they use. The modules
+//! hidden from these docs (codecs, framing, replay, file names, locks, operations, the
+//! handler's engine, protocol and server, the command line) are
 //! internals shared with the `tsvz` binary, the tests and the fuzz targets; they may change in
 //! any release.
 

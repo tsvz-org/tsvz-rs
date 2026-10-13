@@ -27,6 +27,20 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | Long options | A unique prefix is accepted (`--delim`), as argparse did | `_cliParseArgs` |
 | `setdefault` with a marker key | Usage error (2), as §21.7.3 asks of a handler | `_ServeStore` |
 | Bulk input | Lines with an empty key are skipped (a reader would ignore them) | `_cliStdinBatch` |
+| A part that cannot be read | Skipped with a warning: reads print what was read and exit 1 (§21.8.5 for a handler, and the same on the files so that routing changes nothing); `pop`, `popitem`, `setdefault`, `clear`, `scrub` and a `delete` that must name a key (§20.2.7) change nothing | `_specLoad` (`'unreadable'`) |
+| `--x-written` | A handler accepts it: the write is answered once written, and a failed write answers status 1. A routed `set`, `append` or `delete` sends it, so that a failed write exits 1 as on the files; so does every write of `handler::Client` | `_serveDispatch`, `_cliRouted`, `TSVZClient` |
+| Routed operations | Every operation but `serve`, `stop`, `verify` and `parts` (which read the files themselves) | `_cliHandler` |
+| A routed operation whose handler goes away | `read`, `get`, `has`, `len`, `keys` warn and run on the files; any other exits 1, saying it may or may not have been applied | `_cliRouted` |
+| Handler statuses | A reading operation on a missing store: 1, "no such store"; a read that skipped a part or stopped: 1, "could not read every part of the store", with what was read | `_serveDispatch` |
+| `pop`, `popitem`, `setdefault` through a handler | Answered once their write is made; a failed write answers 1 and no row | `_ServeStore.pop` |
+| Writes that fail after they were acknowledged | Reported on `serve`'s standard error; every response carries a `#!` warning until a batch is written again | `_ServeWriter`, `_serveRespond` |
+| The handler's socket | A new `tsvz-XXXXXX` directory under `$XDG_RUNTIME_DIR` when it is writable and access is private, else the temporary directory; socket 0600, 0660 with `--x-group`, or `--x-mode`; the directory 0700 plus search bits for whom the socket admits | `_ServeHandle.start` |
+| The pointer file | Created 0600, published 0644; one that is incomplete is read again after 50 ms; one with another first line, or no `address` or `host`, means no handler, without a warning | `_ServeHandle.lock`, `_serveLookup` |
+| Request line limit | 64 MiB; a longer line closes the connection | `_SERVE_LINE_LIMIT` |
+| `stop STORE` | After `#0`, waits up to 10 s until the pointer file no longer names that handler | `_cliStop` |
+| `serve` options | `--x-idle-timeout S`, `--x-group G`, `--x-mode M`, and `--x-direct` for any command, spelled as TSVZ.py spells them | `_CLI_OPTIONS` |
+| `-v` with a handler | A routed command names the handler it used; `serve -v` reports each request's status | — |
+| Strict stores only (departs from TSVZ.py) | `serve` refuses a loose file and the CLI never forwards one: tsvz-rs and TSVZ.py read loose files by different rules, so a forwarded command could print what the other tool's files would not | — |
 | Loose files | Design section 5.6's simple rule; TSVZ.py uses its 3.39 rules instead (§20.2.4 allows both), which also cut a row longer than the first to its width | — |
 | `-V` | `tsvz-rs 0.1.0` | — |
 

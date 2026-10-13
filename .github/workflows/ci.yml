@@ -31,5 +31,6 @@ jobs:
           TSVZ_PY: ${{ github.workspace }}/TSVZ/TSVZ.py
           TSVZ_REQUIRE_INTEROP: "1"
       - run: cargo build --release
-      - run: python3 TSVZ/tsvzconform.py --impl target/release/tsvz --class reader,writer,cli --feature bzip2,xz,zstd,crc32,crc32c,sha256,blake3,file-first
+      - run: python3 TSVZ/tsvzconform.py --impl target/release/tsvz --class reader,writer,cli,handler --feature bzip2,xz,zstd,crc32,crc32c,sha256,blake3,file-first,handler
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:200
+      - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:100 --handler
