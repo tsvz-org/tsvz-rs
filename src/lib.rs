@@ -2,6 +2,7 @@
 //! TSV, CSV, NSV and PSV files (see `tsvz-spec-v1.md` in the TSVZ repository).
 
 mod error;
+pub mod escape;
 pub mod name;
 
 pub use error::{Error, WarnFn, Warning};
