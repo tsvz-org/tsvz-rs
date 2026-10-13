@@ -202,7 +202,8 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             "quiet" => a.quiet = true,
             "verbose" => a.verbose = true,
             "direct" => a.direct = true,
-            "idle" => a.idle_timeout = Some(parse_idle(&value)?),
+            // 0 means no timeout, as in TSVZ.py.
+            "idle" => a.idle_timeout = Some(parse_idle(&value)?).filter(|d| !d.is_zero()),
             "group" => a.group = Some(parse_group(&value)?),
             "mode" => a.mode = Some(parse_mode(&value)?),
             _ => delimiter = Some(value),
@@ -350,6 +351,20 @@ mod tests {
             let err = p(args).unwrap_err();
             assert!(err.contains(want), "{args:?}: {err}");
         }
+    }
+
+    #[test]
+    fn an_idle_timeout_of_zero_means_none() {
+        // As in TSVZ.py: 0 (or nothing) keeps the handler serving.
+        assert_eq!(
+            run(&["serve", "s.tsvz", "--x-idle-timeout", "0"]).idle_timeout,
+            None
+        );
+        assert_eq!(
+            run(&["serve", "s.tsvz", "--x-idle-timeout", "1.5"]).idle_timeout,
+            Some(Duration::from_millis(1500))
+        );
+        assert!(p(&["serve", "s.tsvz", "--x-idle-timeout", "-1"]).is_err());
     }
 
     #[test]
