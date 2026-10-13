@@ -30,6 +30,7 @@ core design's. "TSVZ.py" is the Python reference implementation in
 | Interoperability | Both ways with TSVZ.py: its CLI and `TSVZClient` work against a tsvz-rs handler, and the tsvz-rs CLI against a TSVZ.py handler |
 | Where the spec is silent | Behave as TSVZ.py does, and record the choice in `docs/silent-choices.md` |
 | Feature claimed | `handler` (conformance class and feature) |
+| §20.2.7 (TSVZ 4.7, after this design) | Naming a key: in the shared operations, used by the CLI and the handler (section 2.3) |
 
 ### Out of scope
 
@@ -115,6 +116,21 @@ files and the engine call, so that what a handler answers is what the files give
 - `ops::protocol_record(&Record) -> String`: a record as a protocol line (a
   marker key as written, a data key with `<#>` for a leading `#`, values §13
   with TAB), for the CLI's bulk routing and the client.
+
+### 2.3 Naming a key (§20.2.7, added after this design)
+
+TSVZ 4.7 added §20.2.7 while this design was being planned. While stripping is in
+force at the end of a strict store, a KEY whose encoded form (§13) ends in a space
+or tab names the live key equal to it if there is one, otherwise the key a reader
+resolves it to; any other KEY names itself. It applies to the KEYs of `get`,
+`has`, `pop`, `delete` and `setdefault` and to the keys `delete -` reads. `delete`
+names all its keys against the store as it was before the batch, guards the
+tombstones that need it, turns stripping back on after a reset inside the batch,
+and writes nothing (exit 1) when it must read the store to name a key and the read
+is incomplete. tsvz-rs mirrors TSVZ.py's `_specStrippable`, `_specNameKey`,
+`_specNamesKeys` and `_specDeleteRows` with `write::strippable`,
+`write::name_key`, `ops::delete_needs_store` and `ops::delete_records`, used by
+both the CLI and the engine; `Store::lookup_key` returns the named key.
 
 ## 3. Protocol (§21.4–§21.6, §21.10)
 
@@ -223,8 +239,11 @@ a batch succeeds again (TSVZ.py's behaviour).
 - `set`, `append`, `delete`: records encoded and submitted under the mutex (so
   writes on one connection keep their order, §21.8.3), answered per section 4.3.
   A marker key writes a marker line; a key alone is a tombstone; `delete` of a
-  marker key resets it; tombstones of keys whose encoding ends in a space or tab
-  are guarded (`write::tombstones`, §9.6).
+  marker key resets it. `set` and `append` write as the CLI does. A `delete`
+  that must name a key (section 2.3) reads the store under the mutex, so that
+  naming and writing are atomic (§21.8.2), and guards its tombstones (§9.6); when
+  that read is incomplete it answers 1, "could not read every part of the store;
+  nothing was written".
 - `pop`, `popitem`, `setdefault`: under the mutex for both the read and the
   submit (§21.8.2), through `ops`.
 - `clear`, `scrub`: under the mutex, barrier, then `maint::clear`/`maint::scrub`,
@@ -373,6 +392,9 @@ message is printed for status 1 and 2.
 If the connection is lost during the request, a read-only operation (`read`,
 `get`, `has`, `len`, `keys`) warns and runs on the files; any other exits 1 with
 "lost the handler; the OPERATION may or may not have been applied".
+
+With `-v`, a routed command names the handler it used, and `serve -v` reports the
+status of every request it answers.
 
 ## 8. The Rust client (`handler::Client`)
 
