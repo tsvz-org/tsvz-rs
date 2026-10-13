@@ -8,7 +8,9 @@ a byte-order mark, a torn tail), split over one to three parts, some of them com
 gzip, padded. Both tools then answer the same reads, compared byte for byte: tsvz-rs pads
 rows to the store's width as TSVZ.py does (§3.6 lets a reader pad). `read`, `verify` and
 `parts` are also run on a pseudo-terminal of fixed width, and their tables compared exactly
-(design section 7.3).
+(design section 7.3), and `read` with a `-d` that the strict extension overrides (§20.7.1).
+Loose files are left out: tsvz-rs reads them by design section 5.6's rule, TSVZ.py by its
+3.39 rules (§20.2.4 allows both; docs/silent-choices.md).
 
 usage: python3 difftest/difftest.py --rust target/release/tsvz [--tsvz ../TSVZ/TSVZ.py]
                                     [--seeds 0:200] [--keep DIR]
@@ -212,7 +214,8 @@ def main():
     keep = args.keep or tempfile.mkdtemp(prefix='difftest-')
     failed = 0
     seen = {}
-    ops = [['read'], ['len'], ['keys'], ['verify'], ['parts'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp']]
+    ops = [['read'], ['len'], ['keys'], ['verify'], ['parts'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp'],
+           ['read', '-d', 'comma']]
     for seed in range(start, end):
         rng = random.Random(seed)
         directory = tempfile.mkdtemp(prefix='seed%d-' % seed)
