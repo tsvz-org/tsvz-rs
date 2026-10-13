@@ -365,6 +365,8 @@ pub fn member(codec: Codec, data: &[u8]) -> Member {
 /// when a step fails, they are decoded again with that step fed a byte at a time, so nothing
 /// decoded before the failing byte is lost with the call that fails (the runner's oracle feeds
 /// every byte alone; decoders are deterministic, so the result is the same in linear time).
+/// What the failing byte itself decodes is dropped with it, as the oracle's decoders raise
+/// without returning it.
 pub fn decode_alone(codec: Codec, data: &[u8]) -> Alone {
     const STEP: usize = 1 << 16;
     let mut d = Decoder::new(codec);
@@ -390,8 +392,12 @@ pub fn decode_alone(codec: Codec, data: &[u8]) -> Alone {
         .chunks(STEP)
         .chain(failing[..failing.len().min(STEP)].chunks(1))
     {
+        let kept = out.len();
         match d.feed(piece, &mut out) {
-            Err(()) => return Alone::Corrupt(out),
+            Err(()) => {
+                out.truncate(kept);
+                return Alone::Corrupt(out);
+            }
             Ok((_, true)) => return Alone::Short(out),
             Ok(_) => {}
         }
@@ -933,6 +939,28 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn the_byte_that_fails_takes_its_output_with_it() {
+        // A corrupt xz member from the differential harness (seed 192): fed a byte at a time,
+        // byte 198 decodes the `\n` that ends `k1,ü<LF>#\r` and fails in the same call. The
+        // runner's oracle raises there and loses that call's output, so the line stays an
+        // uncommitted tail (§16.6 rule 2); keeping the `\n` committed a row TSVZ.py never reads.
+        let hex = "fd377a585a000004e6d6b4460200210116000000742fe5a3e000d0ffa85d0016080c10201dfe4563de2fab4affa95f4ff69ca40597288158e95387200d99a217c32a53cc3ecf1bdb015a6e50cfd3eda358917aa0e4d55d5e14bcecdad52799275d2d743b9fae2572083238cd95836d862e677ed36f7941b64ed044e055915f9e7c41a197d6b455b9a6b2e81ea1c41107cc6d7389d51ae5a295713f67cc468b06cede5f249a1eaaeb339689a8df773d9d7920ce5d4cea786a3793bd889dc25523d5f9c89e939d0000a17c4d921b6e786b0001c401d1010000041566ebb1c467fb020000000004595a";
+        let member: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let Alone::Corrupt(out) = decode_alone(Codec::Xz, &member) else {
+            panic!("not corrupt")
+        };
+        assert!(
+            out.ends_with("k1,ü<LF>#\r".as_bytes()),
+            "{:?}",
+            String::from_utf8_lossy(&out[out.len().saturating_sub(24)..])
+        );
     }
 
     #[cfg(all(feature = "xz", target_os = "linux"))]
