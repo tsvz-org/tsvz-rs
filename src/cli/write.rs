@@ -10,7 +10,7 @@ use crate::escape::{self, is_marker_key};
 use crate::frame::Framer;
 use crate::replay::{Cells, Markers};
 use crate::store::Row;
-use crate::write::{Record, Writer};
+use crate::write::{Record, Writer, tombstones};
 use crate::{Error, Scope, Warning};
 
 fn writer(ctx: &Ctx, member_size: Option<u64>) -> Result<Writer, Error> {
@@ -136,8 +136,8 @@ pub(crate) fn pop(ctx: &mut Ctx) -> Result<i32, Error> {
         return Ok(3);
     };
     let cells = row.to_vec();
-    writer(ctx, Some(store.markers().member_size))?
-        .append(&[Record::Tombstone { key: key.clone() }])?;
+    let strip = ctx.format.strict && store.markers().strip;
+    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
     print(ctx, &key, &cells)?;
     Ok(0)
 }
@@ -155,8 +155,8 @@ pub(crate) fn popitem(ctx: &mut Ctx) -> Result<i32, Error> {
     };
     let Some((key, row)) = pick else { return Ok(3) };
     let (key, cells) = (key.to_string(), row.to_vec());
-    writer(ctx, Some(store.markers().member_size))?
-        .append(&[Record::Tombstone { key: key.clone() }])?;
+    let strip = ctx.format.strict && store.markers().strip;
+    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
     print(ctx, &key, &cells)?;
     Ok(0)
 }

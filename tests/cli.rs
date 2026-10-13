@@ -500,3 +500,24 @@ fn a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was() {
         "the part was changed by a rewrite that could not finish"
     );
 }
+
+#[test]
+fn tombstones_for_keys_ending_in_space_delete_that_key() {
+    let stored =
+        "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\nk\tv2\n";
+    let d = store(stored);
+    assert_eq!(
+        records(d.path(), &["popitem", "s.tsvz", "first"]).1,
+        "k \tv1\n"
+    );
+    assert_eq!(records(d.path(), &["read", "s.tsvz"]).1, "k\tv2\n");
+    let m = tempfile::tempdir().unwrap();
+    fs::write(
+        m.path().join("s.tsvz"),
+        "#_strip_trailing_whites_#\tfalse\nk \tv1\n#_strip_trailing_whites_#\ttrue\n",
+    )
+    .unwrap();
+    fs::write(m.path().join("s.tsvz.1"), "k\tv2\n").unwrap();
+    assert_eq!(records(m.path(), &["clear", "s.tsvz"]).0, 0);
+    assert_eq!(records(m.path(), &["read", "s.tsvz"]).1, "");
+}

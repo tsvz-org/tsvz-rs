@@ -10,7 +10,7 @@ use crate::escape;
 use crate::name::Codec;
 use crate::parts::{self, Stamp};
 use crate::replay::{DEFAULT_MEMBER_SIZE, Markers, Policy};
-use crate::write::{Record, Writer};
+use crate::write::Writer;
 use crate::{Error, Options, Scope, Store, Warning, codec, lock};
 
 /// What a clear or scrub did.
@@ -407,10 +407,10 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             )));
         }
         if s.parts().len() > 1 {
-            let tombstones: Vec<Record> = s
-                .iter()
-                .map(|(k, _)| Record::Tombstone { key: k.to_string() })
-                .collect();
+            let tombstones = crate::write::tombstones(
+                s.iter().map(|(k, _)| k),
+                s.format().strict && s.markers().strip,
+            );
             if tombstones.is_empty() {
                 return Ok(Outcome::Unchanged);
             }

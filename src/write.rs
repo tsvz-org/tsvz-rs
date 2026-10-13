@@ -57,6 +57,27 @@ pub fn classify_key(key: &str) -> KeyKind {
     }
 }
 
+/// Tombstones that delete exactly these stored keys. While the store's final stripping is on
+/// (`strip`), a reader strips a tombstone's key before deleting it (§9.1), so a key ending in a
+/// space or tab would delete another key: such tombstones are written with stripping off
+/// around them, then on again (the idea of §19.4's compensating layout).
+pub fn tombstones<'k>(keys: impl IntoIterator<Item = &'k str>, strip: bool) -> Vec<Record> {
+    let mut records: Vec<Record> = keys
+        .into_iter()
+        .map(|k| Record::Tombstone { key: k.to_string() })
+        .collect();
+    let exposed = |r: &Record| matches!(r, Record::Tombstone { key } if key.ends_with([' ', '\t']));
+    if strip && records.iter().any(exposed) {
+        let set = |value: &str| Record::Marker {
+            key: "#_strip_trailing_whites_#".into(),
+            values: vec![value.into()],
+        };
+        records.insert(0, set("false"));
+        records.push(set("true"));
+    }
+    records
+}
+
 /// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file has no
 /// escaping, so a field holding its delimiter, `\n` or `\r` is refused.
 pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Result<(), Error> {
@@ -341,6 +362,37 @@ mod tests {
         );
         assert_eq!(classify_key("#_x_#"), KeyKind::Marker);
         assert_eq!(classify_key("#x"), KeyKind::Data);
+    }
+
+    #[test]
+    fn tombstones_guard_keys_that_stripping_would_change() {
+        assert_eq!(
+            tombstones(["a", "b"], true),
+            vec![
+                Record::Tombstone { key: "a".into() },
+                Record::Tombstone { key: "b".into() }
+            ]
+        );
+        let guarded = tombstones(["a", "k "], true);
+        assert_eq!(guarded.len(), 4);
+        assert_eq!(
+            guarded[0],
+            Record::Marker {
+                key: "#_strip_trailing_whites_#".into(),
+                values: vec!["false".into()]
+            }
+        );
+        assert_eq!(
+            guarded[3],
+            Record::Marker {
+                key: "#_strip_trailing_whites_#".into(),
+                values: vec!["true".into()]
+            }
+        );
+        assert_eq!(
+            tombstones(["k "], false),
+            vec![Record::Tombstone { key: "k ".into() }]
+        );
     }
 
     fn read(path: &Path) -> Vec<(String, Vec<String>)> {
