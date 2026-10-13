@@ -187,11 +187,45 @@ pub(crate) fn rewrite(
     if old == raw {
         return Ok(Some(false));
     }
-    (&file).seek(SeekFrom::Start(0)).map_err(io)?;
-    (&file).write_all(&raw).map_err(io)?;
-    file.set_len(raw.len() as u64).map_err(io)?;
-    file.sync_all().map_err(io)?;
+    // Reserve the space first (§19.8), so a full disk or a file-size limit refuses the rewrite
+    // before any byte changes.
+    reserve(&file, raw.len() as u64).map_err(io)?;
+    let written = (&file)
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| (&file).write_all(&raw))
+        .and_then(|()| file.set_len(raw.len() as u64))
+        .and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        // Put the old bytes back (they fit before) rather than leave a half-rewritten part.
+        let _ = (&file)
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| (&file).write_all(&old))
+            .and_then(|()| file.set_len(old.len() as u64))
+            .and_then(|()| file.sync_all());
+        return Err(io(e));
+    }
     Ok(Some(true))
+}
+
+/// Reserve `len` bytes from the start of `file` before it is rewritten. A file system that
+/// cannot reserve space is written without it.
+#[cfg(target_os = "linux")]
+fn reserve(file: &File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: posix_fallocate only uses the descriptor and the range given.
+    match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) } {
+        0 | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e)),
+    }
+}
+
+/// Reserve `len` bytes before a rewrite: not available here; the restore on failure remains.
+#[cfg(not(target_os = "linux"))]
+fn reserve(_file: &File, _len: u64) -> io::Result<()> {
+    Ok(())
 }
 
 fn local_timestamp() -> String {

@@ -460,3 +460,43 @@ fn a_loose_file_is_one_file_even_with_numbered_siblings() {
     assert_eq!(file(dir, "app.tsv"), "a\tnew\nc\t3\n");
     assert_eq!(file(dir, "app.tsv.1"), "a\told\nb\told\n");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rewrite_that_cannot_get_its_space_leaves_the_part_as_it_was() {
+    use std::os::unix::process::CommandExt;
+    let d = tempfile::tempdir().unwrap();
+    // Resolving the defaults makes every scrubbed row longer than its written form.
+    let original: String = std::iter::once("#_defaults_#\tdefault-one\tdefault-two\n".to_string())
+        .chain((0..2000).map(|i| format!("k{i}\tv\n")))
+        .collect();
+    fs::write(d.path().join("s.tsvz"), &original).unwrap();
+    let limit = original.len() as u64 + 100;
+    let mut command = tsvz();
+    command.current_dir(d.path()).args(["scrub", "s.tsvz"]);
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let rlimit = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        file(d.path(), "s.tsvz") == original,
+        "the part was changed by a rewrite that could not finish"
+    );
+}
