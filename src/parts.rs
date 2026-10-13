@@ -42,6 +42,18 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
         .to_str()
         .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
     let (base, codec) = name::split_codec(text);
+    if name::format_of(store).is_some_and(|f| !f.strict) {
+        // A loose file is one file (§20.2.4): numbered siblings such as rotated logs are not parts.
+        return Ok(if store.is_file() {
+            vec![Part {
+                path: store.to_path_buf(),
+                ordinal: None,
+                codec,
+            }]
+        } else {
+            Vec::new()
+        });
+    }
     let base = Path::new(base);
     let file_name = base
         .file_name()

@@ -444,3 +444,19 @@ fn clear_and_scrub_refuse_a_path_that_names_one_part() {
         assert_eq!(file(dir, "s.tsvz"), "a\t1\nb\t2\nc\t3\n", "{op}");
     }
 }
+
+#[test]
+fn a_loose_file_is_one_file_even_with_numbered_siblings() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("app.tsv"), "a\tnew\n").unwrap();
+    fs::write(dir.join("app.tsv.1"), "a\told\nb\told\n").unwrap();
+    assert_eq!(
+        records(dir, &["parts", "app.tsv"]).1,
+        "0\t\tapp.tsv\tactive\n"
+    );
+    assert_eq!(records(dir, &["read", "app.tsv"]).1, "a\tnew\n");
+    assert_eq!(records(dir, &["set", "app.tsv", "c", "3"]).0, 0);
+    assert_eq!(file(dir, "app.tsv"), "a\tnew\nc\t3\n");
+    assert_eq!(file(dir, "app.tsv.1"), "a\told\nb\told\n");
+}
