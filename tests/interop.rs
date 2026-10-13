@@ -194,3 +194,180 @@ fn stores_written_by_one_read_the_same_in_the_other() {
         }
     }
 }
+
+/// A handler of either tool, started in `dir`; killed if a test leaves it running.
+struct Handler(std::process::Child);
+
+impl Handler {
+    fn start(mut command: Command, store: &Path) -> Handler {
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let handler = Handler(child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = tsvz::handler::pointer::lookup(store).ok().flatten();
+            if info.is_some_and(|i| tsvz::handler::pointer::connect(&i, None).is_ok()) {
+                return handler;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no handler for {}",
+                store.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn rust(store: &Path, extra: &[&str]) -> Handler {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_tsvz"));
+        c.arg("serve").arg(store).args(extra);
+        Handler::start(c, store)
+    }
+
+    fn python(py: &Path, store: &Path) -> Handler {
+        let mut c = Command::new("python3");
+        c.arg(py).arg("serve").arg(store);
+        Handler::start(c, store)
+    }
+
+    /// Wait for the handler to exit: its status and standard error.
+    fn finish(mut self) -> (Option<i32>, String) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.0.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the handler did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut err = String::new();
+        use std::io::Read;
+        self.0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        (self.0.wait().unwrap().code(), err)
+    }
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn out(o: &Output) -> (Option<i32>, String) {
+    (
+        o.status.code(),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn the_rust_cli_goes_through_a_python_handler() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.tsvz");
+    std::fs::write(&store, "a\t1\n").unwrap();
+    let s = store.to_str().unwrap();
+    let handler = Handler::python(&py, &store);
+    let mut verbose = Command::new(env!("CARGO_BIN_EXE_tsvz"));
+    verbose.args(["-v", "set", s, "k", "v"]);
+    let set = run(verbose, b"");
+    assert!(set.status.success());
+    assert!(String::from_utf8_lossy(&set.stderr).contains("via the handler"));
+    assert_eq!(
+        out(&rust(&["get", s, "k", "zz"], b"")),
+        (Some(3), "k\tv\nzz\t\n".into())
+    );
+    assert_eq!(
+        rust(&["set", s, "-"], b"b\t2\nc\t3\n").status.code(),
+        Some(0)
+    );
+    assert_eq!(
+        out(&rust(&["pop", s, "b"], b"")),
+        (Some(0), "b\t2\n".into())
+    );
+    assert_eq!(
+        out(&rust(&["popitem", s, "first"], b"")),
+        (Some(0), "a\t1\n".into())
+    );
+    assert_eq!(
+        out(&rust(&["setdefault", s, "n", "w"], b"")),
+        (Some(0), "n\tw\n".into())
+    );
+    assert_eq!(rust(&["delete", s, "c"], b"").status.code(), Some(0));
+    assert_eq!(out(&rust(&["keys", s], b"")), (Some(0), "k\nn\n".into()));
+    assert_eq!(out(&rust(&["len", s], b"")), (Some(0), "2\n".into()));
+    assert_eq!(rust(&["stop", s], b"").status.code(), Some(0));
+    let (code, err) = handler.finish();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&store).unwrap().lines().last(),
+        Some("c")
+    );
+}
+
+#[test]
+fn python_commands_and_its_client_go_through_a_rust_handler() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.tsvz");
+    let s = store.to_str().unwrap();
+    let handler = Handler::rust(&store, &["-v"]);
+    assert_eq!(
+        python(&py, &["set", s, "k", "v"], b"").status.code(),
+        Some(0)
+    );
+    assert_eq!(
+        out(&python(&py, &["get", s, "k"], b"")),
+        (Some(0), "k\tv\n".into())
+    );
+    let script = "import sys\nsys.path.insert(0, sys.argv[1])\nimport TSVZ\n\
+        c = TSVZ.TSVZClient(sys.argv[2])\nc['a'] = 'x'\nprint(c['a'])\nprint(len(c))\n\
+        c.update({'b': 'y', 'c': 'z'})\nprint(c.pop('b'))\nprint(c.popitem())\n\
+        print(c.setdefault('d', 'w'))\ndel c['a']\nprint(c.keys())\nc.close()\n";
+    let mut client = Command::new("python3");
+    client
+        .arg("-c")
+        .arg(script)
+        .arg(py.parent().unwrap())
+        .arg(s);
+    let client = run(client, b"");
+    let stderr = String::from_utf8_lossy(&client.stderr);
+    assert!(client.status.success(), "{stderr}");
+    assert!(!stderr.contains("working on the files"), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&client.stdout),
+        "['a', 'x']\n2\n['b', 'y']\n('c', ['c', 'z'])\n['d', 'w']\n['k', 'd']\n"
+    );
+    assert_eq!(python(&py, &["stop", s], b"").status.code(), Some(0));
+    let (code, err) = handler.finish();
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        err.contains("set answered #0"),
+        "the requests came through the handler: {err}"
+    );
+}
+
+#[test]
+fn neither_tool_serves_a_store_the_other_serves() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("s.tsvz");
+    std::fs::write(&store, "").unwrap();
+    let s = store.to_str().unwrap();
+    let handler = Handler::rust(&store, &[]);
+    assert_eq!(python(&py, &["serve", s], b"").status.code(), Some(1));
+    assert_eq!(python(&py, &["stop", s], b"").status.code(), Some(0));
+    assert_eq!(handler.finish().0, Some(0));
+    let handler = Handler::python(&py, &store);
+    let second = rust(&["serve", s], b"");
+    assert_eq!(second.status.code(), Some(1));
+    assert_eq!(rust(&["stop", s], b"").status.code(), Some(0));
+    assert_eq!(handler.finish().0, Some(0));
+}
