@@ -36,12 +36,17 @@ impl Stamp {
 /// The parts of the store at `store`, in replay order (§17.3): the unnumbered file when it
 /// exists, then the numbered parts `<store-without-codec>.<ordinal>[.<codec>]` by ordinal
 /// value. `.rotated` parts and unknown codec suffixes are skipped (§19.5). A missing
-/// directory gives no parts.
+/// directory gives no parts; a store path that is a directory, or a directory that cannot be
+/// listed, is an error.
 pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
     let text = store
         .to_str()
         .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
     let (base, codec) = name::split_codec(text);
+    if store.is_dir() {
+        let is_a_directory = std::io::Error::from(std::io::ErrorKind::IsADirectory);
+        return Err(Error::io(store, is_a_directory));
+    }
     if name::format_of(store).is_some_and(|f| !f.strict) {
         // A loose file is one file (§20.2.4): numbered siblings such as rotated logs are not parts.
         return Ok(if store.is_file() {
@@ -62,8 +67,17 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
     let prefix = format!("{file_name}.");
     let parent = base.parent().filter(|p| !p.as_os_str().is_empty());
     let mut numbered = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(parent.unwrap_or(Path::new("."))) {
-        for entry in entries.flatten() {
+    let dir = parent.unwrap_or(Path::new("."));
+    // A missing directory has no parts; one that cannot be listed is an error, or its numbered
+    // parts would be skipped and appends would land in part 0, behind them.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::io(dir, e)),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::io(dir, e))?;
             let entry_name = entry.file_name();
             let Some(entry_name) = entry_name.to_str() else {
                 continue;
@@ -212,6 +226,33 @@ mod tests {
     fn relative_store_path_keeps_relative_part_paths() {
         let parts = list(std::path::Path::new("no-such-dir-xyz/s.tsvz")).unwrap();
         assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn a_directory_is_not_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("d.tsvz")).unwrap();
+        let err = list(&dir.path().join("d.tsvz")).unwrap_err();
+        assert!(err.to_string().contains("directory"), "{err}");
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid only reads the process's user id.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root can list any directory");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shut = dir.path().join("shut");
+        fs::create_dir(&shut).unwrap();
+        fs::write(shut.join("s.tsvz"), "a\t1\n").unwrap();
+        fs::write(shut.join("s.tsvz.1"), "b\t2\n").unwrap();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o300)).unwrap();
+        let result = list(&shut.join("s.tsvz"));
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
