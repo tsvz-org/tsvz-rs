@@ -4,6 +4,8 @@
 #[doc(hidden)]
 pub mod engine;
 #[doc(hidden)]
+pub mod pointer;
+#[doc(hidden)]
 pub mod protocol;
 
 pub use protocol::Response;
