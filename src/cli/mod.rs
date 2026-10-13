@@ -1,5 +1,14 @@
 //! The command-line tool of §20.
 
+/// Print a diagnostic on stderr (§20.5.2). One that cannot be written is dropped: there is
+/// nowhere left to report it, and the exit status still tells.
+macro_rules! diag {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod args;
 mod maint;
 pub(crate) mod output;
@@ -66,7 +75,7 @@ pub fn main(argv: Vec<OsString>) -> i32 {
         match arg.into_string() {
             Ok(s) => text.push(s),
             Err(bad) => {
-                eprintln!(
+                diag!(
                     "tsvz: an argument is not valid UTF-8: {}",
                     bad.to_string_lossy()
                 );
@@ -76,24 +85,30 @@ pub fn main(argv: Vec<OsString>) -> i32 {
     }
     match args::parse(&text) {
         Err(message) => {
-            eprintln!("tsvz: {message}\nTry 'tsvz --help'.");
+            diag!("tsvz: {message}\nTry 'tsvz --help'.");
             2
         }
-        Ok(Parsed::Help) => {
-            print!("{USAGE}");
-            0
-        }
-        Ok(Parsed::Version) => {
-            println!("tsvz-rs {}", env!("CARGO_PKG_VERSION"));
-            0
-        }
+        Ok(Parsed::Help) => print_stdout(USAGE),
+        Ok(Parsed::Version) => print_stdout(&format!("tsvz-rs {}\n", env!("CARGO_PKG_VERSION"))),
         Ok(Parsed::Run(args)) => match Ctx::new(args) {
             Ok(mut ctx) => ctx.run(),
             Err(e) => {
-                eprintln!("tsvz: {e}");
+                diag!("tsvz: {e}");
                 1
             }
         },
+    }
+}
+
+/// Write `text` to stdout: 0, or 1 when it cannot be written.
+fn print_stdout(text: &str) -> i32 {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => 0,
+        Err(e) => {
+            diag!("tsvz: stdout: {e}");
+            1
+        }
     }
 }
 
@@ -114,7 +129,7 @@ impl Ctx {
         let quiet = args.quiet;
         let warn: WarnFn = Arc::new(move |w: &Warning| {
             if !quiet {
-                eprintln!("tsvz: {}: {}", w.part.display(), w.message);
+                diag!("tsvz: {}: {}", w.part.display(), w.message);
             }
         });
         if let Some(d) = args.delimiter {
@@ -162,7 +177,7 @@ impl Ctx {
     /// An informational message, printed with -v (§20.7.1).
     pub(crate) fn info(&self, message: &str) {
         if self.args.verbose {
-            eprintln!("tsvz: {}: {}", self.store.display(), message);
+            diag!("tsvz: {}: {}", self.store.display(), message);
         }
     }
 
@@ -183,26 +198,29 @@ impl Ctx {
             "clear" => maint::run(self, true),
             "scrub" => maint::run(self, false),
             "serve" | "stop" => {
-                eprintln!(
+                diag!(
                     "tsvz: {}: this tsvz does not provide a handler (§21); work on the files instead",
                     self.args.op
                 );
                 Ok(1)
             }
             other => {
-                eprintln!("tsvz: unknown operation {other}");
+                diag!("tsvz: unknown operation {other}");
                 Ok(2)
             }
         };
-        let code = result.unwrap_or_else(|e| {
-            eprintln!("tsvz: {e}");
-            1
-        });
-        if let Err(e) = self.out.flush() {
-            if e.kind() != std::io::ErrorKind::BrokenPipe {
-                eprintln!("tsvz: stdout: {e}");
+        let code = match result {
+            Ok(code) => code,
+            Err(e) => {
+                diag!("tsvz: {e}"); // reported once; what was printed is flushed when Ctx drops
                 return 1;
             }
+        };
+        if let Err(e) = self.out.flush() {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                diag!("tsvz: stdout: {e}");
+            }
+            return 1;
         }
         code
     }

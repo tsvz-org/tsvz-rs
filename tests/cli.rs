@@ -521,3 +521,78 @@ fn tombstones_for_keys_ending_in_space_delete_that_key() {
     assert_eq!(records(m.path(), &["clear", "s.tsvz"]).0, 0);
     assert_eq!(records(m.path(), &["read", "s.tsvz"]).1, "");
 }
+
+#[cfg(target_os = "linux")]
+fn run_full(
+    dir: &Path,
+    args: &[&str],
+    stdout_full: bool,
+    stderr_full: bool,
+) -> (Option<i32>, String) {
+    let full = || {
+        Stdio::from(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+    };
+    let out = tsvz()
+        .current_dir(dir)
+        .args(args)
+        .stdout(if stdout_full { full() } else { Stdio::null() })
+        .stderr(if stderr_full { full() } else { Stdio::piped() })
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unwritable_output_never_panics() {
+    let d = store("a\tx\ntorn");
+    for (args, stdout_full, stderr_full, want) in [
+        (&["-V"][..], true, false, 1),
+        (&["--help"][..], true, false, 1),
+        (
+            &["--format", "records", "read", "s.tsvz"][..],
+            true,
+            false,
+            1,
+        ),
+        (
+            &["--format", "records", "read", "none.tsvz"][..],
+            false,
+            true,
+            1,
+        ),
+        (
+            &["--format", "records", "read", "s.tsvz"][..],
+            false,
+            true,
+            0,
+        ),
+        (&["frobnicate", "s.tsvz"][..], false, true, 2),
+    ] {
+        let (code, err) = run_full(d.path(), args, stdout_full, stderr_full);
+        assert_eq!(code, Some(want), "{args:?}: {err}");
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pop_that_cannot_print_deletes_nothing() {
+    let d = store("a\t1\nb\t2\n");
+    for args in [
+        &["--format", "records", "pop", "s.tsvz", "a"][..],
+        &["--format", "records", "popitem", "s.tsvz"],
+    ] {
+        let (code, _) = run_full(d.path(), args, true, false);
+        assert_eq!(code, Some(1), "{args:?}");
+        assert_eq!(file(d.path(), "s.tsvz"), "a\t1\nb\t2\n", "{args:?}");
+    }
+}

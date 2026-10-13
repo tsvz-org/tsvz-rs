@@ -18,7 +18,7 @@ pub(crate) fn run(ctx: &mut Ctx, clear: bool) -> Result<i32, Error> {
             let kept = backup
                 .map(|b| format!("; its original bytes are in {}", b.display()))
                 .unwrap_or_default();
-            eprintln!(
+            diag!(
                 "tsvz: {}: the read stopped at damaged data; rewrote what was read{kept}",
                 ctx.store.display()
             );

@@ -1,11 +1,11 @@
 //! The writing operations: set, append, delete (with bulk input), pop, popitem, setdefault
 //! (§20.2, §20.3).
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::cli::Ctx;
-use crate::cli::output::Emitter;
+use crate::cli::output::{Emitter, stdout_error};
 use crate::escape::{self, is_marker_key};
 use crate::frame::Framer;
 use crate::replay::{Cells, Markers};
@@ -118,10 +118,12 @@ fn bulk(ctx: &Ctx, keys_only: bool) -> Result<Vec<Record>, Error> {
     Ok(records)
 }
 
+/// Print one row and flush it, so that a row which cannot be printed is never deleted.
 fn print(ctx: &mut Ctx, key: &str, cells: &[String]) -> Result<(), Error> {
     let mut out = Emitter::new(ctx);
     out.row(key, cells.iter().map(String::as_str))?;
-    out.finish()
+    out.finish()?;
+    ctx.out.flush().map_err(stdout_error)
 }
 
 /// `pop` (§20.2): print KEY's row and append its tombstone; 3 when it is missing.
@@ -137,8 +139,8 @@ pub(crate) fn pop(ctx: &mut Ctx) -> Result<i32, Error> {
     };
     let cells = row.to_vec();
     let strip = ctx.format.strict && store.markers().strip;
-    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
     print(ctx, &key, &cells)?;
+    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
     Ok(0)
 }
 
@@ -156,8 +158,8 @@ pub(crate) fn popitem(ctx: &mut Ctx) -> Result<i32, Error> {
     let Some((key, row)) = pick else { return Ok(3) };
     let (key, cells) = (key.to_string(), row.to_vec());
     let strip = ctx.format.strict && store.markers().strip;
-    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
     print(ctx, &key, &cells)?;
+    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
     Ok(0)
 }
 
@@ -167,7 +169,7 @@ pub(crate) fn setdefault(ctx: &mut Ctx) -> Result<i32, Error> {
     let requested = ctx.args.args[0].clone();
     let values = ctx.args.args[1..].to_vec();
     if is_marker_key(&requested) {
-        eprintln!("tsvz: setdefault: {requested} is a marker key (§21.7.3)");
+        diag!("tsvz: setdefault: {requested} is a marker key (§21.7.3)");
         return Ok(2);
     }
     let store = match ctx.open(Scope::Keys(vec![requested.clone()]), false) {
