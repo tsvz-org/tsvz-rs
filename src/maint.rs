@@ -3,6 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::escape;
@@ -187,11 +188,14 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     let io = |e: io::Error| Error::io(path, e);
     let file = OpenOptions::new().read(true).write(true).open(path).map_err(io)?;
     let _guard = lock::lock(&file, path).map_err(io)?;
+    // The copy is created with the part's own permission bits (less the umask), so it is never
+    // readable by anyone the part was closed to.
+    let mode = file.metadata().map_err(io)?.permissions().mode() & 0o7777;
     let first = PathBuf::from(format!("{}.damaged-{}", path.display(), local_timestamp()));
     let mut target = first.clone();
     let mut n = 0;
     let mut copy = loop {
-        match OpenOptions::new().write(true).create_new(true).open(&target) {
+        match OpenOptions::new().write(true).create_new(true).mode(mode).open(&target) {
             Ok(f) => break f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 n += 1;
@@ -460,5 +464,17 @@ mod tests {
         assert_eq!(fs::read_to_string(&tsv).unwrap(), "#h\na\t2\n");
         clear(&tsv, &opts()).unwrap();
         assert_eq!(fs::read_to_string(&tsv).unwrap(), "#h\n");
+    }
+
+    #[test]
+    fn the_backup_of_a_private_part_is_as_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else { panic!("not partial") };
+        let mode = fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0, "backup mode {mode:o} opens a private part to others");
     }
 }
