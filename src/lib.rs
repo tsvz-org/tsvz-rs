@@ -13,3 +13,6 @@ pub mod store;
 
 pub use error::{Error, WarnFn, Warning};
 pub use store::{Options, PartInfo, Row, Scope, Store};
+
+#[cfg(feature = "cli")]
+pub mod cli;

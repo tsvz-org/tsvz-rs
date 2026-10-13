@@ -38,3 +38,9 @@ tempfile = "3"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[[bin]]
+name = "tsvz"
+path = "src/main.rs"
+required-features = ["cli"]
+doc = false
