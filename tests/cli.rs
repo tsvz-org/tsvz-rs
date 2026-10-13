@@ -623,6 +623,41 @@ fn a_pop_that_cannot_print_deletes_nothing() {
 }
 
 #[test]
+fn a_backup_left_in_another_group_loses_its_group_bits() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // Needs a user who may give the copy neither the part's owner nor its group: root runs
+    // the scrub as nobody, on a part of root's that nobody can write.
+    // SAFETY: geteuid only reads the process's user id.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: needs root to run the scrub as nobody");
+        return;
+    }
+    let d = store("#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n");
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    let part = d.path().join("s.tsvz");
+    fs::set_permissions(&part, fs::Permissions::from_mode(0o666)).unwrap();
+    let ran = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups", "--"])
+        .arg(env!("CARGO_BIN_EXE_tsvz"))
+        .args(["-q", "scrub"])
+        .arg(&part)
+        .output();
+    let Ok(out) = ran else {
+        eprintln!("skipped: no setpriv");
+        return;
+    };
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let copy = fs::read_dir(d.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains(".damaged-"))
+        .expect("no backup");
+    let meta = fs::metadata(&copy).unwrap();
+    assert_ne!(meta.gid(), 0, "nobody cannot give the copy root's group");
+    assert_eq!(meta.mode() & 0o070, 0, "mode {:o}", meta.mode() & 0o7777);
+}
+
+#[test]
 fn an_unreadable_part_exits_1_naming_it() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid only reads the process's user id.

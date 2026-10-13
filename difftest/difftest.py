@@ -190,10 +190,7 @@ def ask(command, store, op):
 
 # Differences where TSVZ.py, not tsvz-rs, departs from the spec: (reason, test). Remove an entry
 # once TSVZ.py is fixed. Each is listed in docs/silent-choices.md.
-KNOWN = [
-    ('TSVZ.py exits 0 from len and keys after a read stopped at damaged data (§4.10, §20.6 say 1)',
-     lambda op, rs, py: op[0] in ('len', 'keys') and rs == (1, py[1]) and py[0] == 0),
-]
+KNOWN = []  # none as of TSVZ.py 4.6
 
 
 def known(op, rs, py):

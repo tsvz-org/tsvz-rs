@@ -247,6 +247,23 @@ fn local_timestamp() -> String {
     )
 }
 
+/// Give a new copy the owner and group of the part `part` describes, as TSVZ.py's
+/// `_matchOwner` does. Where that is not allowed, a copy left in another group loses its group
+/// bits, so no one reads it who could not read the part.
+fn match_owner(copy: &File, part: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, fchown};
+    let gid = Some(part.gid());
+    if fchown(copy, Some(part.uid()), gid).is_ok() || fchown(copy, None, gid).is_ok() {
+        return Ok(());
+    }
+    let created = copy.metadata()?;
+    if created.gid() != part.gid() {
+        // What the umask left, without the group bits.
+        copy.set_permissions(std::fs::Permissions::from_mode(created.mode() & 0o7707))?;
+    }
+    Ok(())
+}
+
 /// Copy a damaged part's bytes to `<part>.damaged-<local time>` (`.1`, `.2`, … when taken) and
 /// sync it, before a rewrite drops the damage (§4.10, §16.6), as TSVZ.py does.
 fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
@@ -260,7 +277,8 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     // The copy is readable by whoever could read the part, and writable by its owner only: the
     // part's read bits plus owner write, never its setuid, setgid, sticky or execute bits, nor
     // write access for others (the umask still applies on top).
-    let mode = file.metadata().map_err(io)?.permissions().mode() & 0o644;
+    let part = file.metadata().map_err(io)?;
+    let mode = part.permissions().mode() & 0o644;
     let first = PathBuf::from(format!("{}.damaged-{}", path.display(), local_timestamp()));
     let mut target = first.clone();
     let mut n = 0;
@@ -279,7 +297,9 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
             Err(e) => return Err(Error::io(&target, e)),
         }
     };
-    let copied = io::copy(&mut &file, &mut copy).and_then(|_| copy.sync_all());
+    let copied = match_owner(&copy, &part)
+        .and_then(|()| io::copy(&mut &file, &mut copy))
+        .and_then(|_| copy.sync_all());
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&target);
         return Err(Error::io(&target, e));
@@ -663,6 +683,25 @@ mod tests {
             0,
             "backup mode {mode:o} opens a private part to others"
         );
+    }
+
+    #[test]
+    fn the_backup_keeps_the_part_owner() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid only reads the process's user id.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: only root can give a file to another owner");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n").unwrap();
+        std::os::unix::fs::chown(&p, Some(65534), Some(65534)).unwrap();
+        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else {
+            panic!("not partial")
+        };
+        let meta = fs::metadata(&copy).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (65534, 65534));
     }
 
     #[test]
