@@ -1,6 +1,7 @@
 //! §20.1 argument parsing.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 /// The operations of §20.2, plus `serve` and `stop` (§20.2.6).
 pub const OPERATIONS: &[&str] = &[
@@ -36,6 +37,14 @@ pub struct Args {
     pub quiet: bool,
     pub verbose: bool,
     pub delimiter: Option<u8>,
+    /// `--x-direct`: work on the files even when a handler serves the store.
+    pub direct: bool,
+    /// `--x-idle-timeout S` (serve).
+    pub idle_timeout: Option<Duration>,
+    /// `--x-group G` (serve), as a gid.
+    pub group: Option<u32>,
+    /// `--x-mode M` (serve): the socket's mode.
+    pub mode: Option<u32>,
     pub op: String,
     pub store: String,
     pub args: Vec<String>,
@@ -61,6 +70,10 @@ const OPTIONS: &[(&str, &str, bool)] = &[
     ("--verbose", "verbose", false),
     ("-d", "delimiter", true),
     ("--delimiter", "delimiter", true),
+    ("--x-direct", "direct", false),
+    ("--x-idle-timeout", "idle", true),
+    ("--x-group", "group", true),
+    ("--x-mode", "mode", true),
 ];
 
 /// An option's destination and whether it takes a value; a long option may be given by a
@@ -89,6 +102,39 @@ fn option(name: &str) -> Result<(&'static str, bool), String> {
 fn is_negative_number(arg: &str) -> bool {
     let mut chars = arg.chars();
     chars.next() == Some('-') && chars.next().is_some_and(|c| c.is_ascii_digit() || c == '.')
+}
+
+fn parse_idle(text: &str) -> Result<Duration, String> {
+    text.parse::<f64>()
+        .ok()
+        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+        .ok_or_else(|| format!("--x-idle-timeout takes seconds, not {text:?}"))
+}
+
+fn parse_mode(text: &str) -> Result<u32, String> {
+    u32::from_str_radix(text, 8)
+        .ok()
+        .filter(|&m| m <= 0o777)
+        .ok_or_else(|| format!("--x-mode takes an octal mode such as 660, not {text:?}"))
+}
+
+/// A group name or number as a gid.
+fn parse_group(text: &str) -> Result<u32, String> {
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return text
+            .parse()
+            .map_err(|_| format!("--x-group: bad group {text:?}"));
+    }
+    let name =
+        std::ffi::CString::new(text).map_err(|_| format!("--x-group: bad group {text:?}"))?;
+    // SAFETY: getgrnam reads the NUL-terminated name; the entry it returns is read at once,
+    // before any other call could reuse it.
+    let entry = unsafe { libc::getgrnam(name.as_ptr()) };
+    if entry.is_null() {
+        return Err(format!("--x-group: no group named {text:?}"));
+    }
+    // SAFETY: entry is a valid group entry (checked above).
+    Ok(unsafe { (*entry).gr_gid })
 }
 
 fn parse_delimiter(text: &str) -> Result<u8, String> {
@@ -155,6 +201,10 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             "format" => format = Some(value),
             "quiet" => a.quiet = true,
             "verbose" => a.verbose = true,
+            "direct" => a.direct = true,
+            "idle" => a.idle_timeout = Some(parse_idle(&value)?),
+            "group" => a.group = Some(parse_group(&value)?),
+            "mode" => a.mode = Some(parse_mode(&value)?),
             _ => delimiter = Some(value),
         }
     }

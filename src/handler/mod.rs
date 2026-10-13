@@ -7,5 +7,7 @@ pub mod engine;
 pub mod pointer;
 #[doc(hidden)]
 pub mod protocol;
+#[doc(hidden)]
+pub mod server;
 
 pub use protocol::Response;

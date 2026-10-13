@@ -13,6 +13,7 @@ pub mod args;
 mod maint;
 pub(crate) mod output;
 mod read;
+mod serve;
 mod table;
 mod width_table;
 mod write;
@@ -49,7 +50,8 @@ operations:
   popitem STORE [first|last]   pop the first or last live key (default: last)
   setdefault STORE KEY VALUE [VALUE ...]
                                print the row of KEY, setting it to the VALUEs if missing
-  serve STORE, stop STORE      not provided by this tsvz (exit 1)
+  serve STORE                  run a write handler for STORE in the foreground (§21)
+  stop STORE                   stop the handler of STORE
 
 options:
   -h, --help                   show this help
@@ -58,6 +60,9 @@ options:
   -q, --quiet                  print errors only
   -v, --verbose                print informational messages
   -d, --delimiter D            delimiter of a .tsv-family file: tab, comma, pipe, null or one character
+  --x-direct                   work on the files even when a handler serves the store
+  --x-idle-timeout S           serve: stop after S seconds without connections
+  --x-group G, --x-mode M      serve: let group G connect / set the socket's octal mode
   --                           every argument after this is positional
 
 exit status: 0 done, 1 failed or refused, 2 usage error, 3 missing key, 4 checksum mismatch
@@ -199,13 +204,8 @@ impl Ctx {
             "setdefault" => write::setdefault(self),
             "clear" => maint::run(self, true),
             "scrub" => maint::run(self, false),
-            "serve" | "stop" => {
-                diag!(
-                    "tsvz: {}: this tsvz does not provide a handler (§21); work on the files instead",
-                    self.args.op
-                );
-                Ok(1)
-            }
+            "serve" => serve::serve(self),
+            "stop" => serve::stop(self),
             other => {
                 diag!("tsvz: unknown operation {other}");
                 Ok(2)

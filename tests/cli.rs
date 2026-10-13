@@ -229,13 +229,6 @@ fn a_stopped_read_prints_what_it_read_and_exits_1() {
     assert_eq!((code, out.as_str()), (1, "a\t1\n"));
 }
 
-#[test]
-fn serve_and_stop_are_not_provided() {
-    let d = store("a\tx\n");
-    assert_eq!(records(d.path(), &["serve", "s.tsvz"]).0, 1);
-    assert_eq!(records(d.path(), &["stop", "s.tsvz"]).0, 1);
-}
-
 fn file(dir: &Path, name: &str) -> String {
     String::from_utf8(fs::read(dir.join(name)).unwrap()).unwrap()
 }
