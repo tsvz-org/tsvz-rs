@@ -2,5 +2,4 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
-/people.tsvz
 /fuzz/Cargo.lock

@@ -8,6 +8,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 |---|---|---|
 | `parts` ordinal | Printed as written in the file name (`002`, `B`), not normalized | `_partRows` |
 | xz parts | A member may be an `.xz` stream or a legacy `.lzma` stream (auto-detected) | `lzma.LZMADecompressor()` |
+| xz stream padding | Zero bytes after an xz stream are judged a member cut short (a warning; every line is read, under any policy) | `decompress_items` |
 | zstd skippable frames | Decoded as frames with no output | `ZstdDecompressor` |
 | Appending after a torn tail | The uncommitted bytes after the last newline are cut first, with a warning, so the new record cannot join them | `_lockedAppend(…, 'truncate')` |
 | `scrub` markers | `#_version_#` written as `1`; then strip, fill-empty, return-defaults, rotate, write-ack, member-size and on-corruption when not default; `#_defaults_#` last | `_specPreamble` |

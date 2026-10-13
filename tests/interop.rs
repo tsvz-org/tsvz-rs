@@ -1,5 +1,6 @@
 //! Working on the same stores as TSVZ.py: writers exclude each other, and reads agree.
-//! Needs python3 and TSVZ.py (`TSVZ_PY`, default `../TSVZ/TSVZ.py`); skipped without them.
+//! Needs python3 and TSVZ.py (`TSVZ_PY`, default `../TSVZ/TSVZ.py`); skipped without them,
+//! unless `TSVZ_REQUIRE_INTEROP` is set (CI), which makes their absence a failure.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,11 @@ macro_rules! need_tsvz_py {
         match tsvz_py() {
             Some(path) => path,
             None => {
+                // CI sets TSVZ_REQUIRE_INTEROP so a missing TSVZ.py fails instead of passing silently.
+                assert!(
+                    std::env::var_os("TSVZ_REQUIRE_INTEROP").is_none(),
+                    "TSVZ_REQUIRE_INTEROP is set but python3 or TSVZ.py was not found (set TSVZ_PY)"
+                );
                 eprintln!("skipped: python3 or TSVZ.py not found (set TSVZ_PY)");
                 return;
             }

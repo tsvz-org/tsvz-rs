@@ -117,6 +117,9 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
 }
 
 /// Appends batches of records to a store's active part (§17.7).
+///
+/// Each append holds the write lock shared with TSVZ.py (see `lock`): where only a classic
+/// POSIX lock is available, closing another descriptor of the part in this process releases it.
 pub struct Writer {
     store: PathBuf,
     format: Format,

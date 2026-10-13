@@ -31,7 +31,7 @@ digests (crc32, crc32c, sha256, blake3) are verified.
 
 ## Library
 
-```rust
+```rust,no_run
 use tsvz::{Options, Record, Store, Writer};
 
 let mut w = Writer::open("people.tsvz")?;
@@ -42,6 +42,11 @@ for (key, row) in store.iter() {
 }
 # Ok::<(), tsvz::Error>(())
 ```
+
+Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
+available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
+process loses when it closes any other descriptor of the same file; a program that keeps a store
+open should not open its files by other means while it writes.
 
 Build without the command line and C libraries with
 `default-features = false, features = ["bzip2"]` (gzip and all digests are always in).

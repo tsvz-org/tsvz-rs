@@ -1,6 +1,10 @@
 //! The write lock shared with TSVZ.py: an in-process gate per file, then an exclusive
 //! whole-file lock — an open file description lock on Linux (a classic POSIX lock when the
 //! kernel refuses it), a classic POSIX lock on macOS. Readers take no lock.
+//!
+//! A classic POSIX lock belongs to the process and is released when the process closes any
+//! descriptor of the file, not only the one it was taken on. The command line never holds two;
+//! a program embedding the library should not open a part by other means while it appends.
 
 use std::collections::HashMap;
 use std::fs::File;

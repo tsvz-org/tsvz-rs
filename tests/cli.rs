@@ -596,3 +596,24 @@ fn a_pop_that_cannot_print_deletes_nothing() {
         assert_eq!(file(d.path(), "s.tsvz"), "a\t1\nb\t2\n", "{args:?}");
     }
 }
+
+#[test]
+fn an_unreadable_part_exits_1_naming_it() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's user id.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can read any file");
+        return;
+    }
+    let d = store("a\tx\n");
+    let part = d.path().join("s.tsvz.1");
+    fs::write(&part, "b\ty\n").unwrap();
+    fs::set_permissions(&part, fs::Permissions::from_mode(0o000)).unwrap();
+    let (code, out, err) = records(d.path(), &["read", "s.tsvz"]);
+    fs::set_permissions(&part, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(
+        err.contains("s.tsvz.1") && err.contains("ermission") && !err.contains("panicked"),
+        "{err}"
+    );
+}
