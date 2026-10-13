@@ -8,5 +8,6 @@ pub mod escape;
 pub mod frame;
 pub mod name;
 pub mod parts;
+pub mod replay;
 
 pub use error::{Error, WarnFn, Warning};
