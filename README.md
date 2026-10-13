@@ -26,7 +26,10 @@ tsvz --help
 ```
 
 Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz, zstd) and split
-into parts; all four digests (crc32, crc32c, sha256, blake3) are verified.
+into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
+one-part store in place, and in a multi-part store writes the parts before the active one as one
+snapshot part between them (§19.2), then applies the store's `#_rotate_#` (`keep`, `rename` or
+`delete`) to them; writers keep appending to the active part throughout.
 
 ## Handler
 
@@ -73,11 +76,11 @@ Build without the command line and C libraries with
 ## Conformance and compatibility
 
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
-every codec and digest claimed, and is checked against TSVZ.py on random stores, with and
-without its handler. Rust and Python
-writers can share a store: they take the same file locks. Where the specification leaves a
-choice open, tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md)
-lists those choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+every codec, every digest and multi-part scrub claimed, and is checked against TSVZ.py on random
+stores, with and without its handler. Rust and Python writers can share a store: they take the
+same file locks. Where the specification leaves a choice open, tsvz-rs does what TSVZ.py does;
+[docs/silent-choices.md](docs/silent-choices.md) lists those choices. Benchmarks against TSVZ.py
+are in [bench/RESULTS.md](bench/RESULTS.md).
 
 ## License
 
