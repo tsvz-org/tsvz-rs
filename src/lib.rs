@@ -6,13 +6,16 @@ pub mod codec;
 pub mod digest;
 pub mod escape;
 pub mod frame;
+pub mod lock;
 pub mod name;
 pub mod parts;
 pub mod replay;
 pub mod store;
+pub mod write;
 
 pub use error::{Error, WarnFn, Warning};
 pub use store::{Options, PartInfo, Row, Scope, Store};
 
 #[cfg(feature = "cli")]
 pub mod cli;
+pub use write::{classify_key, KeyKind, Record, Writer};
