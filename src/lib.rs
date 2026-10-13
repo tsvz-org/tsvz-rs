@@ -9,5 +9,7 @@ pub mod frame;
 pub mod name;
 pub mod parts;
 pub mod replay;
+pub mod store;
 
 pub use error::{Error, WarnFn, Warning};
+pub use store::{Options, PartInfo, Row, Scope, Store};
