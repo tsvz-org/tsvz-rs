@@ -35,34 +35,84 @@ pub enum Item {
     Break,
 }
 
-/// The length of the RFC 1952 header at the start of `data`, or None when it is not all
-/// there or the bytes are not a gzip deflate member.
+/// Where an RFC 1952 header parse is: the optional fields come in the order FEXTRA, FNAME,
+/// FCOMMENT, FHCRC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Stage {
+    #[default]
+    Fixed,
+    XLen(Option<u8>),
+    Extra(usize),
+    Name,
+    Comment,
+    Crc(u8),
+    Done,
+}
+
+/// The optional header fields: (flag bit, the stage that reads the field).
+const FIELDS: [(u8, Stage); 4] = [(4, Stage::XLen(None)), (8, Stage::Name), (16, Stage::Comment), (2, Stage::Crc(2))];
+
+/// An RFC 1952 header parsed a byte at a time, with constant work per byte, so a long or
+/// unterminated name or comment costs linear time however the bytes arrive.
+#[derive(Debug, Default)]
+struct GzipHeader {
+    seen: usize,
+    flags: u8,
+    stage: Stage,
+}
+
+impl GzipHeader {
+    /// The stage that reads the first flagged field from `FIELDS[i]` on.
+    fn from(&self, i: usize) -> Stage {
+        FIELDS[i..].iter().find(|(bit, _)| self.flags & bit != 0).map_or(Stage::Done, |&(_, stage)| stage)
+    }
+
+    /// Take one byte: Ok(true) once the header is complete; Err(()) when the bytes are not a gzip
+    /// deflate member.
+    fn push(&mut self, b: u8) -> Result<bool, ()> {
+        self.seen += 1;
+        self.stage = match self.stage {
+            Stage::Fixed => {
+                let i = self.seen - 1;
+                if i < 3 && b != b"\x1f\x8b\x08"[i] {
+                    return Err(());
+                }
+                if i == 3 {
+                    self.flags = b;
+                }
+                if self.seen == 10 { self.from(0) } else { Stage::Fixed }
+            }
+            Stage::XLen(None) => Stage::XLen(Some(b)),
+            Stage::XLen(Some(low)) => match low as usize + 256 * b as usize {
+                0 => self.from(1),
+                n => Stage::Extra(n),
+            },
+            Stage::Extra(1) => self.from(1),
+            Stage::Extra(n) => Stage::Extra(n - 1),
+            Stage::Name if b == 0 => self.from(2),
+            Stage::Comment if b == 0 => self.from(3),
+            Stage::Crc(1) => Stage::Done,
+            Stage::Crc(n) => Stage::Crc(n - 1),
+            stage => stage,
+        };
+        Ok(self.stage == Stage::Done)
+    }
+}
+
+/// The length of the RFC 1952 header at the start of `data`, or None when it is not all there or
+/// the bytes are not a gzip deflate member.
 pub fn gzip_header_len(data: &[u8]) -> Option<usize> {
-    if data.len() < 10 || &data[..3] != b"\x1f\x8b\x08" {
-        return None;
-    }
-    let flags = data[3];
-    let mut pos = 10usize;
-    if flags & 4 != 0 {
-        if data.len() < pos + 2 {
-            return None;
-        }
-        pos += 2 + data[pos] as usize + 256 * data[pos + 1] as usize;
-    }
-    for flag in [8u8, 16] {
-        if flags & flag != 0 {
-            let rest = data.get(pos..)?;
-            pos += memchr::memchr(0, rest)? + 1;
+    let mut header = GzipHeader::default();
+    for (i, &b) in data.iter().enumerate() {
+        if header.push(b).ok()? {
+            return Some(i + 1);
         }
     }
-    if flags & 2 != 0 {
-        pos += 2;
-    }
-    (pos <= data.len()).then_some(pos)
+    None
 }
 
 struct GzipDecoder {
-    header: Vec<u8>,
+    header: GzipHeader,
     /// The raw inflater once the header is complete, and whether its deflate stream ended.
     inflate: Option<(flate2::Decompress, bool)>,
     trailer: Vec<u8>,
@@ -89,7 +139,7 @@ impl Decoder {
     fn new(codec: Codec) -> Decoder {
         match codec {
             Codec::Gzip => Decoder::Gzip(Box::new(GzipDecoder {
-                header: Vec::new(),
+                header: GzipHeader::default(),
                 inflate: None,
                 trailer: Vec::new(),
                 crc: crc32fast::Hasher::new(),
@@ -176,19 +226,12 @@ impl GzipDecoder {
             return Ok((0, true));
         }
         if self.inflate.is_none() {
-            while gzip_header_len(&self.header).is_none() && used < input.len() {
-                self.header.push(input[used]);
+            loop {
+                let Some(&b) = input.get(used) else { return Ok((used, false)) };
                 used += 1;
-                let n = self.header.len();
-                if n <= 3 && self.header[..] != b"\x1f\x8b\x08"[..n] {
-                    return Err(());
+                if self.header.push(b)? {
+                    break;
                 }
-                if n > 1 << 20 {
-                    return Err(()); // an absurd header: not a member a writer made
-                }
-            }
-            if gzip_header_len(&self.header).is_none() {
-                return Ok((used, false));
             }
             self.inflate = Some((flate2::Decompress::new(false), false));
         }
@@ -238,13 +281,31 @@ pub fn member(codec: Codec, data: &[u8]) -> Member {
     }
 }
 
-/// Decode a damaged member's bytes on their own (§16.6 rule 2), one byte at a time so that
-/// nothing decoded before a failure is lost with the call that fails.
+/// Decode a damaged member's bytes on their own (§16.6 rule 2). They are fed in large steps;
+/// when a step fails, they are decoded again with that step fed a byte at a time, so nothing
+/// decoded before the failing byte is lost with the call that fails (the runner's oracle feeds
+/// every byte alone; decoders are deterministic, so the result is the same in linear time).
 pub fn decode_alone(codec: Codec, data: &[u8]) -> Alone {
+    const STEP: usize = 1 << 16;
     let mut d = Decoder::new(codec);
     let mut out = Vec::new();
-    for i in 0..data.len() {
-        match d.feed(&data[i..i + 1], &mut out) {
+    let mut failed = None;
+    for (i, chunk) in data.chunks(STEP).enumerate() {
+        match d.feed(chunk, &mut out) {
+            Err(()) => {
+                failed = Some(i);
+                break;
+            }
+            Ok((_, true)) => return Alone::Short(out),
+            Ok(_) => {}
+        }
+    }
+    let Some(step) = failed else { return Alone::Short(out) };
+    let (before, failing) = data.split_at(step * STEP);
+    let mut d = Decoder::new(codec);
+    let mut out = Vec::new();
+    for piece in before.chunks(STEP).chain(failing[..failing.len().min(STEP)].chunks(1)) {
+        match d.feed(piece, &mut out) {
             Err(()) => return Alone::Corrupt(out),
             Ok((_, true)) => return Alone::Short(out),
             Ok(_) => {}
@@ -617,5 +678,30 @@ mod tests {
     #[test]
     fn empty_payload_is_no_member() {
         assert_eq!(encode_members(Codec::Gzip, b"", 100).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_long_unterminated_gzip_name_is_judged_in_linear_time() {
+        // FNAME set, then 200 KB without its terminating zero: the header never completes.
+        let mut data = b"\x1f\x8b\x08\x08\0\0\0\0\0\xff".to_vec();
+        data.extend(std::iter::repeat_n(b'a', 200_000));
+        let started = std::time::Instant::now();
+        assert_eq!(member(Codec::Gzip, &data), Member::Short);
+        assert_eq!(decode_alone(Codec::Gzip, &data), Alone::Short(Vec::new()));
+        assert_eq!(gzip_header_len(&data), None);
+        assert!(started.elapsed().as_millis() < 500, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_long_cut_short_member_decodes_alone_in_large_steps() {
+        for codec in codecs() {
+            let data: Vec<u8> = (0..400_000u32).flat_map(|i| format!("k{i}\tv{}\n", i % 97).into_bytes()).collect();
+            let full = fixture(codec, &data);
+            let cut = &full[..full.len() * 9 / 10];
+            let started = std::time::Instant::now();
+            let Alone::Short(out) = decode_alone(codec, cut) else { panic!("{codec:?}: not short") };
+            assert!(data.starts_with(&out) && out.len() > data.len() / 2, "{codec:?}");
+            assert!(started.elapsed().as_secs() < 3, "{codec:?}: took {:?}", started.elapsed());
+        }
     }
 }
