@@ -233,13 +233,29 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     let any = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
         .iter()
         .any(|&s| unsafe { libc::sigismember(&signals, s) } == 1);
+    let mut helpers = Ok(());
     if any {
         let (shared, info) = (shared.clone(), config.info.clone());
-        std::thread::spawn(move || wait_for_signal(signals, shared, info));
+        helpers = std::thread::Builder::new()
+            .name("tsvz-signals".into())
+            .spawn(move || wait_for_signal(signals, shared, info))
+            .map(drop);
     }
-    if let Some(idle) = config.idle {
+    if let (Some(idle), Ok(())) = (config.idle, &helpers) {
         let (shared, info) = (shared.clone(), config.info.clone());
-        std::thread::spawn(move || watch_idle(idle, shared, info));
+        helpers = std::thread::Builder::new()
+            .name("tsvz-idle".into())
+            .spawn(move || watch_idle(idle, shared, info))
+            .map(drop);
+    }
+    if let Err(e) = helpers {
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
+        held.release();
+        return Err(Error::Refused(format!(
+            "{}: serve cannot start its threads ({e})",
+            store.display()
+        )));
     }
     (config.info)(&format!(
         "serving {} at {address} (pid {})",
@@ -266,9 +282,14 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         if stream.set_nonblocking(false).is_err() {
             continue;
         }
-        let (engine, shared, info) = (engine.clone(), shared.clone(), config.info.clone());
-        let verbose = config.verbose;
-        std::thread::spawn(move || serve_connection(stream, &engine, &shared, &info, verbose));
+        start_connection(
+            std::thread::Builder::new().name("tsvz-connection".into()),
+            stream,
+            engine.clone(),
+            shared.clone(),
+            config.info.clone(),
+            config.verbose,
+        );
     }
     drop(listener);
     for (_, conn) in lock(&shared.open).drain() {
@@ -309,6 +330,29 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>, info: InfoFn) {
         if open == 0 && since.elapsed() >= idle {
             info(&format!("idle for {} s; stopping", idle.as_secs_f64()));
             shared.stop();
+        }
+    }
+}
+
+/// Serve `stream` on a thread of its own, made by `builder`. When no thread can be made (a task
+/// limit, no memory), the connection is closed, the fact is reported, and the handler keeps
+/// serving: `std::thread::spawn` would panic, and the release build aborts on panic.
+fn start_connection(
+    builder: std::thread::Builder,
+    stream: UnixStream,
+    engine: Arc<Engine>,
+    shared: Arc<Shared>,
+    info: InfoFn,
+    verbose: bool,
+) -> bool {
+    let report = info.clone();
+    match builder.spawn(move || serve_connection(stream, &engine, &shared, &info, verbose)) {
+        Ok(_) => true,
+        Err(e) => {
+            report(&format!(
+                "cannot start a thread for a connection ({e}); closed it"
+            ));
+            false
         }
     }
 }
@@ -420,4 +464,58 @@ pub fn stop(store: &Path) -> Result<(), Error> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn a_connection_that_gets_no_thread_is_closed_and_serving_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None).unwrap());
+        let (wake, _wakened) = UnixStream::pair().unwrap();
+        let shared = Arc::new(Shared {
+            stopping: AtomicBool::new(false),
+            wake,
+            activity: Mutex::new((0, Instant::now())),
+            open: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(0),
+        });
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let log = said.clone();
+        let info: InfoFn = Arc::new(move |m: &str| lock(&log).push(m.to_string()));
+        // No system can map a stack this large: the thread cannot be made.
+        let impossible = std::thread::Builder::new().stack_size(usize::MAX / 2);
+        let (mut client, end) = UnixStream::pair().unwrap();
+        assert!(!start_connection(
+            impossible,
+            end,
+            engine.clone(),
+            shared.clone(),
+            info.clone(),
+            false
+        ));
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client.read(&mut byte).unwrap(),
+            0,
+            "the connection is closed"
+        );
+        assert!(lock(&said)[0].contains("thread"), "{:?}", lock(&said));
+        let (mut client, end) = UnixStream::pair().unwrap();
+        assert!(start_connection(
+            std::thread::Builder::new(),
+            end,
+            engine,
+            shared,
+            info,
+            false
+        ));
+        client.write_all(b"len\n").unwrap();
+        let mut answer = String::new();
+        client.take(5).read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "0\n#0\n");
+    }
 }
