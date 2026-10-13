@@ -712,3 +712,26 @@ fn a_handler_whose_socket_directory_was_removed_still_stops() {
     assert_eq!(status.code(), Some(0));
     assert!(!pointer::path_of(&s).exists());
 }
+
+#[test]
+fn a_client_never_reads_an_answer_meant_for_a_request_it_gave_up_on() {
+    use tsvz::handler::Client;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let served = Served::start(&s, &[]);
+    let c = Client::connect(&s)
+        .unwrap()
+        .timeout(Some(Duration::from_millis(100)));
+    served.signal(libc::SIGSTOP);
+    let mut c = c;
+    let lost = c.get("a");
+    served.signal(libc::SIGCONT);
+    assert!(matches!(lost, Err(tsvz::Error::HandlerLost(_))), "{lost:?}");
+    std::thread::sleep(Duration::from_millis(200)); // the late answer for `a` arrives
+    let mut c = c.timeout(None);
+    match c.get("b") {
+        Err(tsvz::Error::HandlerLost(_)) => {}
+        Ok(Some(row)) => assert_eq!(row, ["b", "2"], "a stale answer"),
+        other => panic!("{other:?}"),
+    }
+}

@@ -15,8 +15,9 @@ use crate::{Error, Record, WarnFn, Warning};
 ///
 /// Rows are returned key first, then their cells. Statuses 0, 3 (missing key) and 4 (checksum
 /// mismatch) are answers; a request that fails (1) or is refused as a usage error (2) is
-/// [`Error::Handler`]; a connection that breaks is [`Error::HandlerLost`]. A client never
-/// falls back to the files: open a [`crate::Store`] for that.
+/// [`Error::Handler`]; a connection that breaks or times out is [`Error::HandlerLost`], and
+/// so is every later call on it: connect again. A client never falls back to the files: open
+/// a [`crate::Store`] for that.
 ///
 /// ```no_run
 /// use tsvz::handler::Client;
@@ -33,6 +34,9 @@ pub struct Client {
     writer: UnixStream,
     sync: bool,
     warn: Option<WarnFn>,
+    /// Why the connection was given up: after a send or an answer fails, the stream may hold
+    /// half a request or a late answer, so it is never used again.
+    lost: Option<String>,
 }
 
 fn lost(e: std::io::Error) -> Error {
@@ -62,6 +66,7 @@ impl Client {
             writer: stream,
             sync: false,
             warn: None,
+            lost: None,
         })
     }
 
@@ -99,8 +104,20 @@ impl Client {
             }
             text.push_str("#\n");
         }
-        self.writer.write_all(text.as_bytes()).map_err(lost)?;
-        read_response(&mut self.reader).map_err(lost)
+        if let Some(why) = &self.lost {
+            return Err(Error::HandlerLost(format!(
+                "the connection was lost earlier ({why})"
+            )));
+        }
+        let answer = self
+            .writer
+            .write_all(text.as_bytes())
+            .and_then(|()| read_response(&mut self.reader));
+        answer.map_err(|e| {
+            self.lost = Some(e.to_string());
+            let _ = self.writer.shutdown(std::net::Shutdown::Both);
+            lost(e)
+        })
     }
 
     /// The raw form: `fields` (operation and arguments, each sent §13-encoded with TAB), then
