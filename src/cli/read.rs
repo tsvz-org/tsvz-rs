@@ -6,9 +6,9 @@ use crate::cli::Ctx;
 use crate::cli::output::{Emitter, Fields, stdout_error};
 use crate::{Error, Scope, Store, parts};
 
-/// A read that stopped at damaged data fails (§4.10, §20.6).
+/// A read that skipped a part or stopped at damaged data fails (§4.10, §20.6, §21.8.5).
 fn status(store: &Store, code: i32) -> i32 {
-    if store.stopped().is_some() { 1 } else { code }
+    if store.incomplete() { 1 } else { code }
 }
 
 pub(crate) fn read(ctx: &mut Ctx) -> Result<i32, Error> {

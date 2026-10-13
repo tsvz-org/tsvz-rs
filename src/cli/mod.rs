@@ -167,6 +167,8 @@ impl Ctx {
             verify,
             delimiter: self.args.delimiter,
             warnings: Some(self.warn.clone()),
+            // Print what can be read and exit 1, as a handler answers (§21.8.5, §20.8.1).
+            skip_unreadable: true,
         }
     }
 

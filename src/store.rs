@@ -14,7 +14,7 @@ use crate::frame::Framer;
 use crate::name::{self, Codec, Format};
 use crate::parts::{self, Stamp};
 use crate::replay::{Binding, Cells, Damage, EMPTY_CELLS, Markers, Mismatch, Policy, Replay, Sink};
-use crate::{Error, WarnFn};
+use crate::{Error, WarnFn, Warning};
 
 /// What a store keeps of each row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub struct Options {
     /// The delimiter of a loose file (`-d`); ignored for strict variants (§5.1).
     pub delimiter: Option<u8>,
     pub warnings: Option<WarnFn>,
+    /// Skip a part that cannot be opened or read, or whose codec this build lacks (§16.5),
+    /// with a warning, instead of failing: the store then holds what could be read, and
+    /// [`Store::incomplete`] is true (§21.8.5). Off by default.
+    pub skip_unreadable: bool,
 }
 
 /// One part as `parts` lists it (§20.2).
@@ -258,6 +262,13 @@ pub(crate) fn racy(mtime: i128) -> bool {
     now - mtime < RACY_NS
 }
 
+fn unsupported(part: &parts::Part) -> Error {
+    Error::UnsupportedCodec {
+        path: part.path.clone(),
+        codec: part.codec.map_or("", Codec::name),
+    }
+}
+
 fn read_check(file: &File, offset: u64) -> Vec<u8> {
     let start = offset.saturating_sub(CHECK_BYTES);
     let mut buf = vec![0u8; (offset - start) as usize];
@@ -275,6 +286,7 @@ pub struct Store {
     table: Table,
     replay: Replay,
     parts: Vec<PartInfo>,
+    unreadable: Vec<PathBuf>,
     pub(crate) follow: Follow,
 }
 
@@ -293,6 +305,7 @@ impl Store {
             format,
             options,
             parts: Vec::new(),
+            unreadable: Vec::new(),
             follow: Follow::default(),
         };
         store.load()?;
@@ -304,14 +317,13 @@ impl Store {
         if list.is_empty() {
             return Err(Error::Missing(self.path.clone()));
         }
-        if let Some(part) = list
-            .iter()
-            .find(|p| p.codec.is_some_and(|c| !c.supported()))
-        {
-            return Err(Error::UnsupportedCodec {
-                path: part.path.clone(),
-                codec: part.codec.map_or("", Codec::name),
-            });
+        if !self.options.skip_unreadable {
+            if let Some(part) = list
+                .iter()
+                .find(|p| p.codec.is_some_and(|c| !c.supported()))
+            {
+                return Err(unsupported(part));
+            }
         }
         let dir = dir_mtime(&self.path);
         self.follow = Follow {
@@ -322,64 +334,20 @@ impl Store {
         let last = list.len() - 1;
         for (i, part) in list.iter().enumerate() {
             self.replay.begin_part(&part.path, i == 0);
-            let mut file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
-            let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
-            if meta.is_dir() {
-                return Err(Error::io(
-                    &part.path,
-                    std::io::Error::from(std::io::ErrorKind::IsADirectory),
-                ));
-            }
-            self.follow.stamps.push(Some(Stamp::of(&meta)));
-            let (replay, table) = (&mut self.replay, &mut self.table);
-            let mut framer = Framer::new();
-            match part.codec {
-                Some(codec) => {
-                    let mut data = Vec::new();
-                    file.read_to_end(&mut data)
-                        .map_err(|e| Error::io(&part.path, e))?;
-                    codec::for_each_item(codec, &data, &mut |item| match item {
-                        Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
-                        Item::CutShort { offset, out } => {
-                            replay.cut_short(offset);
-                            framer.push(&out, &mut |l| replay.line(l, table))
-                        }
-                        Item::Corrupt { offset, out } => match replay.corrupt(offset, out.len()) {
-                            Policy::Recover => framer.push(&out, &mut |l| replay.line(l, table)),
-                            Policy::Skip => true,
-                            Policy::Stop => false,
-                        },
-                        Item::Break => {
-                            framer.brk();
-                            true
-                        }
-                    });
+            if let Err(e) = self.read_part(part, i == last) {
+                if !self.options.skip_unreadable {
+                    return Err(e);
                 }
-                None => {
-                    let mut buf = vec![0u8; 1 << 20];
-                    loop {
-                        let n = match file.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => n,
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(e) => return Err(Error::io(&part.path, e)),
-                        };
-                        if !framer.push(&buf[..n], &mut |l| replay.line(l, table)) {
-                            break;
-                        }
-                    }
-                }
+                self.skip(i, part, &e);
             }
             if self.replay.stopped.is_some() {
                 break; // a stop policy ends the read of the whole store (§4.10)
             }
-            self.replay.tail(framer.tail().len());
-            if i == last && part.codec.is_none() {
-                self.follow.offset = framer.committed();
-                self.follow.line = framer.number();
-                self.follow.tail = framer.tail().to_vec();
-                self.follow.check = read_check(&file, framer.committed());
-            }
+        }
+        // Parts a stop left unread are stamped too, so that `refresh` sees whether they change.
+        for part in &list[self.follow.stamps.len()..] {
+            let meta = std::fs::metadata(&part.path).ok();
+            self.follow.stamps.push(meta.map(|m| Stamp::of(&m)));
         }
         self.parts = list
             .into_iter()
@@ -393,6 +361,95 @@ impl Store {
             })
             .collect();
         Ok(())
+    }
+
+    /// Replay one part; `last` marks the store's last part, whose end the follow state records.
+    fn read_part(&mut self, part: &parts::Part, last: bool) -> Result<(), Error> {
+        let mut file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
+        let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
+        if meta.is_dir() {
+            return Err(Error::io(
+                &part.path,
+                std::io::Error::from(std::io::ErrorKind::IsADirectory),
+            ));
+        }
+        self.follow.stamps.push(Some(Stamp::of(&meta)));
+        if part.codec.is_some_and(|c| !c.supported()) {
+            return Err(unsupported(part));
+        }
+        let (replay, table) = (&mut self.replay, &mut self.table);
+        let mut framer = Framer::new();
+        match part.codec {
+            Some(codec) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data)
+                    .map_err(|e| Error::io(&part.path, e))?;
+                codec::for_each_item(codec, &data, &mut |item| match item {
+                    Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
+                    Item::CutShort { offset, out } => {
+                        replay.cut_short(offset);
+                        framer.push(&out, &mut |l| replay.line(l, table))
+                    }
+                    Item::Corrupt { offset, out } => match replay.corrupt(offset, out.len()) {
+                        Policy::Recover => framer.push(&out, &mut |l| replay.line(l, table)),
+                        Policy::Skip => true,
+                        Policy::Stop => false,
+                    },
+                    Item::Break => {
+                        framer.brk();
+                        true
+                    }
+                });
+            }
+            None => {
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    let n = match file.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(Error::io(&part.path, e)),
+                    };
+                    if !framer.push(&buf[..n], &mut |l| replay.line(l, table)) {
+                        break;
+                    }
+                }
+            }
+        }
+        if self.replay.stopped.is_some() {
+            return Ok(());
+        }
+        self.replay.tail(framer.tail().len());
+        if last && part.codec.is_none() {
+            self.follow.offset = framer.committed();
+            self.follow.line = framer.number();
+            self.follow.tail = framer.tail().to_vec();
+            self.follow.check = read_check(&file, framer.committed());
+        }
+        Ok(())
+    }
+
+    /// Record part `i` as skipped: it could not be read (§21.8.5). The replay goes on with the
+    /// next part from the state it had reached.
+    fn skip(&mut self, i: usize, part: &parts::Part, e: &Error) {
+        if self.follow.stamps.len() == i {
+            let meta = std::fs::metadata(&part.path).ok();
+            self.follow.stamps.push(meta.map(|m| Stamp::of(&m)));
+        }
+        let reason = match e {
+            Error::Io { source, .. } => source.to_string(),
+            other => other.to_string(),
+        };
+        if let Some(w) = &self.options.warnings {
+            w(&Warning {
+                part: part.path.clone(),
+                offset: None,
+                message: format!(
+                    "skipped this part, which cannot be read ({reason}); the read is incomplete"
+                ),
+            });
+        }
+        self.unreadable.push(part.path.clone());
     }
 
     pub fn path(&self) -> &Path {
@@ -482,6 +539,17 @@ impl Store {
         self.replay.stopped.as_ref()
     }
 
+    /// The parts skipped because they could not be read (with [`Options::skip_unreadable`]).
+    pub fn unreadable(&self) -> &[PathBuf] {
+        &self.unreadable
+    }
+
+    /// Whether the read missed something: a part was skipped, or a `stop` policy ended it
+    /// (§4.10). Such a read has failed, and nothing should be changed on its strength.
+    pub fn incomplete(&self) -> bool {
+        self.replay.stopped.is_some() || !self.unreadable.is_empty()
+    }
+
     pub fn damaged(&self) -> bool {
         self.replay.damaged
     }
@@ -546,13 +614,14 @@ impl Store {
     fn follow_append(&mut self, stamp: Stamp) -> Result<bool, Error> {
         let last = self.parts.len() - 1;
         let path = self.parts[last].path.clone();
-        let Some(old) = self.follow.stamps[last] else {
+        let Some(old) = self.follow.stamps.get(last).copied().flatten() else {
             return Ok(false);
         };
         let offset = self.follow.offset;
         let want = offset.min(CHECK_BYTES) as usize;
         if self.replay.stopped.is_some()
             || self.parts[last].codec.is_some()
+            || self.unreadable.contains(&path)
             || stamp.ino != old.ino
             || stamp.size < offset
             || stamp.size <= old.size
@@ -952,5 +1021,102 @@ mod tests {
         append(&p, b"#hdr\nk\tv\n");
         assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
         assert_eq!(s.header(), Some("#hdr"));
+    }
+
+    fn skipping(warned: &Arc<std::sync::Mutex<Vec<crate::Warning>>>) -> Options {
+        let w = warned.clone();
+        Options {
+            skip_unreadable: true,
+            warnings: Some(Arc::new(move |x: &crate::Warning| {
+                w.lock().unwrap().push(x.clone())
+            })),
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn an_unreadable_part_is_skipped_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"#_defaults_#\td1\td2\na\t1\n");
+        let hole = dir.path().join("s.tsvz.1");
+        fs::create_dir(&hole).unwrap();
+        write(dir.path(), "s.tsvz.2", b"b\t2\n");
+        assert!(matches!(
+            Store::open(&p, Options::default()),
+            Err(Error::Io { .. })
+        ));
+        let warned = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Store::open(&p, skipping(&warned)).unwrap();
+        // The replay goes on past the skipped part with the markers it had reached.
+        assert_eq!(rows(&s), vec![v(&["a", "1", "d2"]), v(&["b", "2", "d2"])]);
+        assert_eq!(s.unreadable(), std::slice::from_ref(&hole));
+        assert!(s.incomplete() && s.stopped().is_none());
+        let warned = warned.lock().unwrap();
+        assert_eq!(warned.len(), 1);
+        assert_eq!(warned[0].part, hole);
+        assert!(warned[0].message.contains("skipped"), "{:?}", warned[0]);
+        let whole = write(dir.path(), "t.tsvz", b"a\t1\n");
+        assert!(
+            !Store::open(whole, skipping(&warned_none()))
+                .unwrap()
+                .incomplete()
+        );
+    }
+
+    fn warned_none() -> Arc<std::sync::Mutex<Vec<crate::Warning>>> {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    #[test]
+    fn a_store_with_a_skipped_part_follows_appends_and_reloads_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let hole = dir.path().join("s.tsvz.1");
+        fs::create_dir(&hole).unwrap();
+        let last = write(dir.path(), "s.tsvz.2", b"b\t2\n");
+        let mut s = Store::open(&p, skipping(&warned_none())).unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Unchanged);
+        append(&last, b"c\t3\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(keys(&s), vec!["a", "b", "c"]);
+        assert!(s.incomplete());
+        fs::remove_dir(&hole).unwrap();
+        fs::write(&hole, "x\t9\n").unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["a", "x", "b", "c"]);
+        assert!(s.unreadable().is_empty() && !s.incomplete());
+    }
+
+    #[test]
+    fn a_read_that_stopped_before_the_last_part_refreshes_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            "s.tsvz",
+            b"#_on_corruption_#\tstop\na\t1\n\0x\t1\n",
+        );
+        let last = write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(keys(&s), vec!["a"]);
+        assert_eq!(s.refresh().unwrap(), Refreshed::Unchanged);
+        append(&last, b"c\t3\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["a"]);
+        assert!(s.stopped().is_some());
+    }
+
+    #[test]
+    fn a_skipped_last_part_reloads_on_any_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let hole = dir.path().join("s.tsvz.1");
+        fs::create_dir(&hole).unwrap();
+        let mut s = Store::open(&p, skipping(&warned_none())).unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Unchanged);
+        fs::remove_dir(&hole).unwrap();
+        fs::write(&hole, "b\t2\n").unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["a", "b"]);
+        assert!(!s.incomplete());
     }
 }

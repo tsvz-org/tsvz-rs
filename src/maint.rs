@@ -334,10 +334,13 @@ fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// A whole read for a rewrite: never past a part it cannot read, since what it writes would
+/// lose that part's rows.
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
         verify: false,
+        skip_unreadable: false,
         ..options.clone()
     }
 }
@@ -720,5 +723,22 @@ mod tests {
             0,
             "backup mode {mode:o} has setuid, setgid, sticky, execute or shared write bits"
         );
+    }
+
+    #[test]
+    fn clear_never_reads_past_an_unreadable_part() {
+        // Tombstones for the keys a partial read saw would miss the unread part's keys.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::create_dir(dir.path().join("s.tsvz.1")).unwrap();
+        let last = dir.path().join("s.tsvz.2");
+        fs::write(&last, "b\t2\n").unwrap();
+        let skipping = Options {
+            skip_unreadable: true,
+            ..opts()
+        };
+        assert!(matches!(clear(&p, &skipping), Err(Error::Io { .. })));
+        assert_eq!(fs::read_to_string(&last).unwrap(), "b\t2\n");
     }
 }

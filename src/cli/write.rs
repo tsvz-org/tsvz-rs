@@ -11,7 +11,7 @@ use crate::frame::Framer;
 use crate::replay::{Cells, Markers};
 use crate::store::Row;
 use crate::write::{Record, Writer, tombstones};
-use crate::{Error, Scope, Warning};
+use crate::{Error, Scope, Store, Warning};
 
 fn writer(ctx: &Ctx, member_size: Option<u64>) -> Result<Writer, Error> {
     let mut w = Writer::open(&ctx.store)?
@@ -130,8 +130,8 @@ fn print(ctx: &mut Ctx, key: &str, cells: &[String]) -> Result<(), Error> {
 pub(crate) fn pop(ctx: &mut Ctx) -> Result<i32, Error> {
     let requested = ctx.args.args[0].clone();
     let store = ctx.open(Scope::Keys(vec![requested.clone()]), false)?;
-    if store.stopped().is_some() {
-        return Ok(1); // no change is based on a read that stopped (§4.10)
+    if store.incomplete() {
+        return Ok(1); // no change is based on a read that failed (§4.10)
     }
     let key = store.lookup_key(&requested).to_string();
     let Some(row) = store.get(&key) else {
@@ -148,7 +148,7 @@ pub(crate) fn pop(ctx: &mut Ctx) -> Result<i32, Error> {
 /// `popitem [first|last]` (§20.2).
 pub(crate) fn popitem(ctx: &mut Ctx) -> Result<i32, Error> {
     let store = ctx.open(Scope::All, false)?;
-    if store.stopped().is_some() {
+    if store.incomplete() {
         return Ok(1);
     }
     let pick = if ctx.args.args.first().map(String::as_str) == Some("first") {
@@ -179,7 +179,7 @@ pub(crate) fn setdefault(ctx: &mut Ctx) -> Result<i32, Error> {
         Err(Error::Missing(_)) => None,
         Err(e) => return Err(e),
     };
-    if store.as_ref().is_some_and(|s| s.stopped().is_some()) {
+    if store.as_ref().is_some_and(Store::incomplete) {
         return Ok(1);
     }
     let markers = store

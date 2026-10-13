@@ -141,6 +141,35 @@ fn missing_and_unreadable_stores_exit_1_naming_the_path() {
 }
 
 #[test]
+fn a_part_that_cannot_be_read_is_skipped_and_the_read_fails() {
+    // §21.8.5 and §4.10: print what could be read, exit 1; change nothing on such a read.
+    let d = store("a\t1\n");
+    fs::create_dir(d.path().join("s.tsvz.1")).unwrap();
+    let last = d.path().join("s.tsvz.2");
+    fs::write(&last, "b\t2\n").unwrap();
+    let (code, out, err) = records(d.path(), &["read", "s.tsvz"]);
+    assert_eq!((code, out.as_str()), (1, "a\t1\nb\t2\n"));
+    assert!(err.contains("s.tsvz.1") && err.contains("skipped"), "{err}");
+    assert_eq!(
+        records(d.path(), &["get", "s.tsvz", "b"]),
+        (1, "b\t2\n".into(), err.clone())
+    );
+    assert_eq!(records(d.path(), &["len", "s.tsvz"]).1, "2\n");
+    assert_eq!(records(d.path(), &["len", "s.tsvz"]).0, 1);
+    assert_eq!(records(d.path(), &["has", "s.tsvz", "b"]).0, 1);
+    for change in [
+        &["pop", "s.tsvz", "b"][..],
+        &["popitem", "s.tsvz"],
+        &["setdefault", "s.tsvz", "c", "3"],
+        &["clear", "s.tsvz"],
+    ] {
+        let (code, out, _) = records(d.path(), change);
+        assert_eq!((code, out.as_str()), (1, ""), "{change:?}");
+        assert_eq!(fs::read_to_string(&last).unwrap(), "b\t2\n", "{change:?}");
+    }
+}
+
+#[test]
 fn awkward_paths() {
     let d = tempfile::tempdir().unwrap();
     fs::write(d.path().join("my store ü.tsvz"), "k\tv\n").unwrap();
@@ -671,7 +700,7 @@ fn an_unreadable_part_exits_1_naming_it() {
     fs::set_permissions(&part, fs::Permissions::from_mode(0o000)).unwrap();
     let (code, out, err) = records(d.path(), &["read", "s.tsvz"]);
     fs::set_permissions(&part, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert_eq!((code, out.as_str()), (1, "a\tx\n"), "{err}");
     assert!(
         err.contains("s.tsvz.1") && err.contains("ermission") && !err.contains("panicked"),
         "{err}"
