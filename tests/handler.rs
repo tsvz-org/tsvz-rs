@@ -670,3 +670,45 @@ fn a_handler_whose_standard_error_is_closed_keeps_serving() {
     assert_eq!(child.wait().unwrap().code(), Some(0));
     assert!(!pointer::path_of(&s).exists());
 }
+
+#[test]
+fn a_handler_whose_socket_directory_was_removed_still_stops() {
+    // As /run/user/UID is removed at logout: stopping must not need the socket path.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = tsvz()
+        .arg("serve")
+        .arg(&s)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", tmp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while connect(&s).is_none() {
+        assert!(Instant::now() < deadline, "no handler");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let info = pointer::lookup(&s).unwrap().unwrap();
+    let socket = PathBuf::from(&info.address["unix:".len()..]);
+    assert!(socket.starts_with(tmp.path()), "{}", socket.display());
+    fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+    // SAFETY: kill only sends a signal to the child, which is still ours to reap.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("serve did not exit after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0));
+    assert!(!pointer::path_of(&s).exists());
+}

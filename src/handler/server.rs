@@ -46,7 +46,8 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
 /// What the connections and the stoppers share.
 struct Shared {
     stopping: AtomicBool,
-    socket: PathBuf,
+    /// The write end of the accept loop's wake-up pair.
+    wake: UnixStream,
     /// Open connections (for the idle timeout) and when the last one closed.
     activity: Mutex<(usize, Instant)>,
     /// A handle on each open connection, to end it when the handler stops.
@@ -55,10 +56,12 @@ struct Shared {
 }
 
 impl Shared {
-    /// Make the accept loop return: set the flag, then wake it with a connection of our own.
+    /// Make the accept loop return: set the flag, then wake it through its own pair of sockets,
+    /// which needs no path (the socket's directory may be gone, as `/run/user/UID` is after a
+    /// logout).
     fn stop(&self) {
         if !self.stopping.swap(true, Ordering::SeqCst) {
-            let _ = UnixStream::connect(&self.socket);
+            let _ = (&self.wake).write_all(b"x");
         }
     }
 }
@@ -199,6 +202,20 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         }
     };
     let address = format!("unix:{}", socket.display());
+    let woken = UnixStream::pair().and_then(|pair| {
+        listener.set_nonblocking(true)?;
+        pair.1.set_nonblocking(true)?;
+        Ok(pair)
+    });
+    let (wake, wakened) = match woken {
+        Ok(pair) => pair,
+        Err(e) => {
+            engine.close();
+            let _ = std::fs::remove_dir_all(&dir);
+            held.release();
+            return Err(Error::io(&socket, e));
+        }
+    };
     if let Err(e) = held.publish(&address) {
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
@@ -207,7 +224,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     }
     let shared = Arc::new(Shared {
         stopping: AtomicBool::new(false),
-        socket,
+        wake,
         activity: Mutex::new((0, Instant::now())),
         open: Mutex::new(HashMap::new()),
         next: AtomicU64::new(0),
@@ -229,14 +246,26 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         store.display(),
         std::process::id()
     ));
-    for conn in listener.incoming() {
+    loop {
+        let ready = wait_for(&listener, &wakened);
         if shared.stopping.load(Ordering::SeqCst) {
             break;
         }
-        let Ok(stream) = conn else {
-            std::thread::sleep(Duration::from_millis(10)); // out of descriptors, for a moment
-            continue;
+        if !ready {
+            continue; // interrupted
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10)); // out of descriptors, for a moment
+                continue;
+            }
         };
+        // An accepted socket inherits non-blocking mode on some systems (BSD, macOS).
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         let (engine, shared, info) = (engine.clone(), shared.clone(), config.info.clone());
         let verbose = config.verbose;
         std::thread::spawn(move || serve_connection(stream, &engine, &shared, &info, verbose));
@@ -250,6 +279,26 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     held.release();
     (config.info)(&format!("stopped serving {}", store.display()));
     Ok(())
+}
+
+/// Wait until a connection can be accepted on `listener` or the stop pair `wakened` is
+/// written to; false when the wait failed (and should be retried).
+fn wait_for(listener: &UnixListener, wakened: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wakened.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: poll reads and writes the two pollfd entries, whose descriptors stay open.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) > 0 }
 }
 
 fn watch_idle(idle: Duration, shared: Arc<Shared>, info: InfoFn) {
