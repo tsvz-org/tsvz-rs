@@ -5,6 +5,7 @@ mod error;
 pub mod codec;
 pub mod digest;
 pub mod escape;
+pub mod frame;
 pub mod name;
 pub mod parts;
 
