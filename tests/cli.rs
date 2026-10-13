@@ -19,8 +19,16 @@ fn run_in(dir: &Path, args: &[&str], stdin: &[u8]) -> (i32, String, String) {
         .unwrap();
     use std::io::Write;
     child.stdin.take().unwrap().write_all(stdin).unwrap();
-    let Output { status, stdout, stderr } = child.wait_with_output().unwrap();
-    (status.code().unwrap_or(-1), String::from_utf8_lossy(&stdout).into(), String::from_utf8_lossy(&stderr).into())
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = child.wait_with_output().unwrap();
+    (
+        status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&stdout).into(),
+        String::from_utf8_lossy(&stderr).into(),
+    )
 }
 
 fn records(dir: &Path, args: &[&str]) -> (i32, String, String) {
@@ -38,13 +46,22 @@ fn store(content: &str) -> tempfile::TempDir {
 #[test]
 fn read_get_has_len_keys() {
     let d = store("#_defaults_#\td1\td2\n<#>h\tv<lt>\na\tx\n");
-    assert_eq!(records(d.path(), &["read", "s.tsvz"]), (0, "<#>h\tv<lt>\td2\na\tx\td2\n".into(), String::new()));
-    assert_eq!(records(d.path(), &["get", "s.tsvz", "a  ", "zz"]), (3, "a\tx\td2\nzz\td1\td2\n".into(), String::new()));
+    assert_eq!(
+        records(d.path(), &["read", "s.tsvz"]),
+        (0, "<#>h\tv<lt>\td2\na\tx\td2\n".into(), String::new())
+    );
+    assert_eq!(
+        records(d.path(), &["get", "s.tsvz", "a  ", "zz"]),
+        (3, "a\tx\td2\nzz\td1\td2\n".into(), String::new())
+    );
     assert_eq!(records(d.path(), &["has", "s.tsvz", "a"]).0, 0);
     assert_eq!(records(d.path(), &["has", "s.tsvz", "zz"]).0, 3);
     assert_eq!(records(d.path(), &["len", "s.tsvz"]).1, "2\n");
     assert_eq!(records(d.path(), &["keys", "s.tsvz"]).1, "<#>h\na\n");
-    assert_eq!(records(d.path(), &["s.tsvz"]).1, "<#>h\tv<lt>\td2\na\tx\td2\n");
+    assert_eq!(
+        records(d.path(), &["s.tsvz"]).1,
+        "<#>h\tv<lt>\td2\na\tx\td2\n"
+    );
 }
 
 #[test]
@@ -52,15 +69,27 @@ fn verify_and_parts() {
     let d = store("#_checksum_crc32_#\na\tx\n#_checksum_crc32_#\tDEADBEEF\n");
     let (code, out, _) = records(d.path(), &["verify", "s.tsvz"]);
     assert_eq!(code, 4);
-    assert_eq!(out, format!("s.tsvz\t3\tcrc32\tdeadbeef\t{:08x}\n", crc32fast::hash(b"a\tx\n")));
+    assert_eq!(
+        out,
+        format!(
+            "s.tsvz\t3\tcrc32\tdeadbeef\t{:08x}\n",
+            crc32fast::hash(b"a\tx\n")
+        )
+    );
     fs::write(d.path().join("s.tsvz.a.gz"), b"").unwrap();
-    assert_eq!(records(d.path(), &["parts", "s.tsvz"]).1, "0\t\ts.tsvz\t\n1\ta\ts.tsvz.a.gz\tactive,gzip\n");
+    assert_eq!(
+        records(d.path(), &["parts", "s.tsvz"]).1,
+        "0\t\ts.tsvz\t\n1\ta\ts.tsvz.a.gz\tactive,gzip\n"
+    );
 }
 
 #[test]
 fn version_help_and_usage_errors() {
     let d = tempfile::tempdir().unwrap();
-    assert_eq!(run_in(d.path(), &["-V"], b"").1, format!("tsvz-rs {}\n", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        run_in(d.path(), &["-V"], b"").1,
+        format!("tsvz-rs {}\n", env!("CARGO_PKG_VERSION"))
+    );
     let (code, out, _) = run_in(d.path(), &["--help"], b"");
     assert!(code == 0 && out.contains("OPERATION STORE"));
     let (code, _, err) = run_in(d.path(), &["frobnicate", "s.tsvz"], b"");
@@ -75,11 +104,17 @@ fn missing_and_unreadable_stores_exit_1_naming_the_path() {
     assert!(err.contains("none.tsvz"), "{err}");
     fs::create_dir(d.path().join("dir.tsvz")).unwrap();
     let (code, _, err) = records(d.path(), &["get", "dir.tsvz", "k"]);
-    assert!(code == 1 && err.contains("dir.tsvz") && !err.contains("panicked"), "{err}");
+    assert!(
+        code == 1 && err.contains("dir.tsvz") && !err.contains("panicked"),
+        "{err}"
+    );
     fs::write(d.path().join("p.tsvz"), "a\tx\n").unwrap();
     fs::create_dir(d.path().join("p.tsvz.1")).unwrap();
     let (code, _, err) = records(d.path(), &["read", "p.tsvz"]);
-    assert!(code == 1 && err.contains("p.tsvz.1") && !err.contains("panicked"), "{err}");
+    assert!(
+        code == 1 && err.contains("p.tsvz.1") && !err.contains("panicked"),
+        "{err}"
+    );
     let (code, _, err) = records(d.path(), &["read", "notes.txt"]);
     assert!(code == 1 && err.contains("not a TSVZ store path"), "{err}");
 }
@@ -88,11 +123,22 @@ fn missing_and_unreadable_stores_exit_1_naming_the_path() {
 fn awkward_paths() {
     let d = tempfile::tempdir().unwrap();
     fs::write(d.path().join("my store ü.tsvz"), "k\tv\n").unwrap();
-    assert_eq!(records(d.path(), &["get", "my store ü.tsvz", "k"]).1, "k\tv\n");
+    assert_eq!(
+        records(d.path(), &["get", "my store ü.tsvz", "k"]).1,
+        "k\tv\n"
+    );
     fs::write(d.path().join("-dash.tsvz"), "k\tv\n").unwrap();
-    assert_eq!(records(d.path(), &["--", "-dash.tsvz", "get", "k"]).1, "k\tv\n");
+    assert_eq!(
+        records(d.path(), &["--", "-dash.tsvz", "get", "k"]).1,
+        "k\tv\n"
+    );
     use std::os::unix::ffi::OsStringExt;
-    let out = tsvz().current_dir(d.path()).arg("read").arg(std::ffi::OsString::from_vec(b"bad\xff.tsvz".to_vec())).output().unwrap();
+    let out = tsvz()
+        .current_dir(d.path())
+        .arg("read")
+        .arg(std::ffi::OsString::from_vec(b"bad\xff.tsvz".to_vec()))
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
 }
@@ -111,10 +157,19 @@ fn a_closed_stdout_ends_quietly() {
         .unwrap();
     let mut first = [0u8; 16];
     use std::io::Read;
-    child.stdout.as_mut().unwrap().read_exact(&mut first).unwrap();
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut first)
+        .unwrap();
     drop(child.stdout.take());
     let out = child.wait_with_output().unwrap();
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -140,11 +195,23 @@ fn set_append_delete_write_records() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     assert_eq!(records(dir, &["set", "s.tsvz", "#k", "a\tb", "<", ""]).0, 0);
-    assert_eq!(records(dir, &["append", "s.tsvz", "#_defaults_#", "d1"]).0, 0);
+    assert_eq!(
+        records(dir, &["append", "s.tsvz", "#_defaults_#", "d1"]).0,
+        0
+    );
     assert_eq!(records(dir, &["set", "s.tsvz", "gone"]).0, 0);
-    assert_eq!(records(dir, &["delete", "s.tsvz", "x", "#_defaults_#"]).0, 0);
-    assert_eq!(file(dir, "s.tsvz"), "<#>k\ta<sep>b\t<lt>\t\n#_defaults_#\td1\ngone\nx\n#_defaults_#\n");
-    assert_eq!(records(dir, &["set", "-v", "s.tsvz", "--", "carol", "-5"]).0, 0);
+    assert_eq!(
+        records(dir, &["delete", "s.tsvz", "x", "#_defaults_#"]).0,
+        0
+    );
+    assert_eq!(
+        file(dir, "s.tsvz"),
+        "<#>k\ta<sep>b\t<lt>\t\n#_defaults_#\td1\ngone\nx\n#_defaults_#\n"
+    );
+    assert_eq!(
+        records(dir, &["set", "-v", "s.tsvz", "--", "carol", "-5"]).0,
+        0
+    );
     assert_eq!(records(dir, &["get", "s.tsvz", "carol"]).1, "carol\t-5\n");
 }
 
@@ -152,12 +219,20 @@ fn set_append_delete_write_records() {
 fn bulk_input() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    let input = b"\xef\xbb\xbfa\tx<LF>y\r\n# comment\n\n#_defaults_#\td\nb\na\nc\t\nunterminated\tz";
+    let input =
+        b"\xef\xbb\xbfa\tx<LF>y\r\n# comment\n\n#_defaults_#\td\nb\na\nc\t\nunterminated\tz";
     let (code, _, err) = run_in(dir, &["set", "s.tsvz", "-"], input);
     assert_eq!(code, 0);
     assert!(err.contains("unterminated"), "{err}");
-    assert_eq!(file(dir, "s.tsvz"), "a\tx<LF>y\n#_defaults_#\td\nb\na\nc\t\n");
-    let (code, _, _) = run_in(dir, &["delete", "s.tsvz", "-"], b"c\textra\n#_defaults_#\n# skip\n<#>h\n");
+    assert_eq!(
+        file(dir, "s.tsvz"),
+        "a\tx<LF>y\n#_defaults_#\td\nb\na\nc\t\n"
+    );
+    let (code, _, _) = run_in(
+        dir,
+        &["delete", "s.tsvz", "-"],
+        b"c\textra\n#_defaults_#\n# skip\n<#>h\n",
+    );
     assert_eq!(code, 0);
     assert!(file(dir, "s.tsvz").ends_with("c\t\nc\n#_defaults_#\n<#>h\n"));
     fs::write(dir.join("c.csvz"), "").unwrap();
@@ -169,22 +244,44 @@ fn bulk_input() {
 fn pop_popitem_setdefault() {
     let d = store("#_defaults_#\td1\td2\na\t1\nb\t2\nc\t3\n");
     let dir = d.path();
-    assert_eq!(records(dir, &["pop", "s.tsvz", "b"]), (0, "b\t2\td2\n".into(), String::new()));
+    assert_eq!(
+        records(dir, &["pop", "s.tsvz", "b"]),
+        (0, "b\t2\td2\n".into(), String::new())
+    );
     assert_eq!(records(dir, &["pop", "s.tsvz", "b"]).0, 3);
-    assert_eq!(records(dir, &["popitem", "s.tsvz", "first"]).1, "a\t1\td2\n");
+    assert_eq!(
+        records(dir, &["popitem", "s.tsvz", "first"]).1,
+        "a\t1\td2\n"
+    );
     assert_eq!(records(dir, &["popitem", "s.tsvz"]).1, "c\t3\td2\n");
     assert_eq!(records(dir, &["popitem", "s.tsvz"]).0, 3);
-    assert_eq!(records(dir, &["setdefault", "s.tsvz", "n", "v "]).1, "n\tv\td2\n");
-    assert_eq!(records(dir, &["setdefault", "s.tsvz", "n", "other"]).1, "n\tv\td2\n");
-    assert_eq!(records(dir, &["setdefault", "s.tsvz", "#_defaults_#", "x"]).0, 2);
-    assert!(file(dir, "s.tsvz").starts_with("#_defaults_#\td1\td2\na\t1\nb\t2\nc\t3\nb\na\nc\nn\tv \n"));
+    assert_eq!(
+        records(dir, &["setdefault", "s.tsvz", "n", "v "]).1,
+        "n\tv\td2\n"
+    );
+    assert_eq!(
+        records(dir, &["setdefault", "s.tsvz", "n", "other"]).1,
+        "n\tv\td2\n"
+    );
+    assert_eq!(
+        records(dir, &["setdefault", "s.tsvz", "#_defaults_#", "x"]).0,
+        2
+    );
+    assert!(
+        file(dir, "s.tsvz").starts_with("#_defaults_#\td1\td2\na\t1\nb\t2\nc\t3\nb\na\nc\nn\tv \n")
+    );
 }
 
 #[test]
 fn writes_create_missing_stores_and_reads_do_not() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    for (op, args) in [("set", vec!["k", "v"]), ("append", vec!["k", "v"]), ("delete", vec!["k"]), ("setdefault", vec!["k", "v"])] {
+    for (op, args) in [
+        ("set", vec!["k", "v"]),
+        ("append", vec!["k", "v"]),
+        ("delete", vec!["k"]),
+        ("setdefault", vec!["k", "v"]),
+    ] {
         let name = format!("{op}.tsvz");
         let mut all = vec![op, name.as_str()];
         all.extend(args);
@@ -213,7 +310,10 @@ fn a_stopped_store_is_not_changed_by_pop() {
 #[test]
 fn clear_and_scrub_from_the_command_line() {
     let d = store("#hdr\na\tx\nb\na\ty\n");
-    assert_eq!(records(d.path(), &["scrub", "s.tsvz"]), (0, String::new(), String::new()));
+    assert_eq!(
+        records(d.path(), &["scrub", "s.tsvz"]),
+        (0, String::new(), String::new())
+    );
     assert_eq!(file(d.path(), "s.tsvz"), "#hdr\n#_version_#\t1\na\ty\n");
     assert_eq!(records(d.path(), &["clear", "s.tsvz"]).0, 0);
     assert_eq!(file(d.path(), "s.tsvz"), "#hdr\n");
@@ -230,7 +330,10 @@ fn clear_and_scrub_from_the_command_line() {
 fn table_format_on_request() {
     let d = store("alpha\tA\t1\nbeta\tB<sep>x\t2\n");
     let (code, out, _) = run_in(d.path(), &["--format", "table", "read", "s.tsvz"], b"");
-    assert_eq!((code, out.as_str()), (0, "alpha | A    | 1\nbeta  | B\\tx | 2\n\n"));
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "alpha | A    | 1\nbeta  | B\\tx | 2\n\n")
+    );
     let (_, empty, _) = run_in(d.path(), &["--format", "table", "verify", "s.tsvz"], b"");
     assert_eq!(empty, "");
 }
@@ -239,15 +342,25 @@ fn table_format_on_request() {
 fn loose_files_by_the_simple_rule() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    fs::write(dir.join("s.csv"), "#name,age\nalice,30\nbob,40\nbob\ncarol,<lt>\n").unwrap();
+    fs::write(
+        dir.join("s.csv"),
+        "#name,age\nalice,30\nbob,40\nbob\ncarol,<lt>\n",
+    )
+    .unwrap();
     assert_eq!(records(dir, &["read", "s.csv"]).1, "alice,30\ncarol,<lt>\n");
     let (code, _, err) = records(dir, &["set", "s.csv", "dave", "a,b"]);
     assert!(code == 1 && err.contains("loose file"), "{err}");
     assert_eq!(records(dir, &["set", "s.csv", "dave", "41"]).0, 0);
-    assert_eq!(records(dir, &["verify", "s.csv"]), (0, String::new(), String::new()));
+    assert_eq!(
+        records(dir, &["verify", "s.csv"]),
+        (0, String::new(), String::new())
+    );
     assert_eq!(records(dir, &["parts", "s.csv"]).1, "0\t\ts.csv\tactive\n");
     assert_eq!(records(dir, &["scrub", "s.csv"]).0, 0);
-    assert_eq!(file(dir, "s.csv"), "#name,age\nalice,30\ncarol,<lt>\ndave,41\n");
+    assert_eq!(
+        file(dir, "s.csv"),
+        "#name,age\nalice,30\ncarol,<lt>\ndave,41\n"
+    );
     assert_eq!(records(dir, &["clear", "s.csv"]).0, 0);
     assert_eq!(file(dir, "s.csv"), "#name,age\n");
 }

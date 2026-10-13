@@ -82,7 +82,9 @@ fn split_ext(name: &str) -> (&str, Option<&str>) {
     let start = name.rfind('/').map_or(0, |i| i + 1);
     let base = &name[start..];
     match base.rfind('.') {
-        Some(dot) if base[..dot].bytes().any(|b| b != b'.') => (&name[..start + dot], Some(&base[dot + 1..])),
+        Some(dot) if base[..dot].bytes().any(|b| b != b'.') => {
+            (&name[..start + dot], Some(&base[dot + 1..]))
+        }
         _ => (name, None),
     }
 }
@@ -129,7 +131,10 @@ pub struct Numbered {
 /// Parse what follows `<store>.<ext>.` in a directory entry; None when it is not a part name
 /// (for example a pointer file `….serve` or a backup `….damaged-…`).
 pub fn parse_numbered(rest: &str) -> Option<Numbered> {
-    let hex_end = rest.bytes().position(|b| !b.is_ascii_hexdigit()).unwrap_or(rest.len());
+    let hex_end = rest
+        .bytes()
+        .position(|b| !b.is_ascii_hexdigit())
+        .unwrap_or(rest.len());
     if hex_end == 0 {
         return None;
     }
@@ -147,7 +152,11 @@ pub fn parse_numbered(rest: &str) -> Option<Numbered> {
         }
         Some(Codec::from_suffix(suffix)?)
     };
-    Some(Numbered { ordinal: rest[..hex_end].to_string(), rotated, codec })
+    Some(Numbered {
+        ordinal: rest[..hex_end].to_string(),
+        rotated,
+        codec,
+    })
 }
 
 /// A sort key that orders ordinals by their hexadecimal value, of any length, without
@@ -179,7 +188,10 @@ mod tests {
     #[test]
     fn split_codec_strips_only_a_codec_suffix() {
         assert_eq!(split_codec("a/s.tsvz.gz"), ("a/s.tsvz", Some(Codec::Gzip)));
-        assert_eq!(split_codec("s.tsvz.10.rotated.XZ"), ("s.tsvz.10.rotated", Some(Codec::Xz)));
+        assert_eq!(
+            split_codec("s.tsvz.10.rotated.XZ"),
+            ("s.tsvz.10.rotated", Some(Codec::Xz))
+        );
         assert_eq!(split_codec("s.tsvz"), ("s.tsvz", None));
         assert_eq!(split_codec("dir.gz/s.tsvz"), ("dir.gz/s.tsvz", None));
         assert_eq!(split_codec(".gz"), (".gz", None));
@@ -188,12 +200,48 @@ mod tests {
     #[test]
     fn format_from_the_variant_extension() {
         let f = |p: &str| format_of(Path::new(p));
-        assert_eq!(f("s.tsvz"), Some(Format { delimiter: b'\t', strict: true }));
-        assert_eq!(f("s.CSVZ"), Some(Format { delimiter: b',', strict: true }));
-        assert_eq!(f("s.nsvz.gz"), Some(Format { delimiter: 0, strict: true }));
-        assert_eq!(f("s.psvz.1f.rotated.zst"), Some(Format { delimiter: b'|', strict: true }));
-        assert_eq!(f("dir/s.tsv"), Some(Format { delimiter: b'\t', strict: false }));
-        assert_eq!(f("s.csv.0190c3a1"), Some(Format { delimiter: b',', strict: false }));
+        assert_eq!(
+            f("s.tsvz"),
+            Some(Format {
+                delimiter: b'\t',
+                strict: true
+            })
+        );
+        assert_eq!(
+            f("s.CSVZ"),
+            Some(Format {
+                delimiter: b',',
+                strict: true
+            })
+        );
+        assert_eq!(
+            f("s.nsvz.gz"),
+            Some(Format {
+                delimiter: 0,
+                strict: true
+            })
+        );
+        assert_eq!(
+            f("s.psvz.1f.rotated.zst"),
+            Some(Format {
+                delimiter: b'|',
+                strict: true
+            })
+        );
+        assert_eq!(
+            f("dir/s.tsv"),
+            Some(Format {
+                delimiter: b'\t',
+                strict: false
+            })
+        );
+        assert_eq!(
+            f("s.csv.0190c3a1"),
+            Some(Format {
+                delimiter: b',',
+                strict: false
+            })
+        );
         assert_eq!(f("s.txt"), None);
         assert_eq!(f("tsvz"), None);
     }
@@ -202,11 +250,19 @@ mod tests {
     fn numbered_part_names() {
         assert_eq!(
             parse_numbered("0190c3a1"),
-            Some(Numbered { ordinal: "0190c3a1".into(), rotated: false, codec: None })
+            Some(Numbered {
+                ordinal: "0190c3a1".into(),
+                rotated: false,
+                codec: None
+            })
         );
         assert_eq!(
             parse_numbered("B.rotated.gz"),
-            Some(Numbered { ordinal: "B".into(), rotated: true, codec: Some(Codec::Gzip) })
+            Some(Numbered {
+                ordinal: "B".into(),
+                rotated: true,
+                codec: Some(Codec::Gzip)
+            })
         );
         assert_eq!(parse_numbered("1.Zstd").unwrap().codec, Some(Codec::Zstd));
         assert_eq!(parse_numbered("1.serve"), None);
@@ -218,8 +274,29 @@ mod tests {
 
     #[test]
     fn ordinals_compare_as_hex_integers() {
-        let mut ords = vec!["10", "f", "002", "1", "B", "a", "0", "00000000000000000000000000000000ff"];
+        let mut ords = vec![
+            "10",
+            "f",
+            "002",
+            "1",
+            "B",
+            "a",
+            "0",
+            "00000000000000000000000000000000ff",
+        ];
         ords.sort_by_key(|o| ordinal_key(o));
-        assert_eq!(ords, vec!["0", "1", "002", "a", "B", "f", "10", "00000000000000000000000000000000ff"]);
+        assert_eq!(
+            ords,
+            vec![
+                "0",
+                "1",
+                "002",
+                "a",
+                "B",
+                "f",
+                "10",
+                "00000000000000000000000000000000ff"
+            ]
+        );
     }
 }

@@ -77,7 +77,9 @@ pub fn is_marker_key(field: &str) -> bool {
     b.len() >= 5
         && b.starts_with(b"#_")
         && b.ends_with(b"_#")
-        && b[2..b.len() - 2].iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        && b[2..b.len() - 2]
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 #[cfg(test)]
@@ -86,7 +88,10 @@ mod tests {
 
     #[test]
     fn every_token_decodes() {
-        assert_eq!(decode("a<sep>b<LF>c<CR>d<NUL>e<lt>f<#>g", b'\t'), "a\tb\nc\rd\0e<f#g");
+        assert_eq!(
+            decode("a<sep>b<LF>c<CR>d<NUL>e<lt>f<#>g", b'\t'),
+            "a\tb\nc\rd\0e<f#g"
+        );
         assert_eq!(decode("a<sep>b", b','), "a,b");
         assert_eq!(decode("a<sep>b", b'|'), "a|b");
         assert_eq!(decode("a<sep>b<NUL>c", 0), "a\0b\0c");
@@ -101,12 +106,18 @@ mod tests {
         assert_eq!(decode("a<b", b'\t'), "a<b");
         assert_eq!(decode("ends<", b'\t'), "ends<");
         assert_eq!(decode("plain", b'\t'), "plain");
-        assert!(matches!(decode("plain", b'\t'), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            decode("plain", b'\t'),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
     fn encoding_inverts_decoding() {
-        assert_eq!(encode("a\tb\nc\rd\0e<f#g", b'\t', false), "a<sep>b<LF>c<CR>d<NUL>e<lt>f#g");
+        assert_eq!(
+            encode("a\tb\nc\rd\0e<f#g", b'\t', false),
+            "a<sep>b<LF>c<CR>d<NUL>e<lt>f#g"
+        );
         assert_eq!(encode("#k", b'\t', true), "<#>k");
         assert_eq!(encode("#k", b'\t', false), "#k");
         assert_eq!(encode("k#", b'\t', true), "k#");
@@ -123,10 +134,18 @@ mod tests {
 
     #[test]
     fn marker_key_pattern() {
-        for key in ["#_defaults_#", "#_X-y_#", "#__ext__#", "#_CHECKSUM_CRC32_#", "#_9_#"] {
+        for key in [
+            "#_defaults_#",
+            "#_X-y_#",
+            "#__ext__#",
+            "#_CHECKSUM_CRC32_#",
+            "#_9_#",
+        ] {
             assert!(is_marker_key(key), "{key}");
         }
-        for key in ["#__#", "#_a_", "#_a b_#", "#_a_# ", " #_a_#", "_a_#", "#foo", "#_ä_#", ""] {
+        for key in [
+            "#__#", "#_a_", "#_a b_#", "#_a_# ", " #_a_#", "_a_#", "#foo", "#_ä_#", "",
+        ] {
             assert!(!is_marker_key(key), "{key}");
         }
     }

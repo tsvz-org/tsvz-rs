@@ -79,7 +79,10 @@ pub struct Cells {
 }
 
 /// No cells: what a missing key's row resolves from (§14.5).
-pub static EMPTY_CELLS: Cells = Cells { text: String::new(), ends: Vec::new() };
+pub static EMPTY_CELLS: Cells = Cells {
+    text: String::new(),
+    ends: Vec::new(),
+};
 
 impl Cells {
     pub fn push(&mut self, cell: &str) {
@@ -227,7 +230,11 @@ impl Replay {
 
     fn warn(&self, offset: Option<u64>, message: String) {
         if let Some(w) = &self.warn {
-            w(&Warning { part: self.part.clone(), offset, message });
+            w(&Warning {
+                part: self.part.clone(),
+                offset,
+                message,
+            });
         }
     }
 
@@ -235,7 +242,12 @@ impl Replay {
     pub fn binding(&mut self) -> Arc<Binding> {
         let markers = &self.markers;
         self.binding
-            .get_or_insert_with(|| Arc::new(Binding { defaults: markers.defaults.clone(), fill_empty: markers.fill_empty }))
+            .get_or_insert_with(|| {
+                Arc::new(Binding {
+                    defaults: markers.defaults.clone(),
+                    fill_empty: markers.fill_empty,
+                })
+            })
             .clone()
     }
 
@@ -249,13 +261,20 @@ impl Replay {
                 let n = line.number;
                 match self.markers.on_corruption {
                     Policy::Stop => {
-                        self.stopped = Some(Damage { part: self.part.clone(), offset: line.offset, kind: DamageKind::ZeroFill });
+                        self.stopped = Some(Damage {
+                            part: self.part.clone(),
+                            offset: line.offset,
+                            kind: DamageKind::ZeroFill,
+                        });
                         self.warn(Some(line.offset), format!("line {n} holds zero bytes (zero-fill damage); reading stopped there (#_on_corruption_# stop)"));
                         return false;
                     }
                     Policy::Skip => {
                         self.feed(line.raw, None); // digests cover the line as written (§4.9)
-                        self.warn(Some(line.offset), format!("line {n} holds zero bytes (zero-fill damage); skipped it"));
+                        self.warn(
+                            Some(line.offset),
+                            format!("line {n} holds zero bytes (zero-fill damage); skipped it"),
+                        );
                         return true;
                     }
                     Policy::Recover => {
@@ -267,7 +286,13 @@ impl Replay {
         }
         let text = String::from_utf8_lossy(body);
         if matches!(text, Cow::Owned(_)) {
-            self.warn(Some(line.offset), format!("line {} is not valid UTF-8; replaced the bad bytes with U+FFFD", line.number));
+            self.warn(
+                Some(line.offset),
+                format!(
+                    "line {} is not valid UTF-8; replaced the bad bytes with U+FFFD",
+                    line.number
+                ),
+            );
         }
         if self.format.strict {
             self.strict_line(&text, line, first, sink);
@@ -291,7 +316,10 @@ impl Replay {
         if key_raw.starts_with('#') {
             if is_marker_key(key_raw) {
                 let lower = key_raw.to_ascii_lowercase();
-                if let Some(name) = lower.strip_prefix("#_checksum_").and_then(|n| n.strip_suffix("_#")) {
+                if let Some(name) = lower
+                    .strip_prefix("#_checksum_")
+                    .and_then(|n| n.strip_suffix("_#"))
+                {
                     let algo = Algo::from_name(name);
                     self.feed(line.raw, algo);
                     if let (Some(algo), true) = (algo, self.verify) {
@@ -315,7 +343,9 @@ impl Replay {
 
     fn checksum(&mut self, algo: Algo, rest: Option<&str>, number: u64) {
         let d = self.format.delimiter;
-        let value = rest.map(|r| escape::decode(split_first(r, d).0, d).into_owned()).unwrap_or_default();
+        let value = rest
+            .map(|r| escape::decode(split_first(r, d).0, d).into_owned())
+            .unwrap_or_default();
         match self.armed.iter().position(|(a, _)| *a == algo) {
             None => self.armed.push((algo, Accumulator::new(algo))), // the first marker arms; its value is ignored (§15.3)
             Some(i) => {
@@ -338,11 +368,15 @@ impl Replay {
         let d = self.format.delimiter;
         let mut fields = rest.into_iter().flat_map(move |r| r.split(d as char));
         if key == "#_defaults_#" {
-            self.markers.defaults = Arc::new(fields.map(|f| escape::decode(f, d).into_owned()).collect());
+            self.markers.defaults =
+                Arc::new(fields.map(|f| escape::decode(f, d).into_owned()).collect());
             self.binding = None;
             return;
         }
-        let value = fields.next().map(|f| escape::decode(f, d)).unwrap_or(Cow::Borrowed(""));
+        let value = fields
+            .next()
+            .map(|f| escape::decode(f, d))
+            .unwrap_or(Cow::Borrowed(""));
         let value: &str = &value;
         let lower = value.to_ascii_lowercase();
         let m = &mut self.markers;
@@ -405,7 +439,13 @@ impl Replay {
             _ => true, // a marker version 1 does not define: no effect (§12.3)
         };
         if !valid {
-            self.warn(Some(line.offset), format!("line {}: {} has an invalid value {:?}; ignored", line.number, key, value));
+            self.warn(
+                Some(line.offset),
+                format!(
+                    "line {}: {} has an invalid value {:?}; ignored",
+                    line.number, key, value
+                ),
+            );
         }
     }
 
@@ -424,7 +464,10 @@ impl Replay {
         let mut cells = Cells::default();
         if sink.wants_cells(&key) {
             for field in rest.split(d as char) {
-                cells.push(&escape::decode(if strip { trim_ws(field) } else { field }, d));
+                cells.push(&escape::decode(
+                    if strip { trim_ws(field) } else { field },
+                    d,
+                ));
             }
         }
         sink.put(&key, cells, &binding);
@@ -459,7 +502,10 @@ impl Replay {
     /// A member was cut short (§16.6): its whole lines are read.
     pub fn cut_short(&mut self, offset: usize) {
         self.damaged = true;
-        self.warn(Some(offset as u64), format!("the member at byte {offset} is cut short; its whole lines are read"));
+        self.warn(
+            Some(offset as u64),
+            format!("the member at byte {offset} is cut short; its whole lines are read"),
+        );
     }
 
     /// A corrupt member (§16.6): what the policy in force says to do with its output (§4.10).
@@ -467,11 +513,19 @@ impl Replay {
         self.damaged = true;
         let policy = self.markers.on_corruption;
         let message = match policy {
-            Policy::Recover => format!("used {decoded} bytes the corrupt member at byte {offset} decoded before it failed; they are not verified"),
+            Policy::Recover => format!(
+                "used {decoded} bytes the corrupt member at byte {offset} decoded before it failed; they are not verified"
+            ),
             Policy::Skip => format!("skipped the corrupt member at byte {offset}"),
             Policy::Stop => {
-                self.stopped = Some(Damage { part: self.part.clone(), offset: offset as u64, kind: DamageKind::CorruptMember });
-                format!("the member at byte {offset} is corrupt; reading stopped there (#_on_corruption_# stop)")
+                self.stopped = Some(Damage {
+                    part: self.part.clone(),
+                    offset: offset as u64,
+                    kind: DamageKind::CorruptMember,
+                });
+                format!(
+                    "the member at byte {offset} is corrupt; reading stopped there (#_on_corruption_# stop)"
+                )
             }
         };
         self.warn(Some(offset as u64), message);
@@ -481,7 +535,10 @@ impl Replay {
     /// Bytes after a part's last newline were ignored (§4.3).
     pub fn tail(&mut self, bytes: usize) {
         if bytes > 0 {
-            self.warn(None, format!("ignored {bytes} uncommitted bytes after the last newline"));
+            self.warn(
+                None,
+                format!("ignored {bytes} uncommitted bytes after the last newline"),
+            );
         }
     }
 }
@@ -511,12 +568,16 @@ mod tests {
         }
     }
 
-    const TSVZ: Format = Format { delimiter: b'\t', strict: true };
+    const TSVZ: Format = Format {
+        delimiter: b'\t',
+        strict: true,
+    };
 
     fn run(format: Format, verify: bool, data: &[u8]) -> (Replay, Rows, Vec<String>) {
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let sink = warnings.clone();
-        let warn: WarnFn = Arc::new(move |w: &Warning| sink.lock().unwrap().push(w.message.clone()));
+        let warn: WarnFn =
+            Arc::new(move |w: &Warning| sink.lock().unwrap().push(w.message.clone()));
         let mut replay = Replay::new(format, verify, Some(warn));
         replay.begin_part(Path::new("s.tsvz"), true);
         let mut rows = Rows::default();
@@ -543,8 +604,15 @@ mod tests {
     #[test]
     fn stripping_escaping_and_empty_keys() {
         let (_, rows, _) = run(TSVZ, false, b"a  \tx <LF>\n \t1\n\tz\n<#>h\tv<sep>w\n");
-        assert_eq!(table(&rows), vec![row("a", &["x \n"]), row("#h", &["v\tw"])]);
-        let (_, off, _) = run(TSVZ, false, b"#_strip_trailing_whites_#\tfalse\na \tx \n \t1\n");
+        assert_eq!(
+            table(&rows),
+            vec![row("a", &["x \n"]), row("#h", &["v\tw"])]
+        );
+        let (_, off, _) = run(
+            TSVZ,
+            false,
+            b"#_strip_trailing_whites_#\tfalse\na \tx \n \t1\n",
+        );
         assert_eq!(table(&off), vec![row("a ", &["x "]), row(" ", &["1"])]);
     }
 
@@ -562,19 +630,33 @@ mod tests {
 
     #[test]
     fn defaults_are_decoded_not_stripped_and_rows_bind_where_they_appear() {
-        let (r, rows, _) = run(TSVZ, false, b"#_defaults_#\td<sep>e \tf\na\t1\nb\t2\n#_defaults_#\tg\nc\t3\n");
+        let (r, rows, _) = run(
+            TSVZ,
+            false,
+            b"#_defaults_#\td<sep>e \tf\na\t1\nb\t2\n#_defaults_#\tg\nc\t3\n",
+        );
         assert_eq!(*r.markers.defaults, vec!["g".to_string()]);
-        assert_eq!(*rows.0[0].2.defaults, vec!["d\te ".to_string(), "f".to_string()]);
+        assert_eq!(
+            *rows.0[0].2.defaults,
+            vec!["d\te ".to_string(), "f".to_string()]
+        );
         assert!(Arc::ptr_eq(&rows.0[0].2, &rows.0[1].2));
         assert!(!Arc::ptr_eq(&rows.0[0].2, &rows.0[2].2));
     }
 
     #[test]
     fn comments_unknown_markers_and_the_header() {
-        let (r, rows, _) = run(TSVZ, false, b"#name\tage\n#__ext__#\tx\n#_frobnicate_#\ty\n #k\tv\n#_defaults_# \tz\n");
+        let (r, rows, _) = run(
+            TSVZ,
+            false,
+            b"#name\tage\n#__ext__#\tx\n#_frobnicate_#\ty\n #k\tv\n#_defaults_# \tz\n",
+        );
         assert_eq!(r.header.as_deref(), Some("#name\tage"));
         assert_eq!(table(&rows), vec![row(" #k", &["v"])]);
-        assert!(r.markers.defaults.is_empty(), "a marker key with a trailing space is a comment");
+        assert!(
+            r.markers.defaults.is_empty(),
+            "a marker key with a trailing space is a comment"
+        );
         let (m, _, _) = run(TSVZ, false, b"#_version_#\t1\n#c\n");
         assert_eq!(m.header, None);
     }
@@ -582,21 +664,45 @@ mod tests {
     #[test]
     fn zero_fill_under_each_policy() {
         let (_, rec, w) = run(TSVZ, false, b"a\t1\n\0\0b\t2\nc\t3\n");
-        assert_eq!(table(&rec), vec![row("a", &["1"]), row("b", &["2"]), row("c", &["3"])]);
+        assert_eq!(
+            table(&rec),
+            vec![row("a", &["1"]), row("b", &["2"]), row("c", &["3"])]
+        );
         assert_eq!(w.len(), 1);
-        let (_, skip, _) = run(TSVZ, false, b"#_on_corruption_#\tskip\na\t1\n\0\0b\t2\nc\t3\n");
+        let (_, skip, _) = run(
+            TSVZ,
+            false,
+            b"#_on_corruption_#\tskip\na\t1\n\0\0b\t2\nc\t3\n",
+        );
         assert_eq!(table(&skip), vec![row("a", &["1"]), row("c", &["3"])]);
-        let (r, stop, _) = run(TSVZ, false, b"#_on_corruption_#\tstop\na\t1\n\0\0b\t2\nc\t3\n");
+        let (r, stop, _) = run(
+            TSVZ,
+            false,
+            b"#_on_corruption_#\tstop\na\t1\n\0\0b\t2\nc\t3\n",
+        );
         assert_eq!(table(&stop), vec![row("a", &["1"])]);
-        assert_eq!(r.stopped.as_ref().map(|d| (d.offset, d.kind)), Some((27, DamageKind::ZeroFill)));
-        let (_, nsv, _) = run(Format { delimiter: 0, strict: true }, false, b"a\0x\n\0y\n");
+        assert_eq!(
+            r.stopped.as_ref().map(|d| (d.offset, d.kind)),
+            Some((27, DamageKind::ZeroFill))
+        );
+        let (_, nsv, _) = run(
+            Format {
+                delimiter: 0,
+                strict: true,
+            },
+            false,
+            b"a\0x\n\0y\n",
+        );
         assert_eq!(table(&nsv), vec![row("a", &["x"])]);
     }
 
     #[test]
     fn invalid_utf8_becomes_replacement_characters() {
         let (_, rows, w) = run(TSVZ, false, b"a\t\xff\xfeok\xe2\x82\n");
-        assert_eq!(table(&rows), vec![row("a", &["\u{fffd}\u{fffd}ok\u{fffd}"])]);
+        assert_eq!(
+            table(&rows),
+            vec![row("a", &["\u{fffd}\u{fffd}ok\u{fffd}"])]
+        );
         assert_eq!(w.len(), 1);
     }
 
@@ -604,15 +710,29 @@ mod tests {
     fn verify_segments() {
         let seg = b"a\tx\n#_checksum_sha256_#\n";
         let crc = format!("{:08x}", crc32fast::hash(seg));
-        let good = format!("#_checksum_crc32_#\tignored\n{}#_CHECKSUM_CRC32_#\t{}\n", std::str::from_utf8(seg).unwrap(), crc.to_uppercase());
+        let good = format!(
+            "#_checksum_crc32_#\tignored\n{}#_CHECKSUM_CRC32_#\t{}\n",
+            std::str::from_utf8(seg).unwrap(),
+            crc.to_uppercase()
+        );
         let (r, rows, _) = run(TSVZ, true, good.as_bytes());
         assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
         assert_eq!(table(&rows), vec![row("a", &["x"])]);
         let bad = b"#_checksum_crc32_#\na\tx\n#_checksum_crc32_#\tDEADBEEF\n#_checksum_crc32_#\t\n#_checksum_crc32_#\t11111111\n";
         let (r, _, _) = run(TSVZ, true, bad);
         assert_eq!(r.mismatches.len(), 2);
-        assert_eq!((r.mismatches[0].line, r.mismatches[0].algo, r.mismatches[0].expected.as_str()), (3, "crc32", "deadbeef"));
-        assert_eq!(r.mismatches[0].computed, format!("{:08x}", crc32fast::hash(b"a\tx\n")));
+        assert_eq!(
+            (
+                r.mismatches[0].line,
+                r.mismatches[0].algo,
+                r.mismatches[0].expected.as_str()
+            ),
+            (3, "crc32", "deadbeef")
+        );
+        assert_eq!(
+            r.mismatches[0].computed,
+            format!("{:08x}", crc32fast::hash(b"a\tx\n"))
+        );
         assert_eq!(r.mismatches[1].line, 5);
         let (off, _, _) = run(TSVZ, false, bad);
         assert!(off.mismatches.is_empty());
@@ -620,18 +740,32 @@ mod tests {
 
     #[test]
     fn loose_lines_are_split_raw() {
-        let (r, rows, _) = run(Format { delimiter: b',', strict: false }, false, b"#h,dr\nk,x<lt>,y \n#_defaults_#,d\nb\nk2, \n");
+        let (r, rows, _) = run(
+            Format {
+                delimiter: b',',
+                strict: false,
+            },
+            false,
+            b"#h,dr\nk,x<lt>,y \n#_defaults_#,d\nb\nk2, \n",
+        );
         assert_eq!(r.header.as_deref(), Some("#h,dr"));
         assert!(r.markers.defaults.is_empty());
-        assert_eq!(table(&rows), vec![row("k", &["x<lt>", "y "]), row("k2", &[" "])]);
+        assert_eq!(
+            table(&rows),
+            vec![row("k", &["x<lt>", "y "]), row("k2", &[" "])]
+        );
     }
 
     #[test]
     fn keys_only_sinks_get_no_cells() {
         struct Keys(Vec<(String, usize)>);
         impl Sink for Keys {
-            fn wants_cells(&self, _: &str) -> bool { false }
-            fn put(&mut self, key: &str, cells: Cells, _: &Arc<Binding>) { self.0.push((key.into(), cells.len())); }
+            fn wants_cells(&self, _: &str) -> bool {
+                false
+            }
+            fn put(&mut self, key: &str, cells: Cells, _: &Arc<Binding>) {
+                self.0.push((key.into(), cells.len()));
+            }
             fn delete(&mut self, _: &str) {}
         }
         let mut replay = Replay::new(TSVZ, false, None);
@@ -649,6 +783,9 @@ mod tests {
         assert!(r.damaged && r.stopped.is_none());
         r.markers.on_corruption = Policy::Stop;
         assert_eq!(r.corrupt(99, 0), Policy::Stop);
-        assert_eq!(r.stopped.as_ref().map(|d| (d.offset, d.kind)), Some((99, DamageKind::CorruptMember)));
+        assert_eq!(
+            r.stopped.as_ref().map(|d| (d.offset, d.kind)),
+            Some((99, DamageKind::CorruptMember))
+        );
     }
 }

@@ -66,7 +66,10 @@ pub fn main(argv: Vec<OsString>) -> i32 {
         match arg.into_string() {
             Ok(s) => text.push(s),
             Err(bad) => {
-                eprintln!("tsvz: an argument is not valid UTF-8: {}", bad.to_string_lossy());
+                eprintln!(
+                    "tsvz: an argument is not valid UTF-8: {}",
+                    bad.to_string_lossy()
+                );
                 return 2;
             }
         }
@@ -121,7 +124,8 @@ impl Ctx {
                 warn(&Warning {
                     part: store.clone(),
                     offset: None,
-                    message: "-d ignored: a strict store's extension decides its delimiter (§5.1)".into(),
+                    message: "-d ignored: a strict store's extension decides its delimiter (§5.1)"
+                        .into(),
                 });
             }
         }
@@ -132,11 +136,23 @@ impl Ctx {
             Some(OutputFormat::Records) => false,
             None => terminal,
         };
-        Ok(Ctx { args, store, format, table, warn, out: BufWriter::with_capacity(1 << 16, std::io::stdout().lock()) })
+        Ok(Ctx {
+            args,
+            store,
+            format,
+            table,
+            warn,
+            out: BufWriter::with_capacity(1 << 16, std::io::stdout().lock()),
+        })
     }
 
     pub(crate) fn options(&self, scope: Scope, verify: bool) -> Options {
-        Options { scope, verify, delimiter: self.args.delimiter, warnings: Some(self.warn.clone()) }
+        Options {
+            scope,
+            verify,
+            delimiter: self.args.delimiter,
+            warnings: Some(self.warn.clone()),
+        }
     }
 
     pub(crate) fn open(&self, scope: Scope, verify: bool) -> Result<Store, Error> {
@@ -167,7 +183,10 @@ impl Ctx {
             "clear" => maint::run(self, true),
             "scrub" => maint::run(self, false),
             "serve" | "stop" => {
-                eprintln!("tsvz: {}: this tsvz does not provide a handler (§21); work on the files instead", self.args.op);
+                eprintln!(
+                    "tsvz: {}: this tsvz does not provide a handler (§21); work on the files instead",
+                    self.args.op
+                );
                 Ok(1)
             }
             other => {

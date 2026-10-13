@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::escape::{self, is_marker_key};
 use crate::name::{self, Format};
 use crate::replay::DEFAULT_MEMBER_SIZE;
-use crate::{codec, lock, parts, Error, WarnFn, Warning};
+use crate::{Error, WarnFn, Warning, codec, lock, parts};
 
 /// A record to append.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,11 +26,17 @@ impl Record {
     /// reserved pattern is a marker line; a lone data key is a tombstone.
     pub fn from_args(key: &str, values: &[String]) -> Record {
         if is_marker_key(key) {
-            Record::Marker { key: key.into(), values: values.to_vec() }
+            Record::Marker {
+                key: key.into(),
+                values: values.to_vec(),
+            }
         } else if values.is_empty() {
             Record::Tombstone { key: key.into() }
         } else {
-            Record::Data { key: key.into(), values: values.to_vec() }
+            Record::Data {
+                key: key.into(),
+                values: values.to_vec(),
+            }
         }
     }
 }
@@ -44,7 +50,11 @@ pub enum KeyKind {
 }
 
 pub fn classify_key(key: &str) -> KeyKind {
-    if is_marker_key(key) { KeyKind::Marker } else { KeyKind::Data }
+    if is_marker_key(key) {
+        KeyKind::Marker
+    } else {
+        KeyKind::Data
+    }
 }
 
 /// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file has no
@@ -98,7 +108,13 @@ impl Writer {
     pub fn open(store: impl AsRef<Path>) -> Result<Writer, Error> {
         let store = store.as_ref().to_path_buf();
         let format = name::format_of(&store).ok_or_else(|| Error::BadPath(store.clone()))?;
-        Ok(Writer { store, format, member_size: DEFAULT_MEMBER_SIZE as usize, fsync: false, warn: None })
+        Ok(Writer {
+            store,
+            format,
+            member_size: DEFAULT_MEMBER_SIZE as usize,
+            fsync: false,
+            warn: None,
+        })
     }
 
     /// The most uncompressed bytes per compressed member (§16.7); default 1 MiB.
@@ -145,9 +161,18 @@ impl Writer {
         let io = |e: io::Error| Error::io(path, e);
         match part.codec {
             Some(codec) => {
-                let bytes = codec::encode_members(codec, payload, self.member_size)
-                    .ok_or_else(|| Error::UnsupportedCodec { path: path.to_path_buf(), codec: codec.name() })?;
-                let file = OpenOptions::new().append(true).create(true).open(path).map_err(io)?;
+                let bytes =
+                    codec::encode_members(codec, payload, self.member_size).ok_or_else(|| {
+                        Error::UnsupportedCodec {
+                            path: path.to_path_buf(),
+                            codec: codec.name(),
+                        }
+                    })?;
+                let file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                    .map_err(io)?;
                 let _guard = lock::lock(&file, path).map_err(io)?;
                 (&file).write_all(&bytes).map_err(io)?;
                 if self.fsync {
@@ -155,7 +180,12 @@ impl Writer {
                 }
             }
             None => {
-                let file = OpenOptions::new().read(true).append(true).create(true).open(path).map_err(io)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                    .map_err(io)?;
                 let _guard = lock::lock(&file, path).map_err(io)?;
                 self.cut_torn_tail(&file, path).map_err(io)?;
                 (&file).write_all(payload).map_err(io)?;
@@ -184,7 +214,10 @@ impl Writer {
             w(&Warning {
                 part: path.to_path_buf(),
                 offset: Some(keep),
-                message: format!("cut {} uncommitted bytes after the last newline before appending", size - keep),
+                message: format!(
+                    "cut {} uncommitted bytes after the last newline before appending",
+                    size - keep
+                ),
             });
         }
         Ok(())
@@ -211,7 +244,10 @@ mod tests {
     use crate::{Options, Store};
     use std::fs;
 
-    const TSVZ: Format = Format { delimiter: b'\t', strict: true };
+    const TSVZ: Format = Format {
+        delimiter: b'\t',
+        strict: true,
+    };
 
     fn enc(r: Record, f: Format) -> Result<String, Error> {
         let mut s = String::new();
@@ -220,24 +256,89 @@ mod tests {
 
     #[test]
     fn records_encode_per_variant() {
-        let d = |k: &str, v: &[&str]| Record::Data { key: k.into(), values: v.iter().map(|s| s.to_string()).collect() };
-        assert_eq!(enc(d("#k", &["a\tb", "<", "#v"]), TSVZ).unwrap(), "<#>k\ta<sep>b\t<lt>\t#v\n");
-        assert_eq!(enc(d("#_defaults_#", &["x"]), TSVZ).unwrap(), "<#>_defaults_#\tx\n");
-        assert_eq!(enc(Record::Tombstone { key: "#_x_#".into() }, TSVZ).unwrap(), "<#>_x_#\n");
-        assert_eq!(enc(Record::Marker { key: "#_defaults_#".into(), values: vec!["a,b".into()] }, Format { delimiter: b',', strict: true }).unwrap(), "#_defaults_#,a<sep>b\n");
-        assert_eq!(enc(d("k", &["a\0b"]), Format { delimiter: 0, strict: true }).unwrap(), "k\0a<sep>b\n");
+        let d = |k: &str, v: &[&str]| Record::Data {
+            key: k.into(),
+            values: v.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            enc(d("#k", &["a\tb", "<", "#v"]), TSVZ).unwrap(),
+            "<#>k\ta<sep>b\t<lt>\t#v\n"
+        );
+        assert_eq!(
+            enc(d("#_defaults_#", &["x"]), TSVZ).unwrap(),
+            "<#>_defaults_#\tx\n"
+        );
+        assert_eq!(
+            enc(
+                Record::Tombstone {
+                    key: "#_x_#".into()
+                },
+                TSVZ
+            )
+            .unwrap(),
+            "<#>_x_#\n"
+        );
+        assert_eq!(
+            enc(
+                Record::Marker {
+                    key: "#_defaults_#".into(),
+                    values: vec!["a,b".into()]
+                },
+                Format {
+                    delimiter: b',',
+                    strict: true
+                }
+            )
+            .unwrap(),
+            "#_defaults_#,a<sep>b\n"
+        );
+        assert_eq!(
+            enc(
+                d("k", &["a\0b"]),
+                Format {
+                    delimiter: 0,
+                    strict: true
+                }
+            )
+            .unwrap(),
+            "k\0a<sep>b\n"
+        );
         assert_eq!(enc(d("k", &["", ""]), TSVZ).unwrap(), "k\t\t\n");
-        let loose = Format { delimiter: b',', strict: false };
+        let loose = Format {
+            delimiter: b',',
+            strict: false,
+        };
         assert_eq!(enc(d("k", &["a<b", "#c"]), loose).unwrap(), "k,a<b,#c\n");
-        assert!(matches!(enc(d("k", &["a,b"]), loose), Err(Error::Refused(_))));
-        assert!(matches!(enc(d("k", &["a\nb"]), loose), Err(Error::Refused(_))));
+        assert!(matches!(
+            enc(d("k", &["a,b"]), loose),
+            Err(Error::Refused(_))
+        ));
+        assert!(matches!(
+            enc(d("k", &["a\nb"]), loose),
+            Err(Error::Refused(_))
+        ));
     }
 
     #[test]
     fn records_from_arguments() {
-        assert_eq!(Record::from_args("#_defaults_#", &[]), Record::Marker { key: "#_defaults_#".into(), values: vec![] });
-        assert_eq!(Record::from_args("k", &[]), Record::Tombstone { key: "k".into() });
-        assert_eq!(Record::from_args("k", &["".into()]), Record::Data { key: "k".into(), values: vec!["".into()] });
+        assert_eq!(
+            Record::from_args("#_defaults_#", &[]),
+            Record::Marker {
+                key: "#_defaults_#".into(),
+                values: vec![]
+            }
+        );
+        assert_eq!(
+            Record::from_args("k", &[]),
+            Record::Tombstone { key: "k".into() }
+        );
+        assert_eq!(
+            Record::from_args("k", &["".into()]),
+            Record::Data {
+                key: "k".into(),
+                values: vec!["".into()]
+            }
+        );
         assert_eq!(classify_key("#_x_#"), KeyKind::Marker);
         assert_eq!(classify_key("#x"), KeyKind::Data);
     }
@@ -257,11 +358,19 @@ mod tests {
         fs::write(&p, b"a\t1\ntorn").unwrap();
         let warned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = warned.clone();
-        let mut w = Writer::open(&p).unwrap().warnings(Some(std::sync::Arc::new(move |w: &Warning| sink.lock().unwrap().push(w.message.clone()))));
+        let mut w =
+            Writer::open(&p)
+                .unwrap()
+                .warnings(Some(std::sync::Arc::new(move |w: &Warning| {
+                    sink.lock().unwrap().push(w.message.clone())
+                })));
         w.append(&[Record::from_args("b", &["2".into()])]).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n");
         assert_eq!(warned.lock().unwrap().len(), 1);
-        Writer::open(dir.path().join("e.tsvz")).unwrap().append(&[]).unwrap();
+        Writer::open(dir.path().join("e.tsvz"))
+            .unwrap()
+            .append(&[])
+            .unwrap();
         assert_eq!(fs::read(dir.path().join("e.tsvz")).unwrap(), b"");
     }
 
@@ -271,8 +380,14 @@ mod tests {
         fs::write(dir.path().join("s.tsvz"), "a\t1\n").unwrap();
         fs::write(dir.path().join("s.tsvz.f"), "b\t2\n").unwrap();
         fs::write(dir.path().join("s.tsvz.10"), "c\t3\n").unwrap();
-        Writer::open(dir.path().join("s.tsvz")).unwrap().append(&[Record::Tombstone { key: "a".into() }]).unwrap();
-        assert_eq!(fs::read(dir.path().join("s.tsvz.10")).unwrap(), b"c\t3\na\n");
+        Writer::open(dir.path().join("s.tsvz"))
+            .unwrap()
+            .append(&[Record::Tombstone { key: "a".into() }])
+            .unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("s.tsvz.10")).unwrap(),
+            b"c\t3\na\n"
+        );
         assert_eq!(fs::read(dir.path().join("s.tsvz")).unwrap(), b"a\t1\n");
     }
 
@@ -281,13 +396,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz.gz");
         let mut w = Writer::open(&p).unwrap().member_size(16);
-        w.append(&[Record::from_args("a", &["1".into()]), Record::from_args("bbbbbbbbbbbbbbbbbbbb", &["2".into()])]).unwrap();
+        w.append(&[
+            Record::from_args("a", &["1".into()]),
+            Record::from_args("bbbbbbbbbbbbbbbbbbbb", &["2".into()]),
+        ])
+        .unwrap();
         let first = fs::read(&p).unwrap();
         w.append(&[Record::from_args("c", &["3".into()])]).unwrap();
         let all = fs::read(&p).unwrap();
         assert!(all.starts_with(&first));
         assert_eq!(crate::codec::items(crate::name::Codec::Gzip, &all).len(), 3);
-        assert_eq!(read(&p).into_iter().map(|r| r.0).collect::<Vec<_>>(), vec!["a", "bbbbbbbbbbbbbbbbbbbb", "c"]);
+        assert_eq!(
+            read(&p).into_iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec!["a", "bbbbbbbbbbbbbbbbbbbb", "c"]
+        );
     }
 
     #[test]
@@ -295,9 +417,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
         let mut w = Writer::open(&p).unwrap().delimiter(Some(b';'));
-        w.append(&[Record::from_args("k", &["a\tb".into()])]).unwrap();
+        w.append(&[Record::from_args("k", &["a\tb".into()])])
+            .unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
-        assert!(w.append(&[Record::from_args("k", &["x;y".into()])]).is_err());
+        assert!(
+            w.append(&[Record::from_args("k", &["x;y".into()])])
+                .is_err()
+        );
         assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
     }
 }

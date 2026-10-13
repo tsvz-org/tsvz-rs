@@ -2,9 +2,9 @@
 
 use std::io::Write;
 
-use crate::cli::output::{stdout_error, Emitter, Fields};
 use crate::cli::Ctx;
-use crate::{parts, Error, Scope, Store};
+use crate::cli::output::{Emitter, Fields, stdout_error};
+use crate::{Error, Scope, Store, parts};
 
 /// A read that stopped at damaged data fails (§4.10, §20.6).
 fn status(store: &Store, code: i32) -> i32 {
@@ -18,7 +18,11 @@ pub(crate) fn read(ctx: &mut Ctx) -> Result<i32, Error> {
         out.row(key, row.cells())?;
     }
     out.finish()?;
-    ctx.info(&format!("{} live keys in {} parts", store.len(), store.parts().len()));
+    ctx.info(&format!(
+        "{} live keys in {} parts",
+        store.len(),
+        store.parts().len()
+    ));
     Ok(status(&store, 0))
 }
 
@@ -73,7 +77,10 @@ pub(crate) fn verify(ctx: &mut Ctx) -> Result<i32, Error> {
         out.line(&[&part, &m.line.to_string(), m.algo, &m.expected, &m.computed])?;
     }
     out.finish()?;
-    Ok(status(&store, if store.mismatches().is_empty() { 0 } else { 4 }))
+    Ok(status(
+        &store,
+        if store.mismatches().is_empty() { 0 } else { 4 },
+    ))
 }
 
 pub(crate) fn parts(ctx: &mut Ctx) -> Result<i32, Error> {
@@ -92,7 +99,12 @@ pub(crate) fn parts(ctx: &mut Ctx) -> Result<i32, Error> {
             flags.push(codec.name());
         }
         let path = part.path.display().to_string();
-        out.line(&[&i.to_string(), part.ordinal.as_deref().unwrap_or(""), &path, &flags.join(",")])?;
+        out.line(&[
+            &i.to_string(),
+            part.ordinal.as_deref().unwrap_or(""),
+            &path,
+            &flags.join(","),
+        ])?;
     }
     out.finish()?;
     Ok(0)

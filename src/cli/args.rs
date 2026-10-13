@@ -4,8 +4,23 @@ use std::collections::VecDeque;
 
 /// The operations of §20.2, plus `serve` and `stop` (§20.2.6).
 pub const OPERATIONS: &[&str] = &[
-    "read", "get", "set", "append", "delete", "clear", "scrub", "verify", "parts", "has", "len", "keys", "pop", "popitem",
-    "setdefault", "serve", "stop",
+    "read",
+    "get",
+    "set",
+    "append",
+    "delete",
+    "clear",
+    "scrub",
+    "verify",
+    "parts",
+    "has",
+    "len",
+    "keys",
+    "pop",
+    "popitem",
+    "setdefault",
+    "serve",
+    "stop",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +70,10 @@ fn option(name: &str) -> Result<(&'static str, bool), String> {
         return Ok((dest, takes));
     }
     if name.starts_with("--") {
-        let matches: Vec<_> = OPTIONS.iter().filter(|o| o.0.starts_with("--") && o.0.starts_with(name)).collect();
+        let matches: Vec<_> = OPTIONS
+            .iter()
+            .filter(|o| o.0.starts_with("--") && o.0.starts_with(name))
+            .collect();
         if let Some(first) = matches.first() {
             if matches.iter().all(|o| o.1 == first.1) {
                 return Ok((first.1, first.2));
@@ -80,7 +98,9 @@ fn parse_delimiter(text: &str) -> Result<u8, String> {
         "pipe" => Ok(b'|'),
         "null" => Ok(0),
         t if t.len() == 1 && t.is_ascii() && t != "\n" && t != "\r" => Ok(t.as_bytes()[0]),
-        t => Err(format!("-d takes one ASCII character or tab, comma, pipe or null, not {t:?}")),
+        t => Err(format!(
+            "-d takes one ASCII character or tab, comma, pipe or null, not {t:?}"
+        )),
     }
 }
 
@@ -111,7 +131,10 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             if attached.is_empty() {
                 (flag.to_string(), None)
             } else if option(flag).is_ok_and(|o| o.1) {
-                (flag.to_string(), Some(attached.strip_prefix('=').unwrap_or(attached).to_string())) // -dcomma, -d=,
+                (
+                    flag.to_string(),
+                    Some(attached.strip_prefix('=').unwrap_or(attached).to_string()),
+                ) // -dcomma, -d=,
             } else {
                 queue.push_front(format!("-{attached}")); // -qv: one flag at a time
                 (flag.to_string(), None)
@@ -120,7 +143,9 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         let (dest, takes) = option(&name)?;
         let value = match (takes, value) {
             (true, Some(v)) => v,
-            (true, None) => queue.pop_front().ok_or_else(|| format!("option {name} needs a value"))?,
+            (true, None) => queue
+                .pop_front()
+                .ok_or_else(|| format!("option {name} needs a value"))?,
             (false, Some(_)) => return Err(format!("option {name} takes no value")),
             (false, None) => String::new(),
         };
@@ -161,7 +186,11 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
                 a.args = pos.collect();
             }
             Some(op) => {
-                return Err(format!("unknown operation: neither {:?} nor {op:?} is one of {}", a.store, OPERATIONS.join(", ")));
+                return Err(format!(
+                    "unknown operation: neither {:?} nor {op:?} is one of {}",
+                    a.store,
+                    OPERATIONS.join(", ")
+                ));
             }
         }
     }
@@ -172,7 +201,11 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
 fn validate(a: &Args) -> Result<(), String> {
     let op = a.op.as_str();
     let n = a.args.len();
-    if matches!(op, "read" | "clear" | "scrub" | "verify" | "parts" | "len" | "keys" | "serve" | "stop") && n > 0 {
+    if matches!(
+        op,
+        "read" | "clear" | "scrub" | "verify" | "parts" | "len" | "keys" | "serve" | "stop"
+    ) && n > 0
+    {
         return Err(format!("{op} takes no arguments after STORE"));
     }
     if op == "popitem" && !(n == 0 || (n == 1 && matches!(a.args[0].as_str(), "first" | "last"))) {
@@ -184,11 +217,18 @@ fn validate(a: &Args) -> Result<(), String> {
     if op == "setdefault" && n == 1 {
         return Err("setdefault needs a KEY and a VALUE".into());
     }
-    if matches!(op, "get" | "set" | "append" | "delete" | "has" | "pop" | "setdefault") {
+    if matches!(
+        op,
+        "get" | "set" | "append" | "delete" | "has" | "pop" | "setdefault"
+    ) {
         if n == 0 {
             return Err(format!("{op} needs a KEY"));
         }
-        let keys = if matches!(op, "get" | "delete") { &a.args[..] } else { &a.args[..1] };
+        let keys = if matches!(op, "get" | "delete") {
+            &a.args[..]
+        } else {
+            &a.args[..1]
+        };
         if keys.iter().any(String::is_empty) {
             return Err(format!("{op}: a KEY must not be empty"));
         }
@@ -214,12 +254,19 @@ mod tests {
     #[test]
     fn canonical_and_file_first_forms() {
         let a = run(&["get", "s.tsvz", "k1", "k2"]);
-        assert_eq!((a.op.as_str(), a.store.as_str(), a.args.clone()), ("get", "s.tsvz", vec!["k1".to_string(), "k2".to_string()]));
+        assert_eq!(
+            (a.op.as_str(), a.store.as_str(), a.args.clone()),
+            ("get", "s.tsvz", vec!["k1".to_string(), "k2".to_string()])
+        );
         let b = run(&["s.tsvz", "append", "k", "v"]);
         assert_eq!((b.op.as_str(), b.store.as_str()), ("append", "s.tsvz"));
         let c = run(&["s.tsvz"]);
         assert_eq!(c.op, "read");
-        assert!(p(&["s.tsvz", "alice"]).unwrap_err().contains("unknown operation"));
+        assert!(
+            p(&["s.tsvz", "alice"])
+                .unwrap_err()
+                .contains("unknown operation")
+        );
         assert!(p(&["./read", "keys"]).is_ok());
     }
 
@@ -237,7 +284,10 @@ mod tests {
     #[test]
     fn dashes_and_negative_numbers_are_values() {
         assert_eq!(run(&["set", "s.tsvz", "-"]).args, vec!["-"]);
-        assert_eq!(run(&["set", "s.tsvz", "k", "-5", "-.5", "-1x"]).args, vec!["k", "-5", "-.5", "-1x"]);
+        assert_eq!(
+            run(&["set", "s.tsvz", "k", "-5", "-.5", "-1x"]).args,
+            vec!["k", "-5", "-.5", "-1x"]
+        );
     }
 
     #[test]
@@ -246,10 +296,23 @@ mod tests {
         assert!(a.quiet && a.verbose);
         assert_eq!(a.delimiter, Some(b','));
         assert_eq!(run(&["read", "s.tsv", "-d=|"]).delimiter, Some(b'|'));
-        assert_eq!(run(&["read", "s.tsv", "--delimiter=null"]).delimiter, Some(0));
-        assert_eq!(run(&["read", "s.tsv", "--delim", "tab"]).delimiter, Some(b'\t'));
-        assert_eq!(run(&["--form=table", "read", "s.tsvz"]).format, Some(OutputFormat::Table));
-        assert!(p(&["--ver", "read", "s.tsvz"]).unwrap_err().contains("ambiguous"));
+        assert_eq!(
+            run(&["read", "s.tsv", "--delimiter=null"]).delimiter,
+            Some(0)
+        );
+        assert_eq!(
+            run(&["read", "s.tsv", "--delim", "tab"]).delimiter,
+            Some(b'\t')
+        );
+        assert_eq!(
+            run(&["--form=table", "read", "s.tsvz"]).format,
+            Some(OutputFormat::Table)
+        );
+        assert!(
+            p(&["--ver", "read", "s.tsvz"])
+                .unwrap_err()
+                .contains("ambiguous")
+        );
     }
 
     #[test]

@@ -40,12 +40,24 @@ impl Default for Framer {
 impl Framer {
     /// A framer at the start of a part.
     pub fn new() -> Framer {
-        Framer { pending: Vec::new(), bom_decided: false, number: 0, consumed: 0, committed: 0 }
+        Framer {
+            pending: Vec::new(),
+            bom_decided: false,
+            number: 0,
+            consumed: 0,
+            committed: 0,
+        }
     }
 
     /// A framer continuing a part at `offset`, just after committed line number `number`.
     pub fn resume(offset: u64, number: u64) -> Framer {
-        Framer { pending: Vec::new(), bom_decided: offset > 0, number, consumed: offset, committed: offset }
+        Framer {
+            pending: Vec::new(),
+            bom_decided: offset > 0,
+            number,
+            consumed: offset,
+            committed: offset,
+        }
     }
 
     /// Feed the next bytes of the part. `on_line` gets each committed line; returning false
@@ -99,7 +111,11 @@ impl Framer {
 
     fn emit(&mut self, raw: &[u8], on_line: &mut dyn FnMut(&Line<'_>) -> bool) -> bool {
         self.number += 1;
-        let line = Line { raw, number: self.number, offset: self.committed };
+        let line = Line {
+            raw,
+            number: self.number,
+            offset: self.committed,
+        };
         self.committed += raw.len() as u64;
         on_line(&line)
     }
@@ -152,7 +168,10 @@ mod tests {
         let texts: Vec<&[u8]> = lines.iter().map(|l| l.1.as_slice()).collect();
         assert_eq!(texts, vec![&b"a\tx"[..], b"b\ty", b"c\r"]);
         assert_eq!(lines[1].0, b"b\ty\r\n");
-        assert_eq!(lines.iter().map(|l| (l.2, l.3)).collect::<Vec<_>>(), vec![(1, 0), (2, 4), (3, 9)]);
+        assert_eq!(
+            lines.iter().map(|l| (l.2, l.3)).collect::<Vec<_>>(),
+            vec![(1, 0), (2, 4), (3, 9)]
+        );
         assert_eq!(f.tail(), b"partial");
         assert_eq!(f.committed(), 13);
         assert_eq!(f.number(), 3);
@@ -161,7 +180,10 @@ mod tests {
     #[test]
     fn a_line_split_across_pushes() {
         let (lines, _) = frame(&[b"ab", b"c\td", b"", b"ef\ng", b"h\n"]);
-        assert_eq!(lines.iter().map(|l| l.0.clone()).collect::<Vec<_>>(), vec![b"abc\tdef\n".to_vec(), b"gh\n".to_vec()]);
+        assert_eq!(
+            lines.iter().map(|l| l.0.clone()).collect::<Vec<_>>(),
+            vec![b"abc\tdef\n".to_vec(), b"gh\n".to_vec()]
+        );
         assert_eq!(lines[1].3, 8);
     }
 
@@ -181,15 +203,24 @@ mod tests {
     fn a_break_drops_the_unfinished_line_and_decides_the_bom() {
         let mut f = Framer::new();
         let mut got = Vec::new();
-        f.push(b"a\tx\nunfin", &mut |l| { got.push(l.text().to_vec()); true });
+        f.push(b"a\tx\nunfin", &mut |l| {
+            got.push(l.text().to_vec());
+            true
+        });
         f.brk();
-        f.push(b"\xef\xbb\xbfb\ty\n", &mut |l| { got.push(l.text().to_vec()); true });
+        f.push(b"\xef\xbb\xbfb\ty\n", &mut |l| {
+            got.push(l.text().to_vec());
+            true
+        });
         assert_eq!(got, vec![b"a\tx".to_vec(), b"\xef\xbb\xbfb\ty".to_vec()]);
         let mut g = Framer::new();
         g.push(b"\xef", &mut |_| true);
         g.brk();
         let mut after = Vec::new();
-        g.push(b"\xbb\xbfz\n", &mut |l| { after.push(l.text().to_vec()); true });
+        g.push(b"\xbb\xbfz\n", &mut |l| {
+            after.push(l.text().to_vec());
+            true
+        });
         assert_eq!(after, vec![b"\xbb\xbfz".to_vec()]);
     }
 
@@ -197,7 +228,10 @@ mod tests {
     fn stopping_early() {
         let mut f = Framer::new();
         let mut n = 0;
-        assert!(!f.push(b"a\nb\nc\n", &mut |_| { n += 1; n < 2 }));
+        assert!(!f.push(b"a\nb\nc\n", &mut |_| {
+            n += 1;
+            n < 2
+        }));
         assert_eq!(n, 2);
     }
 
@@ -205,7 +239,10 @@ mod tests {
     fn resume_continues_numbers_and_offsets() {
         let mut f = Framer::resume(100, 7);
         let mut got = Vec::new();
-        f.push(b"\xef\xbb\xbfk\tv\n", &mut |l| { got.push((l.text().to_vec(), l.number, l.offset)); true });
+        f.push(b"\xef\xbb\xbfk\tv\n", &mut |l| {
+            got.push((l.text().to_vec(), l.number, l.offset));
+            true
+        });
         assert_eq!(got, vec![(b"\xef\xbb\xbfk\tv".to_vec(), 8, 100)]);
         assert_eq!(f.committed(), 107);
     }
@@ -219,8 +256,15 @@ mod tests {
         for _ in 0..4096 {
             f.push(&piece, &mut |_| true); // 64 MiB without a newline
         }
-        f.push(b"\n", &mut |l| { lens.push(l.raw.len()); true });
+        f.push(b"\n", &mut |l| {
+            lens.push(l.raw.len());
+            true
+        });
         assert_eq!(lens, vec![64 * 1024 * 1024 + 1]);
-        assert!(started.elapsed().as_secs() < 10, "framing a 64 MiB line took {:?}", started.elapsed());
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "framing a 64 MiB line took {:?}",
+            started.elapsed()
+        );
     }
 }

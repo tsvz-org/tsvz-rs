@@ -69,7 +69,12 @@ impl Accumulator {
         match self {
             Accumulator::Crc32(h) => format!("{:08x}", h.clone().finalize()),
             Accumulator::Crc32c(c) => format!("{c:08x}"),
-            Accumulator::Sha256(h) => h.clone().finalize().iter().map(|b| format!("{b:02x}")).collect(),
+            Accumulator::Sha256(h) => h
+                .clone()
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
             Accumulator::Blake3(h) => h.finalize().to_hex().to_string(),
         }
     }
@@ -91,15 +96,24 @@ mod tests {
     fn known_vectors() {
         assert_eq!(digest(Algo::Crc32, &[b"123456789"]), "cbf43926");
         assert_eq!(digest(Algo::Crc32c, &[b"123456789"]), "e3069283");
-        assert_eq!(digest(Algo::Sha256, &[b"abc"]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(digest(Algo::Blake3, &[b"abc"]), "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85");
+        assert_eq!(
+            digest(Algo::Sha256, &[b"abc"]),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            digest(Algo::Blake3, &[b"abc"]),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
         assert_eq!(digest(Algo::Crc32, &[]), "00000000");
     }
 
     #[test]
     fn incremental_equals_whole_and_hex_does_not_consume() {
         for algo in [Algo::Crc32, Algo::Crc32c, Algo::Sha256, Algo::Blake3] {
-            assert_eq!(digest(algo, &[b"a\tx\n", b"b\ty\n"]), digest(algo, &[b"a\tx\nb\ty\n"]));
+            assert_eq!(
+                digest(algo, &[b"a\tx\n", b"b\ty\n"]),
+                digest(algo, &[b"a\tx\nb\ty\n"])
+            );
             let mut acc = Accumulator::new(algo);
             acc.update(b"a");
             let first = acc.hex();

@@ -22,7 +22,10 @@ pub enum Error {
 
 impl Error {
     pub fn io(path: &Path, source: io::Error) -> Error {
-        Error::Io { path: path.to_path_buf(), source }
+        Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     }
 }
 
@@ -32,7 +35,12 @@ impl fmt::Display for Error {
             Error::Missing(path) => write!(f, "{}: no such store", path.display()),
             Error::Io { path, source } => write!(f, "{}: {}", path.display(), source),
             Error::UnsupportedCodec { path, codec } => {
-                write!(f, "{}: this tsvz cannot read {} parts", path.display(), codec)
+                write!(
+                    f,
+                    "{}: this tsvz cannot read {} parts",
+                    path.display(),
+                    codec
+                )
             }
             Error::BadPath(path) => write!(
                 f,

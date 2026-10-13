@@ -13,7 +13,7 @@ use crate::codec::{self, Item};
 use crate::frame::Framer;
 use crate::name::{self, Codec, Format};
 use crate::parts::{self, Stamp};
-use crate::replay::{Binding, Cells, Damage, Markers, Mismatch, Policy, Replay, Sink, EMPTY_CELLS};
+use crate::replay::{Binding, Cells, Damage, EMPTY_CELLS, Markers, Mismatch, Policy, Replay, Sink};
 use crate::{Error, WarnFn};
 
 /// What a store keeps of each row.
@@ -60,7 +60,11 @@ pub struct Row<'a> {
 impl<'a> Row<'a> {
     /// A row resolved from `cells` under `defaults` and a fill-empty setting (§14.2, §14.3).
     pub(crate) fn new(cells: &'a Cells, defaults: &'a [String], fill: bool) -> Row<'a> {
-        Row { cells, defaults, fill }
+        Row {
+            cells,
+            defaults,
+            fill,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -107,7 +111,11 @@ struct Slot {
 }
 
 fn row_of(slot: &Slot) -> Row<'_> {
-    Row { cells: &slot.cells, defaults: &slot.binding.defaults, fill: slot.binding.fill_empty }
+    Row {
+        cells: &slot.cells,
+        defaults: &slot.binding.defaults,
+        fill: slot.binding.fill_empty,
+    }
 }
 
 /// Live rows in first-appearance order (§3.4): slots plus an index; freed slots are compacted.
@@ -123,10 +131,18 @@ struct Table {
 impl Table {
     fn new(scope: &Scope) -> Table {
         let wanted = match scope {
-            Scope::Keys(keys) => Some(keys.iter().flat_map(|k| [k.clone(), k.trim_end_matches([' ', '\t']).to_string()]).collect()),
+            Scope::Keys(keys) => Some(
+                keys.iter()
+                    .flat_map(|k| [k.clone(), k.trim_end_matches([' ', '\t']).to_string()])
+                    .collect(),
+            ),
             _ => None,
         };
-        Table { cells: !matches!(scope, Scope::KeysOnly), wanted, ..Table::default() }
+        Table {
+            cells: !matches!(scope, Scope::KeysOnly),
+            wanted,
+            ..Table::default()
+        }
     }
 
     fn compact(&mut self) {
@@ -164,7 +180,11 @@ impl Sink for Table {
             }
             None => {
                 self.index.insert(key.into(), self.slots.len());
-                self.slots.push(Some(Slot { key: key.into(), cells, binding: binding.clone() }));
+                self.slots.push(Some(Slot {
+                    key: key.into(),
+                    cells,
+                    binding: binding.clone(),
+                }));
                 self.live += 1;
             }
         }
@@ -210,12 +230,19 @@ pub enum Refreshed {
 }
 
 pub(crate) fn dir_mtime(store: &Path) -> i128 {
-    let dir = store.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::metadata(dir).map_or(0, |m| m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128)
+    let dir = store
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::metadata(dir).map_or(0, |m| {
+        m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128
+    })
 }
 
 pub(crate) fn racy(mtime: i128) -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128);
     now - mtime < RACY_NS
 }
 
@@ -265,18 +292,31 @@ impl Store {
         if list.is_empty() {
             return Err(Error::Missing(self.path.clone()));
         }
-        if let Some(part) = list.iter().find(|p| p.codec.is_some_and(|c| !c.supported())) {
-            return Err(Error::UnsupportedCodec { path: part.path.clone(), codec: part.codec.map_or("", Codec::name) });
+        if let Some(part) = list
+            .iter()
+            .find(|p| p.codec.is_some_and(|c| !c.supported()))
+        {
+            return Err(Error::UnsupportedCodec {
+                path: part.path.clone(),
+                codec: part.codec.map_or("", Codec::name),
+            });
         }
         let dir = dir_mtime(&self.path);
-        self.follow = Follow { dir_mtime: dir, dir_racy: racy(dir), ..Follow::default() };
+        self.follow = Follow {
+            dir_mtime: dir,
+            dir_racy: racy(dir),
+            ..Follow::default()
+        };
         let last = list.len() - 1;
         for (i, part) in list.iter().enumerate() {
             self.replay.begin_part(&part.path, i == 0);
             let mut file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
             let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
             if meta.is_dir() {
-                return Err(Error::io(&part.path, std::io::Error::from(std::io::ErrorKind::IsADirectory)));
+                return Err(Error::io(
+                    &part.path,
+                    std::io::Error::from(std::io::ErrorKind::IsADirectory),
+                ));
             }
             self.follow.stamps.push(Some(Stamp::of(&meta)));
             let (replay, table) = (&mut self.replay, &mut self.table);
@@ -284,7 +324,8 @@ impl Store {
             match part.codec {
                 Some(codec) => {
                     let mut data = Vec::new();
-                    file.read_to_end(&mut data).map_err(|e| Error::io(&part.path, e))?;
+                    file.read_to_end(&mut data)
+                        .map_err(|e| Error::io(&part.path, e))?;
                     for item in codec::items(codec, &data) {
                         let go = match item {
                             Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
@@ -292,11 +333,15 @@ impl Store {
                                 replay.cut_short(offset);
                                 framer.push(&out, &mut |l| replay.line(l, table))
                             }
-                            Item::Corrupt { offset, out } => match replay.corrupt(offset, out.len()) {
-                                Policy::Recover => framer.push(&out, &mut |l| replay.line(l, table)),
-                                Policy::Skip => true,
-                                Policy::Stop => false,
-                            },
+                            Item::Corrupt { offset, out } => {
+                                match replay.corrupt(offset, out.len()) {
+                                    Policy::Recover => {
+                                        framer.push(&out, &mut |l| replay.line(l, table))
+                                    }
+                                    Policy::Skip => true,
+                                    Policy::Stop => false,
+                                }
+                            }
                             Item::Break => {
                                 framer.brk();
                                 true
@@ -336,7 +381,13 @@ impl Store {
         self.parts = list
             .into_iter()
             .enumerate()
-            .map(|(i, p)| PartInfo { index: i, ordinal: p.ordinal, path: p.path, codec: p.codec, active: i == last })
+            .map(|(i, p)| PartInfo {
+                index: i,
+                ordinal: p.ordinal,
+                path: p.path,
+                codec: p.codec,
+                active: i == last,
+            })
             .collect();
         Ok(())
     }
@@ -385,12 +436,20 @@ impl Store {
         if self.format.strict && !self.replay.markers.return_missing {
             return None;
         }
-        Some(Row { cells: &EMPTY_CELLS, defaults: &self.replay.markers.defaults, fill: false })
+        Some(Row {
+            cells: &EMPTY_CELLS,
+            defaults: &self.replay.markers.defaults,
+            fill: false,
+        })
     }
 
     /// Live keys and rows in first-appearance order (§3.4).
     pub fn iter(&self) -> impl Iterator<Item = (&str, Row<'_>)> {
-        self.table.slots.iter().flatten().map(|s| (&*s.key, row_of(s)))
+        self.table
+            .slots
+            .iter()
+            .flatten()
+            .map(|s| (&*s.key, row_of(s)))
     }
 
     pub fn first(&self) -> Option<(&str, Row<'_>)> {
@@ -398,7 +457,13 @@ impl Store {
     }
 
     pub fn last(&self) -> Option<(&str, Row<'_>)> {
-        self.table.slots.iter().rev().flatten().next().map(|s| (&*s.key, row_of(s)))
+        self.table
+            .slots
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .map(|s| (&*s.key, row_of(s)))
     }
 
     pub fn stopped(&self) -> Option<&Damage> {
@@ -429,7 +494,11 @@ impl Store {
         let dir = dir_mtime(&self.path);
         if dir != self.follow.dir_mtime || self.follow.dir_racy {
             let now = parts::list(&self.path)?;
-            if now.iter().map(|p| &p.path).ne(self.parts.iter().map(|p| &p.path)) {
+            if now
+                .iter()
+                .map(|p| &p.path)
+                .ne(self.parts.iter().map(|p| &p.path))
+            {
                 return self.reload();
             }
             self.follow.dir_mtime = dir;
@@ -449,7 +518,11 @@ impl Store {
             }
             followed = true;
         }
-        Ok(if followed { Refreshed::Followed } else { Refreshed::Unchanged })
+        Ok(if followed {
+            Refreshed::Followed
+        } else {
+            Refreshed::Unchanged
+        })
     }
 
     fn reload(&mut self) -> Result<Refreshed, Error> {
@@ -461,7 +534,9 @@ impl Store {
     fn follow_append(&mut self, stamp: Stamp) -> Result<bool, Error> {
         let last = self.parts.len() - 1;
         let path = self.parts[last].path.clone();
-        let Some(old) = self.follow.stamps[last] else { return Ok(false) };
+        let Some(old) = self.follow.stamps[last] else {
+            return Ok(false);
+        };
         let offset = self.follow.offset;
         let want = offset.min(CHECK_BYTES) as usize;
         if self.replay.stopped.is_some()
@@ -476,7 +551,11 @@ impl Store {
         let io = |e: std::io::Error| Error::io(&path, e);
         let file = File::open(&path).map_err(io)?;
         let mut check = vec![0u8; want];
-        if file.read_exact_at(&mut check, offset - want as u64).is_err() || check != self.follow.check {
+        if file
+            .read_exact_at(&mut check, offset - want as u64)
+            .is_err()
+            || check != self.follow.check
+        {
             return Ok(false); // rewritten in place (§19.8)
         }
         let mut data = Vec::new();
@@ -487,7 +566,10 @@ impl Store {
         replay.begin_part(&path, last == 0 && offset == 0);
         framer.push(&data, &mut |l| replay.line(l, table));
         let committed = (framer.committed() - offset) as usize;
-        if self.replay.stopped.is_none() && !framer.tail().is_empty() && framer.tail() != self.follow.tail.as_slice() {
+        if self.replay.stopped.is_none()
+            && !framer.tail().is_empty()
+            && framer.tail() != self.follow.tail.as_slice()
+        {
             self.replay.tail(framer.tail().len());
         }
         let mut check = std::mem::take(&mut self.follow.check);
@@ -498,7 +580,10 @@ impl Store {
         self.follow.offset = framer.committed();
         self.follow.line = framer.number();
         self.follow.tail = framer.tail().to_vec();
-        self.follow.stamps[last] = Some(Stamp { size: offset + data.len() as u64, ..stamp });
+        self.follow.stamps[last] = Some(Stamp {
+            size: offset + data.len() as u64,
+            ..stamp
+        });
         Ok(true)
     }
 }
@@ -515,7 +600,10 @@ mod tests {
     }
 
     fn rows(store: &Store) -> Vec<Vec<String>> {
-        store.iter().map(|(k, r)| std::iter::once(k.to_string()).chain(r.to_vec()).collect()).collect()
+        store
+            .iter()
+            .map(|(k, r)| std::iter::once(k.to_string()).chain(r.to_vec()).collect())
+            .collect()
     }
 
     fn v(cells: &[&str]) -> Vec<String> {
@@ -527,7 +615,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\t1\nb\t2\na\nc\t3\na\t4\nb\t5\n");
         let s = Store::open(&p, Options::default()).unwrap();
-        assert_eq!(rows(&s), vec![v(&["b", "5"]), v(&["c", "3"]), v(&["a", "4"])]);
+        assert_eq!(
+            rows(&s),
+            vec![v(&["b", "5"]), v(&["c", "3"]), v(&["a", "4"])]
+        );
         assert_eq!(s.len(), 3);
         assert_eq!(s.first().unwrap().0, "b");
         assert_eq!(s.last().unwrap().0, "a");
@@ -556,23 +647,42 @@ mod tests {
         write(dir.path(), "s.tsvz.f", b"k\tfrom-f\nz\n");
         let s = Store::open(dir.path().join("s.tsvz"), Options::default()).unwrap();
         assert_eq!(rows(&s), vec![v(&["k", "from-10"])]);
-        assert_eq!(s.parts().iter().map(|p| (p.index, p.active)).collect::<Vec<_>>(), vec![(0, false), (1, false), (2, true)]);
+        assert_eq!(
+            s.parts()
+                .iter()
+                .map(|p| (p.index, p.active))
+                .collect::<Vec<_>>(),
+            vec![(0, false), (1, false), (2, true)]
+        );
         assert_eq!(s.lookup_key("k \t"), "k");
     }
 
     #[test]
     fn compressed_parts_and_the_corruption_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let mut bad = crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t2\nc\t3\n").unwrap();
+        let mut bad =
+            crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t2\nc\t3\n").unwrap();
         let n = bad.len();
         bad[n - 8] ^= 1; // CRC mismatch: a corrupt member whose output is still decoded
-        for (policy, want) in [("recover", vec!["a", "b", "c", "d"]), ("skip", vec!["a", "d"]), ("stop", vec!["a"])] {
-            let mut part = crate::codec::encode_member(crate::name::Codec::Gzip, format!("#_on_corruption_#\t{policy}\na\t1\n").as_bytes()).unwrap();
+        for (policy, want) in [
+            ("recover", vec!["a", "b", "c", "d"]),
+            ("skip", vec!["a", "d"]),
+            ("stop", vec!["a"]),
+        ] {
+            let mut part = crate::codec::encode_member(
+                crate::name::Codec::Gzip,
+                format!("#_on_corruption_#\t{policy}\na\t1\n").as_bytes(),
+            )
+            .unwrap();
             part.extend(&bad);
             part.extend(crate::codec::encode_member(crate::name::Codec::Gzip, b"d\t4\n").unwrap());
             let p = write(dir.path(), &format!("{policy}.tsvz.gz"), &part);
             let s = Store::open(&p, Options::default()).unwrap();
-            assert_eq!(s.iter().map(|(k, _)| k).collect::<Vec<_>>(), want, "{policy}");
+            assert_eq!(
+                s.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                want,
+                "{policy}"
+            );
             assert_eq!(s.stopped().is_some(), policy == "stop");
             assert!(s.damaged());
         }
@@ -582,28 +692,67 @@ mod tests {
     fn scopes() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\tx\ty\nb\tz\nc\tw\n");
-        let keys = Store::open(&p, Options { scope: Scope::KeysOnly, ..Options::default() }).unwrap();
-        assert_eq!(keys.iter().map(|(k, r)| (k, r.written())).collect::<Vec<_>>(), vec![("a", 0), ("b", 0), ("c", 0)]);
-        let some = Store::open(&p, Options { scope: Scope::Keys(vec!["b \t".into(), "zz".into()]), ..Options::default() }).unwrap();
+        let keys = Store::open(
+            &p,
+            Options {
+                scope: Scope::KeysOnly,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            keys.iter()
+                .map(|(k, r)| (k, r.written()))
+                .collect::<Vec<_>>(),
+            vec![("a", 0), ("b", 0), ("c", 0)]
+        );
+        let some = Store::open(
+            &p,
+            Options {
+                scope: Scope::Keys(vec!["b \t".into(), "zz".into()]),
+                ..Options::default()
+            },
+        )
+        .unwrap();
         assert_eq!(some.len(), 1);
-        assert_eq!(some.get(some.lookup_key("b \t")).unwrap().to_vec(), v(&["z"]));
+        assert_eq!(
+            some.get(some.lookup_key("b \t")).unwrap().to_vec(),
+            v(&["z"])
+        );
     }
 
     #[test]
     fn verify_reports_mismatches_with_their_part() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "s.tsvz", b"#_checksum_crc32_#\na\tx\n");
-        write(dir.path(), "s.tsvz.1", b"b\ty\n#_checksum_crc32_#\t00000000\n");
-        let s = Store::open(dir.path().join("s.tsvz"), Options { verify: true, ..Options::default() }).unwrap();
+        write(
+            dir.path(),
+            "s.tsvz.1",
+            b"b\ty\n#_checksum_crc32_#\t00000000\n",
+        );
+        let s = Store::open(
+            dir.path().join("s.tsvz"),
+            Options {
+                verify: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         let m = &s.mismatches()[0];
-        assert_eq!((m.part.clone(), m.line, m.computed.as_str()), (dir.path().join("s.tsvz.1"), 2, "c1ec8234"));
+        assert_eq!(
+            (m.part.clone(), m.line, m.computed.as_str()),
+            (dir.path().join("s.tsvz.1"), 2, "c1ec8234")
+        );
     }
 
     #[test]
     fn header_comment() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"#key\tval\na\tx\n");
-        assert_eq!(Store::open(&p, Options::default()).unwrap().header(), Some("#key\tval"));
+        assert_eq!(
+            Store::open(&p, Options::default()).unwrap().header(),
+            Some("#key\tval")
+        );
     }
 
     #[test]
@@ -628,24 +777,49 @@ mod tests {
     #[test]
     fn missing_and_bad_paths() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(Store::open(dir.path().join("none.tsvz"), Options::default()), Err(Error::Missing(_))));
-        assert!(matches!(Store::open(dir.path().join("x.txt"), Options::default()), Err(Error::BadPath(_))));
+        assert!(matches!(
+            Store::open(dir.path().join("none.tsvz"), Options::default()),
+            Err(Error::Missing(_))
+        ));
+        assert!(matches!(
+            Store::open(dir.path().join("x.txt"), Options::default()),
+            Err(Error::BadPath(_))
+        ));
     }
 
     #[test]
     fn loose_delimiter_override() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsv", b"a;x\n");
-        let s = Store::open(&p, Options { delimiter: Some(b';'), ..Options::default() }).unwrap();
+        let s = Store::open(
+            &p,
+            Options {
+                delimiter: Some(b';'),
+                ..Options::default()
+            },
+        )
+        .unwrap();
         assert_eq!(rows(&s), vec![v(&["a", "x"])]);
         let strict = write(dir.path(), "s.tsvz", b"a;x\tb\n");
-        let s = Store::open(&strict, Options { delimiter: Some(b';'), ..Options::default() }).unwrap();
+        let s = Store::open(
+            &strict,
+            Options {
+                delimiter: Some(b';'),
+                ..Options::default()
+            },
+        )
+        .unwrap();
         assert_eq!(rows(&s), vec![v(&["a;x", "b"])]);
     }
 
     fn append(p: &Path, data: &[u8]) {
         use std::io::Write;
-        fs::OpenOptions::new().append(true).open(p).unwrap().write_all(data).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(p)
+            .unwrap()
+            .write_all(data)
+            .unwrap();
     }
 
     fn keys(s: &Store) -> Vec<String> {
@@ -696,12 +870,23 @@ mod tests {
     fn compressed_and_stopped_stores_reload() {
         let dir = tempfile::tempdir().unwrap();
         let gz = dir.path().join("s.tsvz.gz");
-        fs::write(&gz, crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\n").unwrap()).unwrap();
+        fs::write(
+            &gz,
+            crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\n").unwrap(),
+        )
+        .unwrap();
         let mut s = Store::open(&gz, Options::default()).unwrap();
-        append(&gz, &crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t2\n").unwrap());
+        append(
+            &gz,
+            &crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t2\n").unwrap(),
+        );
         assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
         assert_eq!(keys(&s), vec!["a", "b"]);
-        let p = write(dir.path(), "t.tsvz", b"#_on_corruption_#\tstop\na\t1\n\0\0\n");
+        let p = write(
+            dir.path(),
+            "t.tsvz",
+            b"#_on_corruption_#\tstop\na\t1\n\0\0\n",
+        );
         let mut t = Store::open(&p, Options::default()).unwrap();
         append(&p, b"b\t2\n");
         assert_eq!(t.refresh().unwrap(), Refreshed::Reloaded);

@@ -3,8 +3,8 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::cli::{table, Ctx};
-use crate::{escape, Error};
+use crate::cli::{Ctx, table};
+use crate::{Error, escape};
 
 pub(crate) fn stdout_error(e: io::Error) -> Error {
     Error::io(Path::new("stdout"), e)
@@ -62,10 +62,18 @@ pub(crate) struct Emitter<'c> {
 impl<'c> Emitter<'c> {
     pub(crate) fn new(ctx: &'c mut Ctx) -> Emitter<'c> {
         let table = ctx.table.then(Vec::new);
-        Emitter { ctx, buf: String::new(), table }
+        Emitter {
+            ctx,
+            buf: String::new(),
+            table,
+        }
     }
 
-    pub(crate) fn row<'a>(&mut self, key: &str, cells: impl Iterator<Item = &'a str>) -> Result<(), Error> {
+    pub(crate) fn row<'a>(
+        &mut self,
+        key: &str,
+        cells: impl Iterator<Item = &'a str>,
+    ) -> Result<(), Error> {
         if let Some(rows) = &mut self.table {
             let mut row = vec![key.to_string()];
             row.extend(cells.map(str::to_string));
@@ -80,7 +88,10 @@ impl<'c> Emitter<'c> {
     pub(crate) fn finish(self) -> Result<(), Error> {
         if let Some(rows) = self.table {
             let text = table::rows_table(&rows) + "\n";
-            self.ctx.out.write_all(text.as_bytes()).map_err(stdout_error)?;
+            self.ctx
+                .out
+                .write_all(text.as_bytes())
+                .map_err(stdout_error)?;
         }
         Ok(())
     }
@@ -96,12 +107,17 @@ pub(crate) struct Fields<'c> {
 
 impl<'c> Fields<'c> {
     pub(crate) fn new(ctx: &'c mut Ctx, header: &'static [&'static str]) -> Fields<'c> {
-        Fields { ctx, header, rows: Vec::new() }
+        Fields {
+            ctx,
+            header,
+            rows: Vec::new(),
+        }
     }
 
     pub(crate) fn line(&mut self, values: &[&str]) -> Result<(), Error> {
         if self.ctx.table {
-            self.rows.push(values.iter().map(|v| v.to_string()).collect());
+            self.rows
+                .push(values.iter().map(|v| v.to_string()).collect());
             return Ok(());
         }
         fields(&mut self.ctx.out, values).map_err(stdout_error)
@@ -109,8 +125,12 @@ impl<'c> Fields<'c> {
 
     pub(crate) fn finish(self) -> Result<(), Error> {
         if self.ctx.table && !self.rows.is_empty() {
-            let text = table::fields_table(self.header, &self.rows, table::terminal_columns()) + "\n";
-            self.ctx.out.write_all(text.as_bytes()).map_err(stdout_error)?;
+            let text =
+                table::fields_table(self.header, &self.rows, table::terminal_columns()) + "\n";
+            self.ctx
+                .out
+                .write_all(text.as_bytes())
+                .map_err(stdout_error)?;
         }
         Ok(())
     }

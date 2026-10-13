@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use crate::escape;
 use crate::name::Codec;
 use crate::parts::{self, Stamp};
-use crate::replay::{Markers, Policy, DEFAULT_MEMBER_SIZE};
+use crate::replay::{DEFAULT_MEMBER_SIZE, Markers, Policy};
 use crate::write::{Record, Writer};
-use crate::{codec, lock, Error, Options, Scope, Store, Warning};
+use crate::{Error, Options, Scope, Store, Warning, codec, lock};
 
 /// What a clear or scrub did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,10 +79,18 @@ fn preamble(out: &mut String, m: &Markers, d: u8, compensate: bool, version: boo
 
 /// Whether a written row reads back the same under the final markers (§19.4).
 fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
-    if m.strip && std::iter::once(key).chain(cells.iter().map(String::as_str)).any(|c| c.ends_with([' ', '\t'])) {
+    if m.strip
+        && std::iter::once(key)
+            .chain(cells.iter().map(String::as_str))
+            .any(|c| c.ends_with([' ', '\t']))
+    {
         return false;
     }
-    !(m.fill_empty && cells.iter().enumerate().any(|(j, c)| c.is_empty() && m.defaults.get(j).is_some_and(|d| !d.is_empty())))
+    !(m.fill_empty
+        && cells
+            .iter()
+            .enumerate()
+            .any(|(j, c)| c.is_empty() && m.defaults.get(j).is_some_and(|d| !d.is_empty())))
 }
 
 /// The snapshot content of §19.2.3 for a store read whole, as TSVZ.py writes it: the header
@@ -141,20 +149,35 @@ pub fn snapshot(s: &Store) -> String {
 }
 
 fn stamp(path: &Path) -> Result<Stamp, Error> {
-    std::fs::metadata(path).map(|m| Stamp::of(&m)).map_err(|e| Error::io(path, e))
+    std::fs::metadata(path)
+        .map(|m| Stamp::of(&m))
+        .map_err(|e| Error::io(path, e))
 }
 
 /// Replace a part's bytes in place, keeping the file (§18.7, §19.8), under the write lock and
 /// only while the part still has the stamp it had before it was read. Ok(None): another writer
 /// changed it; Ok(Some(false)): it already held these bytes.
-pub(crate) fn rewrite(path: &Path, content: &[u8], expect: Stamp, codec: Option<Codec>, member_size: u64) -> Result<Option<bool>, Error> {
+pub(crate) fn rewrite(
+    path: &Path,
+    content: &[u8],
+    expect: Stamp,
+    codec: Option<Codec>,
+    member_size: u64,
+) -> Result<Option<bool>, Error> {
     let io = |e: io::Error| Error::io(path, e);
     let raw = match codec {
         Some(c) if !content.is_empty() => codec::encode_members(c, content, member_size as usize)
-            .ok_or_else(|| Error::UnsupportedCodec { path: path.to_path_buf(), codec: c.name() })?,
+            .ok_or_else(|| Error::UnsupportedCodec {
+            path: path.to_path_buf(),
+            codec: c.name(),
+        })?,
         _ => content.to_vec(),
     };
-    let file = OpenOptions::new().read(true).write(true).open(path).map_err(io)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
     let _guard = lock::lock(&file, path).map_err(io)?;
     if Stamp::of(&file.metadata().map_err(io)?) != expect {
         return Ok(None);
@@ -179,14 +202,26 @@ fn local_timestamp() -> String {
         libc::localtime_r(&now, &mut tm);
         tm
     };
-    format!("{:04}{:02}{:02}T{:02}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 /// Copy a damaged part's bytes to `<part>.damaged-<local time>` (`.1`, `.2`, … when taken) and
 /// sync it, before a rewrite drops the damage (§4.10, §16.6), as TSVZ.py does.
 fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     let io = |e: io::Error| Error::io(path, e);
-    let file = OpenOptions::new().read(true).write(true).open(path).map_err(io)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
     let _guard = lock::lock(&file, path).map_err(io)?;
     // The copy is readable by whoever could read the part, and writable by its owner only: the
     // part's read bits plus owner write, never its setuid, setgid, sticky or execute bits, nor
@@ -196,7 +231,12 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     let mut target = first.clone();
     let mut n = 0;
     let mut copy = loop {
-        match OpenOptions::new().write(true).create_new(true).mode(mode).open(&target) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&target)
+        {
             Ok(f) => break f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 n += 1;
@@ -219,14 +259,21 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         w(&Warning {
             part: path.to_path_buf(),
             offset: None,
-            message: format!("kept the bytes of this damaged part, whose damage is not rewritten, in {}", target.display()),
+            message: format!(
+                "kept the bytes of this damaged part, whose damage is not rewritten, in {}",
+                target.display()
+            ),
         });
     }
     Ok(target)
 }
 
 fn whole(options: &Options) -> Options {
-    Options { scope: Scope::All, verify: false, ..options.clone() }
+    Options {
+        scope: Scope::All,
+        verify: false,
+        ..options.clone()
+    }
 }
 
 /// Compact a one-part store in place with §19.4 fidelity (§19.8, §20.2 `scrub`).
@@ -261,7 +308,13 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             };
         }
         let content = snapshot(&s);
-        match rewrite(&part.path, content.as_bytes(), before, part.codec, s.markers().member_size)? {
+        match rewrite(
+            &part.path,
+            content.as_bytes(),
+            before,
+            part.codec,
+            s.markers().member_size,
+        )? {
             None => continue, // another writer committed after the read
             Some(written) => {
                 return Ok(if s.stopped().is_some() {
@@ -287,10 +340,17 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
     for _ in 0..ATTEMPTS {
         let list = parts::list(store)?;
         if list.is_empty() {
-            Writer::open(store)?.warnings(options.warnings.clone()).delimiter(options.delimiter).append(&[])?;
+            Writer::open(store)?
+                .warnings(options.warnings.clone())
+                .delimiter(options.delimiter)
+                .append(&[])?;
             return Ok(Outcome::Written);
         }
-        let before = if list.len() == 1 { Some(stamp(&list[0].path)?) } else { None };
+        let before = if list.len() == 1 {
+            Some(stamp(&list[0].path)?)
+        } else {
+            None
+        };
         let s = Store::open(store, whole(options))?;
         if s.stopped().is_some() {
             return Err(Error::Refused(format!(
@@ -299,7 +359,10 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             )));
         }
         if s.parts().len() > 1 {
-            let tombstones: Vec<Record> = s.iter().map(|(k, _)| Record::Tombstone { key: k.to_string() }).collect();
+            let tombstones: Vec<Record> = s
+                .iter()
+                .map(|(k, _)| Record::Tombstone { key: k.to_string() })
+                .collect();
             if tombstones.is_empty() {
                 return Ok(Outcome::Unchanged);
             }
@@ -317,10 +380,22 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             content.push('\n');
         }
         if s.format().strict {
-            preamble(&mut content, s.markers(), s.format().delimiter, false, false);
+            preamble(
+                &mut content,
+                s.markers(),
+                s.format().delimiter,
+                false,
+                false,
+            );
         }
         let part = &s.parts()[0];
-        match rewrite(&part.path, content.as_bytes(), before, part.codec, s.markers().member_size)? {
+        match rewrite(
+            &part.path,
+            content.as_bytes(),
+            before,
+            part.codec,
+            s.markers().member_size,
+        )? {
             None => continue,
             Some(true) => return Ok(Outcome::Written),
             Some(false) => return Ok(Outcome::Unchanged),
@@ -344,17 +419,26 @@ mod tests {
 
     fn rows(p: &Path) -> Vec<Vec<String>> {
         let s = Store::open(p, opts()).unwrap();
-        s.iter().map(|(k, r)| std::iter::once(k.to_string()).chain(r.to_vec()).collect()).collect()
+        s.iter()
+            .map(|(k, r)| std::iter::once(k.to_string()).chain(r.to_vec()).collect())
+            .collect()
     }
 
     #[test]
     fn scrub_layout_resolves_rows_and_keeps_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
-        fs::write(&p, "#key\tval\n#_version_#\t1\n#_defaults_#\td1\td2\na\tx\nb\ty\n#note\na\tz\nb\nc\t\t\n").unwrap();
+        fs::write(
+            &p,
+            "#key\tval\n#_version_#\t1\n#_defaults_#\td1\td2\na\tx\nb\ty\n#note\na\tz\nb\nc\t\t\n",
+        )
+        .unwrap();
         let before = fs::metadata(&p).unwrap();
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
-        assert_eq!(fs::read_to_string(&p).unwrap(), "#key\tval\n#_version_#\t1\n#_defaults_#\td1\td2\na\tz\td2\nc\t\t\n");
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "#key\tval\n#_version_#\t1\n#_defaults_#\td1\td2\na\tz\td2\nc\t\t\n"
+        );
         let after = fs::metadata(&p).unwrap();
         assert_eq!((after.ino(), after.mode()), (before.ino(), before.mode()));
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged);
@@ -391,9 +475,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("s.tsvz"), "a\t1\n").unwrap();
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
-        assert!(matches!(scrub(&dir.path().join("s.tsvz"), &opts()), Err(Error::Refused(_))));
-        assert_eq!(fs::read_to_string(dir.path().join("s.tsvz")).unwrap(), "a\t1\n");
-        assert!(matches!(scrub(&dir.path().join("none.tsvz"), &opts()), Err(Error::Missing(_))));
+        assert!(matches!(
+            scrub(&dir.path().join("s.tsvz"), &opts()),
+            Err(Error::Refused(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz")).unwrap(),
+            "a\t1\n"
+        );
+        assert!(matches!(
+            scrub(&dir.path().join("none.tsvz"), &opts()),
+            Err(Error::Missing(_))
+        ));
         assert!(!dir.path().join("none.tsvz").exists());
     }
 
@@ -403,20 +496,42 @@ mod tests {
         let p = dir.path().join("s.tsvz");
         let damaged = "#_on_corruption_#\tstop\na\t1\n\0\0c\t3\nd\t4\n";
         fs::write(&p, damaged).unwrap();
-        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else { panic!("not partial") };
+        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else {
+            panic!("not partial")
+        };
         assert_eq!(fs::read_to_string(&copy).unwrap(), damaged);
-        assert!(copy.file_name().unwrap().to_str().unwrap().starts_with("s.tsvz.damaged-"));
-        assert_eq!(fs::read_to_string(&p).unwrap(), "#_version_#\t1\n#_on_corruption_#\tstop\na\t1\n");
-        assert_eq!(crate::parts::list(&p).unwrap().len(), 1, "the copy is not a part");
+        assert!(
+            copy.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("s.tsvz.damaged-")
+        );
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "#_version_#\t1\n#_on_corruption_#\tstop\na\t1\n"
+        );
+        assert_eq!(
+            crate::parts::list(&p).unwrap().len(),
+            1,
+            "the copy is not a part"
+        );
     }
 
     #[test]
     fn clear_keeps_header_and_markers_without_a_version_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
-        fs::write(&p, "#hdr\n#_version_#\t1\n#_defaults_#\td\n#_strip_trailing_whites_#\tfalse\na\tx\n").unwrap();
+        fs::write(
+            &p,
+            "#hdr\n#_version_#\t1\n#_defaults_#\td\n#_strip_trailing_whites_#\tfalse\na\tx\n",
+        )
+        .unwrap();
         assert_eq!(clear(&p, &opts()).unwrap(), Outcome::Written);
-        assert_eq!(fs::read_to_string(&p).unwrap(), "#hdr\n#_strip_trailing_whites_#\tfalse\n#_defaults_#\td\n");
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "#hdr\n#_strip_trailing_whites_#\tfalse\n#_defaults_#\td\n"
+        );
     }
 
     #[test]
@@ -424,8 +539,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("s.tsvz"), "#_defaults_#\td\na\t1\n").unwrap();
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\nc\t3\n").unwrap();
-        assert_eq!(clear(&dir.path().join("s.tsvz"), &opts()).unwrap(), Outcome::Written);
-        assert_eq!(fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(), "b\t2\nc\t3\na\nb\nc\n");
+        assert_eq!(
+            clear(&dir.path().join("s.tsvz"), &opts()).unwrap(),
+            Outcome::Written
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
+            "b\t2\nc\t3\na\nb\nc\n"
+        );
         let none = dir.path().join("new.tsvz");
         assert_eq!(clear(&none, &opts()).unwrap(), Outcome::Written);
         assert_eq!(fs::read(&none).unwrap(), b"");
@@ -446,7 +567,10 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         let stale = Stamp::of(&fs::metadata(&p).unwrap());
         fs::write(&p, "a\t1\nb\t2\n").unwrap();
-        assert_eq!(rewrite(&p, b"x\n", stale, None, DEFAULT_MEMBER_SIZE).unwrap(), None);
+        assert_eq!(
+            rewrite(&p, b"x\n", stale, None, DEFAULT_MEMBER_SIZE).unwrap(),
+            None
+        );
         assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\nb\t2\n");
     }
 
@@ -454,11 +578,18 @@ mod tests {
     fn scrub_of_a_compressed_part_and_a_loose_file() {
         let dir = tempfile::tempdir().unwrap();
         let gz = dir.path().join("s.tsvz.gz");
-        let mut data = crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\na\t2\n").unwrap();
+        let mut data =
+            crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\na\t2\n").unwrap();
         data.extend(crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t3\n").unwrap());
         fs::write(&gz, data).unwrap();
         scrub(&gz, &opts()).unwrap();
-        assert_eq!(rows(&gz), vec![vec!["a".to_string(), "2".into()], vec!["b".to_string(), "3".into()]]);
+        assert_eq!(
+            rows(&gz),
+            vec![
+                vec!["a".to_string(), "2".into()],
+                vec!["b".to_string(), "3".into()]
+            ]
+        );
         let tsv = dir.path().join("l.tsv");
         fs::write(&tsv, "#h\na\t1\nb\na\t2\n").unwrap();
         scrub(&tsv, &opts()).unwrap();
@@ -474,9 +605,15 @@ mod tests {
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
-        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else { panic!("not partial") };
+        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else {
+            panic!("not partial")
+        };
         let mode = fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode & 0o077, 0, "backup mode {mode:o} opens a private part to others");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "backup mode {mode:o} opens a private part to others"
+        );
     }
 
     #[test]
@@ -486,8 +623,14 @@ mod tests {
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o6777)).unwrap();
-        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else { panic!("not partial") };
+        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else {
+            panic!("not partial")
+        };
         let mode = fs::metadata(&copy).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode & 0o7133, 0, "backup mode {mode:o} has setuid, setgid, sticky, execute or shared write bits");
+        assert_eq!(
+            mode & 0o7133,
+            0,
+            "backup mode {mode:o} has setuid, setgid, sticky, execute or shared write bits"
+        );
     }
 }

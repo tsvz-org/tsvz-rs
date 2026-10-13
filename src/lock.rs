@@ -15,7 +15,10 @@ type Gate = Arc<(Mutex<bool>, Condvar)>;
 fn gate(path: &Path) -> Gate {
     static GATES: OnceLock<Mutex<HashMap<PathBuf, Gate>>> = OnceLock::new();
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut gates = GATES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     gates.entry(key).or_default().clone()
 }
 

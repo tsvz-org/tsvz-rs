@@ -3,8 +3,8 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::name::{self, Codec};
 use crate::Error;
+use crate::name::{self, Codec};
 
 /// One part of a store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +38,9 @@ impl Stamp {
 /// value. `.rotated` parts and unknown codec suffixes are skipped (§19.5). A missing
 /// directory gives no parts.
 pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
-    let text = store.to_str().ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
+    let text = store
+        .to_str()
+        .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
     let (base, codec) = name::split_codec(text);
     let base = Path::new(base);
     let file_name = base
@@ -51,9 +53,15 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
     if let Ok(entries) = std::fs::read_dir(parent.unwrap_or(Path::new("."))) {
         for entry in entries.flatten() {
             let entry_name = entry.file_name();
-            let Some(entry_name) = entry_name.to_str() else { continue };
-            let Some(rest) = entry_name.strip_prefix(&prefix) else { continue };
-            let Some(n) = name::parse_numbered(rest) else { continue };
+            let Some(entry_name) = entry_name.to_str() else {
+                continue;
+            };
+            let Some(rest) = entry_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(n) = name::parse_numbered(rest) else {
+                continue;
+            };
             if n.rotated {
                 continue;
             }
@@ -63,14 +71,22 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
     numbered.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     let mut parts = Vec::with_capacity(numbered.len() + 1);
     if store.is_file() {
-        parts.push(Part { path: store.to_path_buf(), ordinal: None, codec });
+        parts.push(Part {
+            path: store.to_path_buf(),
+            ordinal: None,
+            codec,
+        });
     }
     for (_, entry_name, n) in numbered {
         let path = match parent {
             Some(dir) => dir.join(&entry_name),
             None => PathBuf::from(&entry_name),
         };
-        parts.push(Part { path, ordinal: Some(n.ordinal), codec: n.codec });
+        parts.push(Part {
+            path,
+            ordinal: Some(n.ordinal),
+            codec: n.codec,
+        });
     }
     Ok(parts)
 }
@@ -82,8 +98,14 @@ pub fn active(store: &Path) -> Result<Part, Error> {
     Ok(match parts.pop() {
         Some(last) => last,
         None => {
-            let text = store.to_str().ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
-            Part { path: store.to_path_buf(), ordinal: None, codec: name::split_codec(text).1 }
+            let text = store
+                .to_str()
+                .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
+            Part {
+                path: store.to_path_buf(),
+                ordinal: None,
+                codec: name::split_codec(text).1,
+            }
         }
     })
 }
@@ -94,17 +116,37 @@ mod tests {
     use std::fs;
 
     fn names(parts: &[Part]) -> Vec<String> {
-        parts.iter().map(|p| p.path.file_name().unwrap().to_str().unwrap().to_string()).collect()
+        parts
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
     fn unnumbered_file_first_then_hex_order() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["s.tsvz", "s.tsvz.10", "s.tsvz.f", "s.tsvz.002", "s.tsvz.B", "s.tsvz.1"] {
+        for name in [
+            "s.tsvz",
+            "s.tsvz.10",
+            "s.tsvz.f",
+            "s.tsvz.002",
+            "s.tsvz.B",
+            "s.tsvz.1",
+        ] {
             fs::write(dir.path().join(name), "").unwrap();
         }
         let parts = list(&dir.path().join("s.tsvz")).unwrap();
-        assert_eq!(names(&parts), ["s.tsvz", "s.tsvz.1", "s.tsvz.002", "s.tsvz.B", "s.tsvz.f", "s.tsvz.10"]);
+        assert_eq!(
+            names(&parts),
+            [
+                "s.tsvz",
+                "s.tsvz.1",
+                "s.tsvz.002",
+                "s.tsvz.B",
+                "s.tsvz.f",
+                "s.tsvz.10"
+            ]
+        );
         assert_eq!(parts[0].ordinal, None);
         assert_eq!(parts[2].ordinal.as_deref(), Some("002"));
     }
@@ -113,8 +155,16 @@ mod tests {
     fn rotated_unknown_and_other_files_are_skipped() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
-            "s.tsvz.1", "s.tsvz.2.rotated", "s.tsvz.3.rotated.gz", "s.tsvz.4.GZ", "s.tsvz.5.zip",
-            "s.tsvz.serve", "s.tsvz.damaged-20261012T000000", "s.tsvzx.6", "t.tsvz.7", "s.csvz.8",
+            "s.tsvz.1",
+            "s.tsvz.2.rotated",
+            "s.tsvz.3.rotated.gz",
+            "s.tsvz.4.GZ",
+            "s.tsvz.5.zip",
+            "s.tsvz.serve",
+            "s.tsvz.damaged-20261012T000000",
+            "s.tsvzx.6",
+            "t.tsvz.7",
+            "s.csvz.8",
         ] {
             fs::write(dir.path().join(name), "").unwrap();
         }

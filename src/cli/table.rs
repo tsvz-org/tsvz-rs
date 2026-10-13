@@ -7,7 +7,15 @@ use super::width_table::{WIDE, ZERO};
 
 fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
     table
-        .binary_search_by(|&(a, b)| if b < cp { Ordering::Less } else if a > cp { Ordering::Greater } else { Ordering::Equal })
+        .binary_search_by(|&(a, b)| {
+            if b < cp {
+                Ordering::Less
+            } else if a > cp {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        })
         .is_ok()
 }
 
@@ -27,7 +35,11 @@ pub(crate) fn char_width(c: char) -> usize {
 }
 
 pub(crate) fn width(s: &str) -> usize {
-    if s.is_ascii() { s.len() } else { s.chars().map(char_width).sum() }
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().map(char_width).sum()
+    }
 }
 
 fn is_control(c: char) -> bool {
@@ -47,7 +59,9 @@ pub(crate) fn escape_cell(s: &str) -> Cow<'_, str> {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            c if is_control(c) && (c as u32) < 0x100 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if is_control(c) && (c as u32) < 0x100 => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
             c if is_control(c) => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
@@ -84,8 +98,18 @@ fn pad(out: &mut String, s: &str, w: usize) {
     }
 }
 
-fn render(header: Option<&[Cow<'_, str>]>, rows: &[Vec<Cow<'_, str>>], widths: &[usize], sep: &str, hsep: &str) -> String {
-    let rule = widths.iter().map(|&w| "-".repeat(w)).collect::<Vec<_>>().join(hsep);
+fn render(
+    header: Option<&[Cow<'_, str>]>,
+    rows: &[Vec<Cow<'_, str>>],
+    widths: &[usize],
+    sep: &str,
+    hsep: &str,
+) -> String {
+    let rule = widths
+        .iter()
+        .map(|&w| "-".repeat(w))
+        .collect::<Vec<_>>()
+        .join(hsep);
     let mut out = String::new();
     if let Some(h) = header {
         for (j, (cell, &w)) in h.iter().zip(widths).enumerate() {
@@ -115,7 +139,13 @@ fn render(header: Option<&[Cow<'_, str>]>, rows: &[Vec<Cow<'_, str>>], widths: &
 }
 
 fn escaped<'a>(rows: &'a [Vec<String>], cols: usize) -> Vec<Vec<Cow<'a, str>>> {
-    rows.iter().map(|r| (0..cols).map(|j| r.get(j).map_or(Cow::Borrowed(""), |c| escape_cell(c))).collect()).collect()
+    rows.iter()
+        .map(|r| {
+            (0..cols)
+                .map(|j| r.get(j).map_or(Cow::Borrowed(""), |c| escape_cell(c)))
+                .collect()
+        })
+        .collect()
 }
 
 /// Row output (read, get, pop, popitem, setdefault, keys): no header; every row padded to the
@@ -127,7 +157,9 @@ pub(crate) fn rows_table(rows: &[Vec<String>]) -> String {
     }
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let cells = escaped(rows, cols);
-    let widths: Vec<usize> = (0..cols).map(|j| cells.iter().map(|r| width(&r[j])).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..cols)
+        .map(|j| cells.iter().map(|r| width(&r[j])).max().unwrap_or(0))
+        .collect();
     render(None, &cells, &widths, " | ", "-+-")
 }
 
@@ -138,9 +170,18 @@ pub(crate) fn fields_table(header: &[&str], rows: &[Vec<String>], cols: usize) -
     let n = header.len();
     let head: Vec<Cow<'_, str>> = header.iter().map(|h| escape_cell(h)).collect();
     let cells = escaped(rows, n);
-    let mut widths: Vec<usize> =
-        (0..n).map(|j| cells.iter().map(|r| width(&r[j])).chain([width(&head[j])]).max().unwrap_or(0)).collect();
-    let total = |widths: &[usize], sep: usize| widths.iter().sum::<usize>() + sep * n.saturating_sub(1);
+    let mut widths: Vec<usize> = (0..n)
+        .map(|j| {
+            cells
+                .iter()
+                .map(|r| width(&r[j]))
+                .chain([width(&head[j])])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let total =
+        |widths: &[usize], sep: usize| widths.iter().sum::<usize>() + sep * n.saturating_sub(1);
     if total(&widths, 3) <= cols {
         return render(Some(&head), &cells, &widths, " | ", "-+-");
     }
@@ -169,7 +210,10 @@ pub(crate) fn terminal_columns() -> usize {
     if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 {
         return ws.ws_col as usize;
     }
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(240)
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(240)
 }
 
 #[cfg(test)]
@@ -182,7 +226,16 @@ mod tests {
 
     #[test]
     fn widths_follow_tsvz_py() {
-        for (c, w) in [('A', 1), ('é', 1), ('日', 2), ('\u{301}', 0), ('\u{200b}', 0), ('\u{1160}', 0), ('😀', 2), ('\u{ff21}', 2)] {
+        for (c, w) in [
+            ('A', 1),
+            ('é', 1),
+            ('日', 2),
+            ('\u{301}', 0),
+            ('\u{200b}', 0),
+            ('\u{1160}', 0),
+            ('😀', 2),
+            ('\u{ff21}', 2),
+        ] {
             assert_eq!(char_width(c), w, "{c:?}");
         }
         assert_eq!(width("日本a"), 5);
@@ -191,15 +244,27 @@ mod tests {
     #[test]
     fn control_characters_are_escaped() {
         assert_eq!(escape_cell("plain"), "plain");
-        assert_eq!(escape_cell("a\tb\nc\rd\u{1b}[31m\u{7f}\u{85}\u{202e}\u{2066}"), "a\\tb\\nc\\rd\\x1b[31m\\x7f\\x85\\u202e\\u2066");
+        assert_eq!(
+            escape_cell("a\tb\nc\rd\u{1b}[31m\u{7f}\u{85}\u{202e}\u{2066}"),
+            "a\\tb\\nc\\rd\\x1b[31m\\x7f\\x85\\u202e\\u2066"
+        );
         assert_eq!(escape_cell("back\\slash"), "back\\slash");
     }
 
     #[test]
     fn rows_pad_to_the_widest_and_are_never_shortened() {
-        assert_eq!(rows_table(&[v(&["a", "x"]), v(&["bb", "yyy"]), v(&["c"])]), "a  | x  \nbb | yyy\nc  |    \n");
-        assert_eq!(rows_table(&[v(&["ab", "c"]), v(&["", ""])]), "ab | c\n---+--\n");
-        assert_eq!(rows_table(&[v(&["日本", "x"]), v(&["a", "y"])]), "日本 | x\na    | y\n");
+        assert_eq!(
+            rows_table(&[v(&["a", "x"]), v(&["bb", "yyy"]), v(&["c"])]),
+            "a  | x  \nbb | yyy\nc  |    \n"
+        );
+        assert_eq!(
+            rows_table(&[v(&["ab", "c"]), v(&["", ""])]),
+            "ab | c\n---+--\n"
+        );
+        assert_eq!(
+            rows_table(&[v(&["日本", "x"]), v(&["a", "y"])]),
+            "日本 | x\na    | y\n"
+        );
         let long = "z".repeat(500);
         assert_eq!(rows_table(&[v(&["k", &long])]), format!("k | {long}\n"));
         assert_eq!(rows_table(&[]), "");
@@ -209,8 +274,17 @@ mod tests {
     fn fields_fit_the_terminal() {
         let rows = [v(&["0", "/very/long/path/name"])];
         let header = ["index", "path"];
-        assert_eq!(fields_table(&header, &rows, 80), "index | path                \n------+---------------------\n0     | /very/long/path/name\n");
-        assert_eq!(fields_table(&header, &rows, 26), "index|path                \n-----+--------------------\n0    |/very/long/path/name\n");
-        assert_eq!(fields_table(&header, &rows, 15), "index|path     \n-----+---------\n0    |/very/l..\n");
+        assert_eq!(
+            fields_table(&header, &rows, 80),
+            "index | path                \n------+---------------------\n0     | /very/long/path/name\n"
+        );
+        assert_eq!(
+            fields_table(&header, &rows, 26),
+            "index|path                \n-----+--------------------\n0    |/very/long/path/name\n"
+        );
+        assert_eq!(
+            fields_table(&header, &rows, 15),
+            "index|path     \n-----+---------\n0    |/very/l..\n"
+        );
     }
 }
