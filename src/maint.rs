@@ -188,9 +188,10 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     let io = |e: io::Error| Error::io(path, e);
     let file = OpenOptions::new().read(true).write(true).open(path).map_err(io)?;
     let _guard = lock::lock(&file, path).map_err(io)?;
-    // The copy is created with the part's own permission bits (less the umask), so it is never
-    // readable by anyone the part was closed to.
-    let mode = file.metadata().map_err(io)?.permissions().mode() & 0o7777;
+    // The copy is readable by whoever could read the part, and writable by its owner only: the
+    // part's read bits plus owner write, never its setuid, setgid, sticky or execute bits, nor
+    // write access for others (the umask still applies on top).
+    let mode = file.metadata().map_err(io)?.permissions().mode() & 0o644;
     let first = PathBuf::from(format!("{}.damaged-{}", path.display(), local_timestamp()));
     let mut target = first.clone();
     let mut n = 0;
@@ -476,5 +477,17 @@ mod tests {
         let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else { panic!("not partial") };
         let mode = fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode & 0o077, 0, "backup mode {mode:o} opens a private part to others");
+    }
+
+    #[test]
+    fn the_backup_never_carries_special_execute_or_shared_write_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o6777)).unwrap();
+        let Outcome::Partial { backup: Some(copy) } = scrub(&p, &opts()).unwrap() else { panic!("not partial") };
+        let mode = fs::metadata(&copy).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode & 0o7133, 0, "backup mode {mode:o} has setuid, setgid, sticky, execute or shared write bits");
     }
 }
