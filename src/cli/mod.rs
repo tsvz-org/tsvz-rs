@@ -3,6 +3,7 @@
 pub mod args;
 pub(crate) mod output;
 mod read;
+mod write;
 
 use std::ffi::OsString;
 use std::io::{BufWriter, StdoutLock, Write};
@@ -156,6 +157,11 @@ impl Ctx {
             "keys" => read::keys(self),
             "verify" => read::verify(self),
             "parts" => read::parts(self),
+            "set" | "append" => write::set(self),
+            "delete" => write::delete(self),
+            "pop" => write::pop(self),
+            "popitem" => write::popitem(self),
+            "setdefault" => write::setdefault(self),
             "serve" | "stop" => {
                 eprintln!("tsvz: {}: this tsvz does not provide a handler (§21); work on the files instead", self.args.op);
                 Ok(1)

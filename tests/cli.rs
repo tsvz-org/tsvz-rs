@@ -130,3 +130,82 @@ fn serve_and_stop_are_not_provided() {
     assert_eq!(records(d.path(), &["serve", "s.tsvz"]).0, 1);
     assert_eq!(records(d.path(), &["stop", "s.tsvz"]).0, 1);
 }
+
+fn file(dir: &Path, name: &str) -> String {
+    String::from_utf8(fs::read(dir.join(name)).unwrap()).unwrap()
+}
+
+#[test]
+fn set_append_delete_write_records() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    assert_eq!(records(dir, &["set", "s.tsvz", "#k", "a\tb", "<", ""]).0, 0);
+    assert_eq!(records(dir, &["append", "s.tsvz", "#_defaults_#", "d1"]).0, 0);
+    assert_eq!(records(dir, &["set", "s.tsvz", "gone"]).0, 0);
+    assert_eq!(records(dir, &["delete", "s.tsvz", "x", "#_defaults_#"]).0, 0);
+    assert_eq!(file(dir, "s.tsvz"), "<#>k\ta<sep>b\t<lt>\t\n#_defaults_#\td1\ngone\nx\n#_defaults_#\n");
+    assert_eq!(records(dir, &["set", "-v", "s.tsvz", "--", "carol", "-5"]).0, 0);
+    assert_eq!(records(dir, &["get", "s.tsvz", "carol"]).1, "carol\t-5\n");
+}
+
+#[test]
+fn bulk_input() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let input = b"\xef\xbb\xbfa\tx<LF>y\r\n# comment\n\n#_defaults_#\td\nb\na\nc\t\nunterminated\tz";
+    let (code, _, err) = run_in(dir, &["set", "s.tsvz", "-"], input);
+    assert_eq!(code, 0);
+    assert!(err.contains("unterminated"), "{err}");
+    assert_eq!(file(dir, "s.tsvz"), "a\tx<LF>y\n#_defaults_#\td\nb\na\nc\t\n");
+    let (code, _, _) = run_in(dir, &["delete", "s.tsvz", "-"], b"c\textra\n#_defaults_#\n# skip\n<#>h\n");
+    assert_eq!(code, 0);
+    assert!(file(dir, "s.tsvz").ends_with("c\t\nc\n#_defaults_#\n<#>h\n"));
+    fs::write(dir.join("c.csvz"), "").unwrap();
+    run_in(dir, &["set", "c.csvz", "-"], b"k,a<sep>b\tc\n");
+    assert_eq!(records(dir, &["get", "c.csvz", "k"]).1, "k,a<sep>b\tc\n");
+}
+
+#[test]
+fn pop_popitem_setdefault() {
+    let d = store("#_defaults_#\td1\td2\na\t1\nb\t2\nc\t3\n");
+    let dir = d.path();
+    assert_eq!(records(dir, &["pop", "s.tsvz", "b"]), (0, "b\t2\td2\n".into(), String::new()));
+    assert_eq!(records(dir, &["pop", "s.tsvz", "b"]).0, 3);
+    assert_eq!(records(dir, &["popitem", "s.tsvz", "first"]).1, "a\t1\td2\n");
+    assert_eq!(records(dir, &["popitem", "s.tsvz"]).1, "c\t3\td2\n");
+    assert_eq!(records(dir, &["popitem", "s.tsvz"]).0, 3);
+    assert_eq!(records(dir, &["setdefault", "s.tsvz", "n", "v "]).1, "n\tv\td2\n");
+    assert_eq!(records(dir, &["setdefault", "s.tsvz", "n", "other"]).1, "n\tv\td2\n");
+    assert_eq!(records(dir, &["setdefault", "s.tsvz", "#_defaults_#", "x"]).0, 2);
+    assert!(file(dir, "s.tsvz").starts_with("#_defaults_#\td1\td2\na\t1\nb\t2\nc\t3\nb\na\nc\nn\tv \n"));
+}
+
+#[test]
+fn writes_create_missing_stores_and_reads_do_not() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    for (op, args) in [("set", vec!["k", "v"]), ("append", vec!["k", "v"]), ("delete", vec!["k"]), ("setdefault", vec!["k", "v"])] {
+        let name = format!("{op}.tsvz");
+        let mut all = vec![op, name.as_str()];
+        all.extend(args);
+        assert_eq!(records(dir, &all).0, 0, "{op}");
+        assert!(dir.join(&name).exists(), "{op}");
+    }
+    for op in ["pop", "popitem"] {
+        let name = format!("{op}.tsvz");
+        let mut all = vec![op, name.as_str()];
+        if op == "pop" {
+            all.push("k");
+        }
+        assert_eq!(records(dir, &all).0, 1, "{op}");
+        assert!(!dir.join(&name).exists(), "{op}");
+    }
+}
+
+#[test]
+fn a_stopped_store_is_not_changed_by_pop() {
+    let d = store("#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n");
+    let before = fs::read(d.path().join("s.tsvz")).unwrap();
+    assert_eq!(records(d.path(), &["pop", "s.tsvz", "a"]).0, 1);
+    assert_eq!(fs::read(d.path().join("s.tsvz")).unwrap(), before);
+}

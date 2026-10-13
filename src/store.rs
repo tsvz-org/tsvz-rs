@@ -58,6 +58,11 @@ pub struct Row<'a> {
 }
 
 impl<'a> Row<'a> {
+    /// A row resolved from `cells` under `defaults` and a fill-empty setting (§14.2, §14.3).
+    pub(crate) fn new(cells: &'a Cells, defaults: &'a [String], fill: bool) -> Row<'a> {
+        Row { cells, defaults, fill }
+    }
+
     pub fn len(&self) -> usize {
         self.cells.len().max(self.defaults.len())
     }
