@@ -19,6 +19,7 @@ mod error;
 pub mod escape;
 #[doc(hidden)]
 pub mod frame;
+pub mod handler;
 #[doc(hidden)]
 pub mod lock;
 pub mod maint;
