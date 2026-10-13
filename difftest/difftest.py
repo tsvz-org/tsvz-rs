@@ -12,8 +12,12 @@ rows to the store's width as TSVZ.py does (§3.6 lets a reader pad). `read`, `ve
 Loose files are left out: tsvz-rs reads them by design section 5.6's rule, TSVZ.py by its
 3.39 rules (§20.2.4 allows both; docs/silent-choices.md).
 
+With --handler, each seed's store is served by `tsvz serve`, so tsvz-rs's operations go through
+its handler (§20.8), while TSVZ.py still reads the files (`--x-direct`): what a handler answers
+must be what the files give (§20.8.1, §21.8.5).
+
 usage: python3 difftest/difftest.py --rust target/release/tsvz [--tsvz ../TSVZ/TSVZ.py]
-                                    [--seeds 0:200] [--keep DIR]
+                                    [--seeds 0:200] [--keep DIR] [--handler]
 Exit status: 0 when every seed agrees, 1 when one does not (its files are kept).
 """
 import argparse
@@ -23,9 +27,11 @@ import lzma
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 try:
@@ -188,6 +194,42 @@ def ask(command, store, op):
     return (done.returncode, done.stdout)
 
 
+def serve(command, store):
+    """Start `tsvz serve STORE`; return the process once its pointer file names a socket that answers."""
+    proc = subprocess.Popen(command + ['-q', 'serve', store], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError('serve exited with status %d' % proc.returncode)
+        try:
+            with open(store + '.serve', encoding='utf-8') as f:
+                lines = f.read().split('\n')
+            fields = dict(line.split('\t', 1) for line in lines[1:] if '\t' in line)
+            address = fields.get('address', '')
+            if lines[0] == 'tsvz-handler\t1' and address.startswith('unix:'):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.connect(address[5:])
+                return proc
+        except OSError:
+            pass
+        time.sleep(0.02)
+    proc.kill()
+    proc.wait()
+    raise RuntimeError('no handler answered within 10 s')
+
+
+def unserve(command, store, proc):
+    """Stop the handler of STORE and reap it."""
+    subprocess.run(command + ['-q', 'stop', store], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=60)
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 # Differences where TSVZ.py, not tsvz-rs, departs from the spec: (reason, test). Remove an entry
 # once TSVZ.py is fixed. Each is listed in docs/silent-choices.md.
 KNOWN = []  # none as of TSVZ.py 4.6
@@ -204,10 +246,14 @@ def main():
     parser.add_argument('--tsvz', default=os.path.join(here, '..', '..', 'TSVZ', 'TSVZ.py'), help='TSVZ.py')
     parser.add_argument('--seeds', default='0:200', help='START:END, end excluded')
     parser.add_argument('--keep', help='where to keep the stores of seeds that disagree (default: a temporary directory)')
+    parser.add_argument('--handler', action='store_true',
+                        help="send tsvz-rs's operations through a tsvz-rs handler; TSVZ.py still reads the files")
     args = parser.parse_args()
     start, end = (int(x) for x in args.seeds.split(':'))
     rust = [os.path.abspath(args.rust)]
     python = [sys.executable, os.path.abspath(args.tsvz)]
+    if args.handler:
+        python.append('--x-direct')  # the files, not the handler that serves them
     keep = args.keep or tempfile.mkdtemp(prefix='difftest-')
     failed = 0
     seen = {}
@@ -219,6 +265,12 @@ def main():
         try:
             store, _ = make(rng, directory)
             problems = []
+            handler = None
+            if args.handler:
+                try:
+                    handler = serve(rust, store)
+                except RuntimeError as e:
+                    problems.append('  serve: %s' % e)
             for op in ops + [['table', 'read'], ['table', 'verify'], ['table', 'parts']]:
                 if op[0] == 'table':
                     a, b = ask_tty(rust, store, op[1:]), ask_tty(python, store, op[1:])
@@ -229,6 +281,8 @@ def main():
                     seen[known(op, a, b)] = seen.get(known(op, a, b), 0) + 1
                 elif not same:
                     problems.append('  %s: tsvz-rs %s %r\n  %s  TSVZ.py %s %r' % (' '.join(op), a[0], a[1][:300], ' ' * len(' '.join(op)), b[0], b[1][:300]))
+            if handler is not None:
+                unserve(rust, store, handler)
             if problems:
                 failed += 1
                 target = os.path.join(keep, 'seed%d' % seed)

@@ -125,3 +125,60 @@ fn random_arguments_never_panic() {
         let _ = tsvz::cli::args::parse(&args);
     }
 }
+
+#[test]
+fn random_requests_never_panic() {
+    use std::io::Cursor;
+    use tsvz::handler::engine::Engine;
+    use tsvz::handler::protocol::{parse, read_line, read_response};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(&dir.path().join("s.tsvz"), None).unwrap();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    const WORDS: &[&str] = &[
+        "read",
+        "get",
+        "set",
+        "append",
+        "delete",
+        "has",
+        "len",
+        "keys",
+        "pop",
+        "popitem",
+        "setdefault",
+        "verify",
+        "parts",
+        "clear",
+        "scrub",
+        "--sync",
+        "--x-written",
+        "-",
+        "first",
+        "#_defaults_#",
+        "#_strip_trailing_whites_#",
+        "<#>k",
+        "k ",
+        "k",
+        "",
+    ];
+    for _ in 0..2000 {
+        let mut text = Vec::new();
+        for _ in 0..1 + rng.below(4) {
+            text.extend_from_slice(WORDS[rng.below(WORDS.len())].as_bytes());
+            text.push(b'\t');
+        }
+        text.extend(rng.bytes(12));
+        text.push(b'\n');
+        let mut input = Cursor::new(text.clone());
+        while let Ok(Some(line)) = read_line(&mut input, 1 << 16) {
+            if let Ok(request) = parse(&line) {
+                let bulk: Vec<String> = (0..rng.below(3))
+                    .map(|_| String::from_utf8_lossy(&rng.bytes(16)).replace('\n', ""))
+                    .collect();
+                let bulk = request.bulk().then_some(&bulk[..]);
+                let _ = engine.handle(&request, bulk);
+            }
+        }
+        let _ = read_response(&mut Cursor::new(text));
+    }
+}
