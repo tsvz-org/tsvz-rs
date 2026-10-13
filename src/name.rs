@@ -109,15 +109,17 @@ pub fn format_of(path: &Path) -> Option<Format> {
     if let Some(stripped) = base.strip_suffix(".rotated") {
         base = stripped;
     }
-    for _ in 0..2 {
-        let (root, ext) = split_ext(base);
-        let ext = ext?;
-        if let Some(format) = variant(ext) {
-            return Some(format);
-        }
-        base = root;
+    let (root, ext) = split_ext(base);
+    let ext = ext?;
+    if let Some(format) = variant(ext) {
+        return Some(format);
     }
-    None
+    // Only an ordinal may follow the variant (§17.2): `s.tsvz.1f` is a part, while
+    // `notes.tsvz.txt` or a `s.tsvz.damaged-…` backup is no store at all.
+    if ext.is_empty() || !ext.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    split_ext(root).1.and_then(variant)
 }
 
 /// Whether a path names one numbered part of a store, `<store>.<ext>.<ordinal>[.rotated][.<codec>]`
@@ -281,6 +283,15 @@ mod tests {
         ] {
             assert!(!names_a_part(Path::new(p)), "{p}");
         }
+    }
+
+    #[test]
+    fn only_an_ordinal_may_follow_the_variant() {
+        let f = |p: &str| format_of(Path::new(p));
+        assert_eq!(f("notes.tsvz.txt"), None);
+        assert_eq!(f("s.tsvz.damaged-20261012T101010"), None);
+        assert_eq!(f("s.tsvz.damaged-20261012T101010.1"), None);
+        assert_eq!(f("s.tsvz.1f"), Some(Format { delimiter: b'\t', strict: true }));
     }
 
     #[test]
