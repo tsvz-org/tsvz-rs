@@ -410,16 +410,28 @@ fn file_name(part: &Path) -> String {
 }
 
 /// Write `bytes` as the new part `target`, never replacing a file (§18.7): through a temporary
-/// file in the same directory, synced, given the owner and permissions of `like` (the part it
-/// continues, §18.7), then linked to `target`, which fails when `target` exists.
-fn create_part(target: &Path, bytes: &[u8], like: &Path) -> Result<(), Error> {
+/// file in the same directory, made only after it is synced and has its owner and permissions,
+/// then linked to `target`, which fails when `target` exists. It takes the owner of the last
+/// part it continues (§18.7) and is never more readable than any part whose rows it holds: the
+/// intersection of their modes, without group access unless they all share its group.
+fn create_part(target: &Path, bytes: &[u8], prefix: &[parts::Part]) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
     let io = |e: io::Error| Error::io(target, e);
     let tmp = target.with_file_name(format!(
         ".{}.tsvz-snapshot-{}",
         file_name(target),
         std::process::id()
     ));
-    let like = std::fs::metadata(like).map_err(|e| Error::io(like, e))?;
+    let metas: Vec<std::fs::Metadata> = prefix
+        .iter()
+        .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
+        .collect::<Result<_, _>>()?;
+    let Some(like) = metas.last() else {
+        return Err(Error::Refused("a snapshot needs parts to continue".into()));
+    };
+    let mode = metas
+        .iter()
+        .fold(0o666, |m, meta| m & meta.permissions().mode());
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -428,12 +440,13 @@ fn create_part(target: &Path, bytes: &[u8], like: &Path) -> Result<(), Error> {
         .map_err(|e| Error::io(&tmp, e))?;
     let made = file
         .write_all(bytes)
-        .and_then(|()| {
-            file.set_permissions(std::fs::Permissions::from_mode(
-                like.permissions().mode() & 0o666,
-            ))
+        .and_then(|()| match_owner(&file, like))
+        .and_then(|()| file.metadata())
+        .and_then(|made| {
+            let shared = metas.iter().all(|m| m.gid() == made.gid());
+            let mode = if shared { mode } else { mode & !0o070 };
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
         })
-        .and_then(|()| match_owner(&file, &like))
         .and_then(|()| file.sync_all())
         .and_then(|()| std::fs::hard_link(&tmp, target));
     let _ = std::fs::remove_file(&tmp);
@@ -554,7 +567,7 @@ fn snapshot_prefix(store: &Path, options: &Options) -> Result<Outcome, Error> {
         };
         let suffix = parts::codec_suffix(&last.path);
         let target = parts::numbered_path(store, &ordinal, suffix.as_deref())?;
-        create_part(&target, &bytes, &last.path)?;
+        create_part(&target, &bytes, prefix)?;
         let unchanged = prefix
             .iter()
             .zip(&before)
@@ -1064,5 +1077,26 @@ mod tests {
             ["s.tsvz", "s.tsvz.07", "s.tsvz.0b", "s.tsvz.0d", "s.tsvz.10"]
         );
         assert_eq!(rows(&p), [["a", "1"], ["b", "2"]]);
+    }
+
+    #[test]
+    fn a_snapshot_is_never_more_readable_than_a_part_it_holds_rows_of() {
+        use std::os::unix::fs::PermissionsExt;
+        // Part 0 is private; the last part before the active one is not: the snapshot holds
+        // part 0's rows, so it takes the most restrictive of their modes.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "secret\t1\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let open = dir.path().join("s.tsvz.2");
+        fs::write(&open, "b\t2\n").unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(dir.path().join("s.tsvz.8"), "c\t3\n").unwrap();
+        scrub(&p, &opts()).unwrap();
+        let mode = fs::metadata(dir.path().join("s.tsvz.5"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {:o}", mode & 0o777);
     }
 }

@@ -12,12 +12,17 @@ rows to the store's width as TSVZ.py does (§3.6 lets a reader pad). `read`, `ve
 Loose files are left out: tsvz-rs reads them by design section 5.6's rule, TSVZ.py by its
 3.39 rules (§20.2.4 allows both; docs/silent-choices.md).
 
+With --scrub, each seed's store is also scrubbed by tsvz-rs, in place for one part and by a
+snapshot of the parts before the active one for several (§19.2), on a copy: TSVZ.py, and
+tsvz-rs, must then read the copy exactly as they read the original (§19.4), padding aside
+(§3.6). A scrub that is refused (exit 1) is counted, not compared.
+
 With --handler, each seed's store is served by `tsvz serve`, so tsvz-rs's operations go through
 its handler (§20.8), while TSVZ.py still reads the files (`--x-direct`): what a handler answers
 must be what the files give (§20.8.1, §21.8.5).
 
 usage: python3 difftest/difftest.py --rust target/release/tsvz [--tsvz ../TSVZ/TSVZ.py]
-                                    [--seeds 0:200] [--keep DIR] [--handler]
+                                    [--seeds 0:200] [--keep DIR] [--handler] [--scrub]
 Exit status: 0 when every seed agrees, 1 when one does not (its files are kept).
 """
 import argparse
@@ -58,6 +63,7 @@ MARKERS = [
     ('#_version_#', lambda r: [r.choice(['1', '2', '0', 'x'])]),
     ('#_on_corruption_#', lambda r: [r.choice(['recover', 'skip', 'stop', 'recover'])]),
     ('#__ext__#', lambda r: ['v']),
+    ('#_rotate_#', lambda r: [r.choice(['keep', 'rename', 'delete'])]),
     ('#_DEFAULTS_#', lambda r: ['up']),
 ]
 
@@ -230,6 +236,35 @@ def unserve(command, store, proc):
         proc.wait()
 
 
+def trimmed(output, delimiter):
+    """Output lines without the empty cells a reader pads rows with (§3.6)."""
+    d = delimiter.encode()
+    return [line.rstrip(d) for line in output.split(b'\n')]
+
+
+def check_scrub(rust, python, store, delimiter, directory):
+    """(refused, problems) of scrubbing a copy of the store: TSVZ.py and tsvz-rs must read the
+    copy as they read the original."""
+    copy = directory + '-scrubbed'
+    shutil.copytree(directory, copy)
+    try:
+        scrubbed = os.path.join(copy, os.path.basename(store))
+        done = subprocess.run(rust + ['-q', 'scrub', scrubbed], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=60)
+        if done.returncode != 0:
+            return True, []
+        problems = []
+        for who, command in (('TSVZ.py', python), ('tsvz-rs', rust)):
+            for op in (['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp']):
+                before, after = ask(command, store, op), ask(command, scrubbed, op)
+                if (before[0], trimmed(before[1], delimiter)) != (after[0], trimmed(after[1], delimiter)):
+                    problems.append('  scrub, then %s %s: before %s %r\n%s after %s %r' % (
+                        who, ' '.join(op), before[0], before[1][:300], ' ' * (len(who) + 13), after[0], after[1][:300]))
+        return False, problems
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+
+
 # Differences where TSVZ.py, not tsvz-rs, departs from the spec: (reason, test). Remove an entry
 # once TSVZ.py is fixed. Each is listed in docs/silent-choices.md.
 KNOWN = []  # none as of TSVZ.py 4.6
@@ -246,6 +281,8 @@ def main():
     parser.add_argument('--tsvz', default=os.path.join(here, '..', '..', 'TSVZ', 'TSVZ.py'), help='TSVZ.py')
     parser.add_argument('--seeds', default='0:200', help='START:END, end excluded')
     parser.add_argument('--keep', help='where to keep the stores of seeds that disagree (default: a temporary directory)')
+    parser.add_argument('--scrub', action='store_true',
+                        help='also scrub a copy of each store with tsvz-rs and check that both tools read it as before')
     parser.add_argument('--handler', action='store_true',
                         help="send tsvz-rs's operations through a tsvz-rs handler; TSVZ.py still reads the files")
     args = parser.parse_args()
@@ -256,6 +293,7 @@ def main():
         python.append('--x-direct')  # the files, not the handler that serves them
     keep = args.keep or tempfile.mkdtemp(prefix='difftest-')
     failed = 0
+    refused = 0
     seen = {}
     ops = [['read'], ['len'], ['keys'], ['verify'], ['parts'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp'],
            ['read', '-d', 'comma']]
@@ -263,7 +301,7 @@ def main():
         rng = random.Random(seed)
         directory = tempfile.mkdtemp(prefix='seed%d-' % seed)
         try:
-            store, _ = make(rng, directory)
+            store, delimiter = make(rng, directory)
             problems = []
             handler = None
             if args.handler:
@@ -283,6 +321,10 @@ def main():
                     problems.append('  %s: tsvz-rs %s %r\n  %s  TSVZ.py %s %r' % (' '.join(op), a[0], a[1][:300], ' ' * len(' '.join(op)), b[0], b[1][:300]))
             if handler is not None:
                 unserve(rust, store, handler)
+            if args.scrub:
+                was_refused, scrub_problems = check_scrub(rust, python, store, delimiter, directory)
+                refused += was_refused
+                problems += scrub_problems
             if problems:
                 failed += 1
                 target = os.path.join(keep, 'seed%d' % seed)
@@ -292,6 +334,8 @@ def main():
             shutil.rmtree(directory, ignore_errors=True)
     for reason, count in seen.items():
         print('known TSVZ.py difference, %d times: %s' % (count, reason))
+    if args.scrub:
+        print('%d scrubs refused (not compared)' % refused)
     print('%d of %d seeds disagree' % (failed, end - start))
     return 1 if failed else 0
 
