@@ -641,3 +641,32 @@ fn a_bulk_request_with_an_unknown_option_still_reads_its_records_as_records() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\n");
 }
+
+#[test]
+fn a_handler_whose_standard_error_is_closed_keeps_serving() {
+    // `tsvz serve s 2>&1 | tee log` whose tee dies: every request's -v line hits a closed pipe.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let mut child = tsvz()
+        .args(["-v", "serve"])
+        .arg(&s)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while connect(&s).is_none() {
+        assert!(Instant::now() < deadline, "no handler");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(child.stderr.take());
+    for _ in 0..5 {
+        assert_eq!(ask(&s, "len").lines, ["1"]);
+    }
+    assert!(child.try_wait().unwrap().is_none(), "the handler died");
+    let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
+    assert_eq!(stop.status.code(), Some(0));
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert!(!pointer::path_of(&s).exists());
+}

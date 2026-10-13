@@ -168,6 +168,12 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
             )));
         }
     };
+    // A handler outlives its readers: a closed log pipe or a client that hangs up must not end
+    // it (the command line restores SIGPIPE's default action for its own output).
+    // SAFETY: setting a signal's disposition to SIG_IGN has no other effect.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let signals = block_signals();
     let engine = match Engine::open(store, config.log.clone()) {
         Ok(engine) => Arc::new(engine),
