@@ -1,6 +1,7 @@
 //! The command-line tool of §20.
 
 pub mod args;
+mod maint;
 pub(crate) mod output;
 mod read;
 mod write;
@@ -162,13 +163,15 @@ impl Ctx {
             "pop" => write::pop(self),
             "popitem" => write::popitem(self),
             "setdefault" => write::setdefault(self),
+            "clear" => maint::run(self, true),
+            "scrub" => maint::run(self, false),
             "serve" | "stop" => {
                 eprintln!("tsvz: {}: this tsvz does not provide a handler (§21); work on the files instead", self.args.op);
                 Ok(1)
             }
             other => {
-                eprintln!("tsvz: {other}: not built yet"); // replaced in Tasks 12 and 13
-                Ok(1)
+                eprintln!("tsvz: unknown operation {other}");
+                Ok(2)
             }
         };
         let code = result.unwrap_or_else(|e| {

@@ -209,3 +209,19 @@ fn a_stopped_store_is_not_changed_by_pop() {
     assert_eq!(records(d.path(), &["pop", "s.tsvz", "a"]).0, 1);
     assert_eq!(fs::read(d.path().join("s.tsvz")).unwrap(), before);
 }
+
+#[test]
+fn clear_and_scrub_from_the_command_line() {
+    let d = store("#hdr\na\tx\nb\na\ty\n");
+    assert_eq!(records(d.path(), &["scrub", "s.tsvz"]), (0, String::new(), String::new()));
+    assert_eq!(file(d.path(), "s.tsvz"), "#hdr\n#_version_#\t1\na\ty\n");
+    assert_eq!(records(d.path(), &["clear", "s.tsvz"]).0, 0);
+    assert_eq!(file(d.path(), "s.tsvz"), "#hdr\n");
+    fs::write(d.path().join("s.tsvz.1"), "z\t1\n").unwrap();
+    let (code, _, err) = records(d.path(), &["scrub", "s.tsvz"]);
+    assert!(code == 1 && err.contains("multi-part"), "{err}");
+    assert_eq!(records(d.path(), &["scrub", "none.tsvz"]).0, 1);
+    let damaged = store("#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n");
+    let (code, _, err) = records(damaged.path(), &["scrub", "s.tsvz"]);
+    assert!(code == 1 && err.contains("damaged-"), "{err}");
+}
