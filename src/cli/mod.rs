@@ -4,6 +4,8 @@ pub mod args;
 mod maint;
 pub(crate) mod output;
 mod read;
+mod table;
+mod width_table;
 mod write;
 
 use std::ffi::OsString;
@@ -97,7 +99,6 @@ pub(crate) struct Ctx {
     pub args: Args,
     pub store: PathBuf,
     pub format: Format,
-    #[allow(dead_code)] // read by the table output (Task 14), which removes this line
     pub table: bool,
     pub warn: WarnFn,
     pub out: BufWriter<StdoutLock<'static>>,

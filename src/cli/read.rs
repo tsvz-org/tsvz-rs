@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use crate::cli::output::{fields, stdout_error, Emitter};
+use crate::cli::output::{stdout_error, Emitter, Fields};
 use crate::cli::Ctx;
 use crate::{parts, Error, Scope, Store};
 
@@ -67,10 +67,12 @@ pub(crate) fn keys(ctx: &mut Ctx) -> Result<i32, Error> {
 
 pub(crate) fn verify(ctx: &mut Ctx) -> Result<i32, Error> {
     let store = ctx.open(Scope::KeysOnly, true)?;
+    let mut out = Fields::new(ctx, &["path", "line", "algorithm", "expected", "computed"]);
     for m in store.mismatches() {
         let part = m.part.display().to_string();
-        fields(&mut ctx.out, &[&part, &m.line.to_string(), m.algo, &m.expected, &m.computed]).map_err(stdout_error)?;
+        out.line(&[&part, &m.line.to_string(), m.algo, &m.expected, &m.computed])?;
     }
+    out.finish()?;
     Ok(status(&store, if store.mismatches().is_empty() { 0 } else { 4 }))
 }
 
@@ -80,6 +82,7 @@ pub(crate) fn parts(ctx: &mut Ctx) -> Result<i32, Error> {
         return Err(Error::Missing(ctx.store.clone()));
     }
     let last = list.len() - 1;
+    let mut out = Fields::new(ctx, &["index", "ordinal", "path", "flags"]);
     for (i, part) in list.iter().enumerate() {
         let mut flags = Vec::new();
         if i == last {
@@ -89,7 +92,8 @@ pub(crate) fn parts(ctx: &mut Ctx) -> Result<i32, Error> {
             flags.push(codec.name());
         }
         let path = part.path.display().to_string();
-        fields(&mut ctx.out, &[&i.to_string(), part.ordinal.as_deref().unwrap_or(""), &path, &flags.join(",")]).map_err(stdout_error)?;
+        out.line(&[&i.to_string(), part.ordinal.as_deref().unwrap_or(""), &path, &flags.join(",")])?;
     }
+    out.finish()?;
     Ok(0)
 }

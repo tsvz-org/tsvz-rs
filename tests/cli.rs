@@ -225,3 +225,12 @@ fn clear_and_scrub_from_the_command_line() {
     let (code, _, err) = records(damaged.path(), &["scrub", "s.tsvz"]);
     assert!(code == 1 && err.contains("damaged-"), "{err}");
 }
+
+#[test]
+fn table_format_on_request() {
+    let d = store("alpha\tA\t1\nbeta\tB<sep>x\t2\n");
+    let (code, out, _) = run_in(d.path(), &["--format", "table", "read", "s.tsvz"], b"");
+    assert_eq!((code, out.as_str()), (0, "alpha | A    | 1\nbeta  | B\\tx | 2\n\n"));
+    let (_, empty, _) = run_in(d.path(), &["--format", "table", "verify", "s.tsvz"], b"");
+    assert_eq!(empty, "");
+}
