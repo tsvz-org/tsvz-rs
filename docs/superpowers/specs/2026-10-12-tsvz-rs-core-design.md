@@ -83,8 +83,11 @@ tsvz-rs/
 | zstd | `zstd` with static linking |
 | Digests | `crc32fast`, `crc32c`, `sha2`, `blake3` (pure build) |
 | Hash map | `hashbrown` |
-| Table output widths | `unicode-width` |
-| Locks and signals | `libc` |
+| Locks, signals, terminal size | `libc` |
+
+Table widths (section 5.4) use a small table generated from the Unicode
+Character Database and checked into the crate, so they follow TSVZ.py's rule
+rather than a width crate's.
 
 There is no argument-parsing crate: §20.1.2's rules are easier to meet exactly
 with a small hand-written parser (section 5.1).
@@ -481,8 +484,32 @@ one batch.
   leading `#`. A row whose resolved cells are all empty is still printed with a
   delimiter, so it does not read back as a tombstone. `verify` and `parts` join
   their fields with TAB, each encoded per §13 for TSVZ.
-- `table`: aligned columns measured with `unicode-width`, cells longer than 40
-  columns cut with `…`; the default when stdout is a terminal (§20.4.3).
+- `table`, the default when stdout is a terminal (§20.4.3), is laid out as
+  TSVZ.py lays it out:
+  - Row output (`read`, `get`, `pop`, `popitem`, `setdefault`, and `keys` as
+    one-column rows): no header; every row padded to the widest row's number of
+    cells; each column padded to its widest cell; cells joined by ` | `; no cell
+    is ever shortened; a row whose cells are all empty is drawn as the rule
+    (`-` runs joined by `-+-`); the table is followed by one empty line.
+  - `verify` and `parts`: a header row (`path line algorithm expected
+    computed`, or `index ordinal path flags`) and a `-+-` rule, fitted to the
+    terminal width: first with ` | ` between cells, then with `|`, then by
+    shortening the columns that are wider than their header, widest first, a
+    shortened cell keeping what fits and ending in `..`. No rows prints nothing.
+  - `len` prints the number in both formats.
+  - Before layout, every cell's control characters are escaped, so no stored
+    value can move the cursor, reorder the line, or send the terminal an escape
+    sequence: U+0000–U+001F, U+007F–U+009F, U+061C, U+200E, U+200F, U+2028,
+    U+2029, U+202A–U+202E and U+2066–U+2069 are shown as `\t`, `\n` or `\r`
+    for those three, else `\xNN` below U+0100 and `\uNNNN` above. A backslash
+    is not escaped: the table is for reading, records are exact.
+  - Widths count terminal columns by TSVZ.py's rule: a character below U+0300
+    takes 1; a combining mark, a character of category Mn, Me or Cf, or one in
+    U+1160–U+11FF takes 0; an East Asian Wide or Fullwidth character takes 2;
+    anything else 1. The categories and East Asian widths come from a table the
+    crate generates from the Unicode Character Database.
+  - The terminal width is that of stdout (`TIOCGWINSZ`); when it cannot be
+    read, `$COLUMNS`, else 240.
 - Output goes through one buffered, locked stdout. Diagnostics go to stderr as
   `tsvz: <path>: <message>`; `-q` drops warnings, `-v` adds informational
   messages.
@@ -525,7 +552,7 @@ with the TSVZ.py behaviour it copies. The differential harness (section 7.3)
 finds new ones. The list starts with: the ordinal printed by `parts`; xz stream
 padding and zstd skippable frames between members; the markers a `scrub` keeps;
 what `scrub` does with checksum markers; truncating an uncommitted tail before
-an append; and the `-V` text.
+an append; the table layout of section 5.4; and the `-V` text.
 
 ## 7. Testing
 
@@ -559,8 +586,11 @@ checksum, `read | set -`).
 reset), tokens and bare `<`, CRLF and lone `\r`, zero fill, invalid UTF-8,
 tombstones and empty keys, multi-part layouts, and gzip parts with damaged,
 cut-short and padded members. For each it compares `read`, `get` of a present
-and a missing key, `len`, `verify` and `parts` between tsvz-rs and TSVZ.py. A
-difference is a bug in one of them, or a silent choice to record (section 6.2).
+and a missing key, `len`, `verify` and `parts` between tsvz-rs and TSVZ.py,
+and, through a pseudo-terminal of fixed size, the table output of `read`,
+`verify` and `parts` (control characters, East Asian and combining text
+included). A difference is a bug in one of them, or a silent choice to record
+(section 6.2).
 It runs for a fixed seed range in CI and for longer locally.
 
 ### 7.4 Robustness
