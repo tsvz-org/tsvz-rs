@@ -380,3 +380,53 @@ fn the_delimiter_option() {
     let (_, _, quiet) = records(dir, &["-q", "-d", ";", "get", "s.tsvz", "k"]);
     assert_eq!(quiet, "");
 }
+
+/// Peak RSS in KiB of `tsvz ARGS` run in `dir`, read with wait4 so no other child counts.
+#[cfg(target_os = "linux")]
+#[allow(clippy::zombie_processes)] // reaped by wait4 below, which also reads its peak RSS
+fn peak_rss_kib(dir: &Path, args: &[&str]) -> (String, i64) {
+    use std::io::Read;
+    let mut child = tsvz()
+        .current_dir(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let mut status = 0;
+    // SAFETY: an all-zero rusage is valid; wait4 reaps exactly this child and fills it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::wait4(child.id() as i32, &mut status, 0, &mut usage) },
+        child.id() as i32
+    );
+    (out, usage.ru_maxrss)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn many_small_compressed_members_read_in_bounded_memory() {
+    let d = tempfile::tempdir().unwrap();
+    let mut part = Vec::new();
+    for i in 0..10_000 {
+        part.extend(
+            tsvz::codec::encode_member(tsvz::name::Codec::Gzip, format!("k{i}\tv\n").as_bytes())
+                .unwrap(),
+        );
+    }
+    fs::write(d.path().join("s.tsvz.gz"), &part).unwrap();
+    let (out, kib) = peak_rss_kib(d.path(), &["--format", "records", "len", "s.tsvz.gz"]);
+    assert_eq!(out, "10000\n");
+    assert!(
+        kib < 64 * 1024,
+        "reading a {} KiB part of 10,000 members peaked at {kib} KiB",
+        part.len() / 1024
+    );
+}

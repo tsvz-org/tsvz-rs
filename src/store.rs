@@ -326,31 +326,22 @@ impl Store {
                     let mut data = Vec::new();
                     file.read_to_end(&mut data)
                         .map_err(|e| Error::io(&part.path, e))?;
-                    for item in codec::items(codec, &data) {
-                        let go = match item {
-                            Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
-                            Item::CutShort { offset, out } => {
-                                replay.cut_short(offset);
-                                framer.push(&out, &mut |l| replay.line(l, table))
-                            }
-                            Item::Corrupt { offset, out } => {
-                                match replay.corrupt(offset, out.len()) {
-                                    Policy::Recover => {
-                                        framer.push(&out, &mut |l| replay.line(l, table))
-                                    }
-                                    Policy::Skip => true,
-                                    Policy::Stop => false,
-                                }
-                            }
-                            Item::Break => {
-                                framer.brk();
-                                true
-                            }
-                        };
-                        if !go {
-                            break;
+                    codec::for_each_item(codec, &data, &mut |item| match item {
+                        Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
+                        Item::CutShort { offset, out } => {
+                            replay.cut_short(offset);
+                            framer.push(&out, &mut |l| replay.line(l, table))
                         }
-                    }
+                        Item::Corrupt { offset, out } => match replay.corrupt(offset, out.len()) {
+                            Policy::Recover => framer.push(&out, &mut |l| replay.line(l, table)),
+                            Policy::Skip => true,
+                            Policy::Stop => false,
+                        },
+                        Item::Break => {
+                            framer.brk();
+                            true
+                        }
+                    });
                 }
                 None => {
                     let mut buf = vec![0u8; 1 << 20];

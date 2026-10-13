@@ -1,5 +1,7 @@
 //! Compressed parts (§16): decoding members, the damaged-member rules of §16.6, and (Task 6) encoding.
 
+use std::borrow::Cow;
+
 use crate::name::Codec;
 
 /// How the member at the start of some bytes decoded (§16.6 rule 1).
@@ -22,17 +24,36 @@ pub enum Alone {
     Corrupt(Vec<u8>),
 }
 
-/// A compressed part as the framer takes it (§16.6).
+/// A compressed part as the framer takes it (§16.6). `for_each_item` lends each member's output
+/// from a buffer it reuses; `items` collects owned copies.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Item {
+pub enum Item<'a> {
     /// A complete member's output.
-    Data(Vec<u8>),
+    Data(Cow<'a, [u8]>),
     /// A member cut short: its output is used, with a warning.
-    CutShort { offset: usize, out: Vec<u8> },
+    CutShort { offset: usize, out: Cow<'a, [u8]> },
     /// A corrupt member: the policy in force decides what happens to `out` (§4.10).
-    Corrupt { offset: usize, out: Vec<u8> },
+    Corrupt { offset: usize, out: Cow<'a, [u8]> },
     /// A damaged member ended here: the unfinished line before this point is dropped.
     Break,
+}
+
+impl Item<'_> {
+    /// The item with its bytes owned.
+    pub fn into_owned(self) -> Item<'static> {
+        match self {
+            Item::Data(d) => Item::Data(Cow::Owned(d.into_owned())),
+            Item::CutShort { offset, out } => Item::CutShort {
+                offset,
+                out: Cow::Owned(out.into_owned()),
+            },
+            Item::Corrupt { offset, out } => Item::Corrupt {
+                offset,
+                out: Cow::Owned(out.into_owned()),
+            },
+            Item::Break => Item::Break,
+        }
+    }
 }
 
 /// Where an RFC 1952 header parse is: the optional fields come in the order FEXTRA, FNAME,
@@ -293,14 +314,29 @@ impl GzipDecoder {
     }
 }
 
+enum Judged {
+    Complete(usize),
+    Short,
+    Bad,
+}
+
+/// Decode the member at the start of `data` into `out`, which is cleared first.
+fn member_into(codec: Codec, data: &[u8], out: &mut Vec<u8>) -> Judged {
+    out.clear();
+    match Decoder::new(codec).feed(data, out) {
+        Err(()) => Judged::Bad,
+        Ok((end, true)) => Judged::Complete(end),
+        Ok((_, false)) => Judged::Short,
+    }
+}
+
 /// Decode the member at the start of `data` (§16.6 rule 1).
 pub fn member(codec: Codec, data: &[u8]) -> Member {
-    let mut d = Decoder::new(codec);
     let mut out = Vec::new();
-    match d.feed(data, &mut out) {
-        Err(()) => Member::Bad,
-        Ok((end, true)) => Member::Complete { out, end },
-        Ok((_, false)) => Member::Short,
+    match member_into(codec, data, &mut out) {
+        Judged::Bad => Member::Bad,
+        Judged::Complete(end) => Member::Complete { out, end },
+        Judged::Short => Member::Short,
     }
 }
 
@@ -413,18 +449,23 @@ pub fn gzip_keep(region: &[u8]) -> usize {
     }
 }
 
-/// A compressed part's bytes as items for the framer (§16.6). Mirrors `decompress_items`.
-pub fn items(codec: Codec, data: &[u8]) -> Vec<Item> {
+/// A compressed part's bytes as items for the framer (§16.6), one at a time: `each` gets every
+/// item as it is found and returns false to stop. Mirrors `decompress_items` in the runner, but
+/// holds one member's output at a time, in a buffer reused from member to member, so a part of
+/// many small members costs its largest member, not their sum.
+pub fn for_each_item(codec: Codec, data: &[u8], each: &mut dyn FnMut(Item<'_>) -> bool) {
     let magic = codec.magic();
-    let mut items = Vec::new();
+    let mut buf = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
         if codec == Codec::Gzip && data[pos] == 0 {
             pos += data[pos..].iter().take_while(|&&b| b == 0).count(); // padding before a member
             continue;
         }
-        if let Member::Complete { out, end } = member(codec, &data[pos..]) {
-            items.push(Item::Data(out));
+        if let Judged::Complete(end) = member_into(codec, &data[pos..], &mut buf) {
+            if !each(Item::Data(Cow::Borrowed(&buf))) {
+                return;
+            }
             pos += end.max(1);
             continue;
         }
@@ -434,19 +475,39 @@ pub fn items(codec: Codec, data: &[u8]) -> Vec<Item> {
         if codec == Codec::Gzip {
             region = &region[..gzip_keep(region)];
         }
-        items.push(match decode_alone(codec, region) {
-            Alone::Short(out) => Item::CutShort { offset: pos, out },
-            Alone::Corrupt(out) => Item::Corrupt { offset: pos, out },
-        });
+        let item = match decode_alone(codec, region) {
+            Alone::Short(out) => Item::CutShort {
+                offset: pos,
+                out: Cow::Owned(out),
+            },
+            Alone::Corrupt(out) => Item::Corrupt {
+                offset: pos,
+                out: Cow::Owned(out),
+            },
+        };
+        if !each(item) {
+            return;
+        }
         match following {
             Some(next) => {
-                items.push(Item::Break);
+                if !each(Item::Break) {
+                    return;
+                }
                 pos = next;
             }
             None => break,
         }
     }
-    items
+}
+
+/// All the items of a compressed part, owned (`for_each_item` streams them instead).
+pub fn items(codec: Codec, data: &[u8]) -> Vec<Item<'static>> {
+    let mut all = Vec::new();
+    for_each_item(codec, data, &mut |item| {
+        all.push(item.into_owned());
+        true
+    });
+    all
 }
 
 /// One member holding `data`, or None when this build does not include the codec.
@@ -640,8 +701,8 @@ mod tests {
             assert_eq!(
                 items(codec, &part),
                 vec![
-                    Item::Data(b"a\tx\n".to_vec()),
-                    Item::Data(b"b\ty\n".to_vec())
+                    Item::Data(b"a\tx\n".to_vec().into()),
+                    Item::Data(b"b\ty\n".to_vec().into())
                 ],
                 "{codec:?}"
             );
@@ -658,8 +719,8 @@ mod tests {
         assert_eq!(
             items(Codec::Gzip, &part),
             vec![
-                Item::Data(b"a\tx\n".to_vec()),
-                Item::Data(b"b\ty\n".to_vec())
+                Item::Data(b"a\tx\n".to_vec().into()),
+                Item::Data(b"b\ty\n".to_vec().into())
             ]
         );
     }
@@ -677,7 +738,7 @@ mod tests {
                 "{codec:?}"
             );
             assert_eq!(got[1], Item::Break);
-            assert_eq!(got[2], Item::Data(b"z\t1\n".to_vec()));
+            assert_eq!(got[2], Item::Data(b"z\t1\n".to_vec().into()));
         }
     }
 
@@ -697,13 +758,13 @@ mod tests {
             part.extend(&b);
             part.extend(fixture(codec, b"c\tz\n"));
             let got = items(codec, &part);
-            assert_eq!(got[0], Item::Data(b"a\tx\n".to_vec()), "{codec:?}");
+            assert_eq!(got[0], Item::Data(b"a\tx\n".to_vec().into()), "{codec:?}");
             assert!(
                 matches!(&got[1], Item::Corrupt { offset, .. } if *offset == a.len()),
                 "{codec:?}: {got:?}"
             );
             assert_eq!(got[2], Item::Break, "{codec:?}");
-            assert_eq!(got[3], Item::Data(b"c\tz\n".to_vec()), "{codec:?}");
+            assert_eq!(got[3], Item::Data(b"c\tz\n".to_vec().into()), "{codec:?}");
         }
     }
 
@@ -770,7 +831,7 @@ mod tests {
         for codec in codecs() {
             let all = encode_members(codec, &payload, 300).unwrap();
             let got = items(codec, &all);
-            let outs: Vec<&Vec<u8>> = got
+            let outs: Vec<&Cow<[u8]>> = got
                 .iter()
                 .map(|i| match i {
                     Item::Data(d) => d,
@@ -783,7 +844,10 @@ mod tests {
                 "{codec:?}"
             );
             assert_eq!(
-                outs.into_iter().flatten().copied().collect::<Vec<u8>>(),
+                outs.iter()
+                    .flat_map(|o| o.iter())
+                    .copied()
+                    .collect::<Vec<u8>>(),
                 payload,
                 "{codec:?}"
             );
@@ -798,7 +862,7 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(
             got[1],
-            Item::Data([vec![b'x'; 1000], b"\n".to_vec()].concat())
+            Item::Data([vec![b'x'; 1000], b"\n".to_vec()].concat().into())
         );
     }
 
