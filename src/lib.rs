@@ -4,5 +4,6 @@
 mod error;
 pub mod escape;
 pub mod name;
+pub mod parts;
 
 pub use error::{Error, WarnFn, Warning};
