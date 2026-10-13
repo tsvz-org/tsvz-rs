@@ -451,3 +451,175 @@ fn a_client_whose_handler_dies_reports_the_request_as_lost() {
     assert!(matches!(err, tsvz::Error::HandlerLost(_)), "{err:?}");
     assert!(err.to_string().contains("may or may not"), "{err}");
 }
+
+/// (exit status, stdout, stderr) of a command line run in `dir`.
+fn cli(dir: &Path, args: &[&str], stdin: &[u8]) -> (i32, String, String) {
+    let out = run(dir, args, stdin);
+    (
+        out.status.code().unwrap_or(-1),
+        text(&out.stdout),
+        text(&out.stderr),
+    )
+}
+
+#[test]
+fn routed_commands_print_what_the_files_give() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    fs::write(
+        d.join("s.csvz"),
+        "#_defaults_#,d1,d2\n<#>h,v<lt>,x<sep>y\na,1\nb,2\n",
+    )
+    .unwrap();
+    let _served = Served::start(&d.join("s.csvz"), &[]);
+    let reads: &[&[&str]] = &[
+        &["--format", "records", "read", "s.csvz"],
+        &["--format", "table", "read", "s.csvz"],
+        &["--format", "records", "get", "s.csvz", "a  ", "zz", "#h"],
+        &["--format", "records", "has", "s.csvz", "b"],
+        &["--format", "records", "has", "s.csvz", "zz"],
+        &["--format", "records", "len", "s.csvz"],
+        &["--format", "records", "keys", "s.csvz"],
+    ];
+    let same = |stage: &str| {
+        for args in reads {
+            let routed = cli(d, args, b"");
+            let mut direct_args = vec!["--x-direct"];
+            direct_args.extend_from_slice(args);
+            let direct = cli(d, &direct_args, b"");
+            assert_eq!(
+                (routed.0, &routed.1),
+                (direct.0, &direct.1),
+                "{stage}: {args:?}: {}",
+                routed.2
+            );
+        }
+    };
+    same("start");
+    let (code, _, err) = cli(d, &["-v", "set", "s.csvz", "c", "3,4"], b"");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("via the handler"), "{err}");
+    same("set");
+    assert_eq!(
+        cli(d, &["set", "s.csvz", "-"], b"e,5\n#_defaults_#,n\nf,6\n").0,
+        0
+    );
+    same("set -");
+    assert_eq!(cli(d, &["delete", "s.csvz", "a", "zz"], b"").0, 0);
+    assert_eq!(cli(d, &["delete", "s.csvz", "-"], b"e\n").0, 0);
+    same("delete");
+    let pop = cli(d, &["--format", "records", "pop", "s.csvz", "b"], b"");
+    assert_eq!((pop.0, pop.1.as_str()), (0, "b,2,d2\n"));
+    assert_eq!(cli(d, &["pop", "s.csvz", "b"], b"").0, 3);
+    let item = cli(
+        d,
+        &["--format", "records", "popitem", "s.csvz", "first"],
+        b"",
+    );
+    assert_eq!((item.0, item.1.as_str()), (0, "<#>h,v<lt>,x<sep>y\n"));
+    let sd = cli(
+        d,
+        &["--format", "records", "setdefault", "s.csvz", "g", "7"],
+        b"",
+    );
+    assert_eq!((sd.0, sd.1.as_str()), (0, "g,7,\n"));
+    assert_eq!(
+        cli(d, &["setdefault", "s.csvz", "#_defaults_#", "x"], b"").0,
+        2
+    );
+    same("pop, popitem, setdefault");
+    assert_eq!(cli(d, &["clear", "s.csvz"], b"").0, 0);
+    same("clear");
+    assert_eq!(cli(d, &["len", "s.csvz"], b"").1, "0\n");
+}
+
+#[test]
+fn an_unreadable_part_reads_the_same_through_the_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let s = store(d, "a\t1\n");
+    fs::create_dir(d.join("s.tsvz.1")).unwrap();
+    fs::write(d.join("s.tsvz.2"), "b\t2\n").unwrap();
+    let _served = Served::start(&s, &[]);
+    let routed = cli(d, &["--format", "records", "read", "s.tsvz"], b"");
+    assert_eq!((routed.0, routed.1.as_str()), (1, "a\t1\nb\t2\n"));
+    assert!(routed.2.contains("s.tsvz.1"), "{}", routed.2);
+    assert_eq!(cli(d, &["pop", "s.tsvz", "b"], b"").0, 1);
+    assert_eq!(fs::read_to_string(d.join("s.tsvz.2")).unwrap(), "b\t2\n");
+}
+
+/// A trusted pointer to a socket of this test, whose "handler" reads one line and hangs up;
+/// the number of connections it took.
+fn rude_handler(store: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::Builder::new()
+        .prefix("rude")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let path = dir.path().join("s");
+    let listener = UnixListener::bind(&path).unwrap();
+    let p = pointer::path_of(store);
+    fs::write(
+        &p,
+        format!(
+            "tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n",
+            path.display(),
+            pointer::hostname()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    std::thread::spawn(move || {
+        let _keep = dir;
+        for conn in listener.incoming() {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut reader = std::io::BufReader::new(conn.unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+        }
+    });
+    count
+}
+
+#[test]
+fn a_handler_that_hangs_up_falls_back_for_reads_and_fails_writes() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let s = store(d, "k\tv\n");
+    let contacts = rude_handler(&s);
+    let (code, out, err) = cli(d, &["--format", "records", "get", "s.tsvz", "k"], b"");
+    assert_eq!((code, out.as_str()), (0, "k\tv\n"), "{err}");
+    assert!(err.contains("lost the handler"), "{err}");
+    let (code, _, err) = cli(d, &["set", "s.tsvz", "n", "w"], b"");
+    assert_eq!(code, 1);
+    assert!(err.contains("may or may not"), "{err}");
+    assert_eq!(contacts.load(Ordering::SeqCst), 2);
+    // --x-direct, verify and parts never contact a handler; neither does a loose file.
+    assert_eq!(cli(d, &["--x-direct", "get", "s.tsvz", "k"], b"").0, 0);
+    assert_eq!(cli(d, &["verify", "s.tsvz"], b"").0, 0);
+    assert_eq!(cli(d, &["parts", "s.tsvz"], b"").0, 0);
+    fs::write(d.join("l.tsv"), "k\tv\n").unwrap();
+    fs::copy(pointer::path_of(&s), d.join("l.tsv.serve")).unwrap();
+    assert_eq!(cli(d, &["get", "l.tsv", "k"], b"").0, 0);
+    assert_eq!(contacts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_untrusted_pointer_is_ignored_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let s = store(d, "k\tv\n");
+    let p = pointer::path_of(&s);
+    fs::write(&p, "tsvz-handler\t1\naddress\ttcp:127.0.0.1:9\nhost\tx\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    let (code, out, err) = cli(d, &["--format", "records", "get", "s.tsvz", "k"], b"");
+    assert_eq!((code, out.as_str()), (0, "k\tv\n"));
+    assert!(err.contains("ignoring the pointer file"), "{err}");
+    let (_, _, quiet) = cli(d, &["-q", "get", "s.tsvz", "k"], b"");
+    assert_eq!(quiet, "");
+}

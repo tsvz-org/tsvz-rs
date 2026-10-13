@@ -13,6 +13,7 @@ pub mod args;
 mod maint;
 pub(crate) mod output;
 mod read;
+mod route;
 mod serve;
 mod table;
 mod width_table;
@@ -189,7 +190,17 @@ impl Ctx {
     }
 
     fn run(&mut self) -> i32 {
-        let result = match self.args.op.as_str() {
+        let routed = route::route(self);
+        let result = match routed {
+            Some(result) => result,
+            None => self.on_files(),
+        };
+        self.finish(result)
+    }
+
+    /// Run the operation on the files (§20.2).
+    fn on_files(&mut self) -> Result<i32, Error> {
+        match self.args.op.as_str() {
             "read" => read::read(self),
             "get" => read::get(self),
             "has" => read::has(self),
@@ -210,7 +221,11 @@ impl Ctx {
                 diag!("tsvz: unknown operation {other}");
                 Ok(2)
             }
-        };
+        }
+    }
+
+    /// Report an error once and flush what was printed: the exit status.
+    fn finish(&mut self, result: Result<i32, Error>) -> i32 {
         let code = match result {
             Ok(code) => code,
             Err(e) => {
