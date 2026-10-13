@@ -623,3 +623,21 @@ fn an_untrusted_pointer_is_ignored_with_a_warning() {
     let (_, _, quiet) = cli(d, &["-q", "get", "s.tsvz", "k"], b"");
     assert_eq!(quiet, "");
 }
+
+#[test]
+fn a_bulk_request_with_an_unknown_option_still_reads_its_records_as_records() {
+    // Its record lines must not run as requests (a tombstone `clear` would empty the store).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let _served = Served::start(&s, &[]);
+    let mut conn = connect(&s).unwrap();
+    let r = send(&mut conn, b"--x-future\tset\t-\nclear\nb\t2\n#\n");
+    assert_eq!(r.status, 2, "{r:?}");
+    assert_eq!(
+        send(&mut conn, b"keys\n").lines,
+        ["a"],
+        "the connection stays in step"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\n");
+}

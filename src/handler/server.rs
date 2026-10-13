@@ -299,18 +299,16 @@ fn answer(
     while let Ok(Some(line)) = read_line(&mut reader, LINE_LIMIT) {
         let request = protocol::parse(&line);
         let mut bulk = None;
-        if let Ok(r) = &request {
-            if r.bulk() {
-                let mut records = Vec::new();
-                loop {
-                    match read_line(&mut reader, LINE_LIMIT) {
-                        Ok(Some(l)) if l == "#" => break,
-                        Ok(Some(l)) => records.push(l),
-                        _ => return, // cut off before its end: nothing is written (§21.7.2)
-                    }
+        if protocol::needs_bulk(&line) {
+            let mut records = Vec::new();
+            loop {
+                match read_line(&mut reader, LINE_LIMIT) {
+                    Ok(Some(l)) if l == "#" => break,
+                    Ok(Some(l)) => records.push(l),
+                    _ => return, // cut off before its end: nothing is written (§21.7.2)
                 }
-                bulk = Some(records);
             }
+            bulk = Some(records);
         }
         let response = match &request {
             Ok(r) if r.op == "stop" => {

@@ -88,6 +88,17 @@ pub fn parse(line: &str) -> Result<Request, String> {
     })
 }
 
+/// Whether record lines up to a `#` line follow the request line `line` (§21.7.2), judged by its
+/// shape alone, as TSVZ.py's `_serveNeedsBulk` judges it: `set -`, `append -` or `delete -`
+/// after any options, known or not. A request refused for its options still has its records
+/// read, so that they are never taken for requests.
+pub fn needs_bulk(line: &str) -> bool {
+    let mut fields = line.split('\t').skip_while(|f| f.starts_with("--"));
+    matches!(fields.next(), Some("set" | "append" | "delete"))
+        && fields.next() == Some("-")
+        && fields.next().is_none()
+}
+
 /// A field of the protocol: §13 with TAB whatever the store's variant (§21.4.2); with `key`, a
 /// leading `#` is written `<#>`.
 pub fn field(value: &str, key: bool) -> String {
@@ -242,6 +253,21 @@ mod tests {
         assert!(parse("delete\t-").unwrap().bulk());
         assert!(!parse("get\t-").unwrap().bulk());
         assert!(parse("stop").is_ok() && parse("popitem\tfirst").is_ok());
+    }
+
+    #[test]
+    fn bulk_is_judged_by_the_shape_of_the_line() {
+        for line in [
+            "set\t-",
+            "--sync\tdelete\t-",
+            "--x-future\tappend\t-",
+            "--a\t--b\tset\t-",
+        ] {
+            assert!(needs_bulk(line), "{line:?}");
+        }
+        for line in ["set\tk", "set\t-\tv", "get\t-", "--sync", "", "set"] {
+            assert!(!needs_bulk(line), "{line:?}");
+        }
     }
 
     #[test]
