@@ -140,7 +140,8 @@ pub(crate) fn pop(ctx: &mut Ctx) -> Result<i32, Error> {
     let cells = row.to_vec();
     let strip = ctx.format.strict && store.markers().strip;
     print(ctx, &key, &cells)?;
-    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
+    let records = tombstones([key.as_str()], strip, ctx.format.delimiter);
+    writer(ctx, Some(store.markers().member_size))?.append(&records)?;
     Ok(0)
 }
 
@@ -159,7 +160,8 @@ pub(crate) fn popitem(ctx: &mut Ctx) -> Result<i32, Error> {
     let (key, cells) = (key.to_string(), row.to_vec());
     let strip = ctx.format.strict && store.markers().strip;
     print(ctx, &key, &cells)?;
-    writer(ctx, Some(store.markers().member_size))?.append(&tombstones([key.as_str()], strip))?;
+    let records = tombstones([key.as_str()], strip, ctx.format.delimiter);
+    writer(ctx, Some(store.markers().member_size))?.append(&records)?;
     Ok(0)
 }
 

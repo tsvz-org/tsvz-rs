@@ -410,6 +410,7 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             let tombstones = crate::write::tombstones(
                 s.iter().map(|(k, _)| k),
                 s.format().strict && s.markers().strip,
+                s.format().delimiter,
             );
             if tombstones.is_empty() {
                 return Ok(Outcome::Unchanged);

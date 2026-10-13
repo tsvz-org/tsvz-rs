@@ -57,16 +57,25 @@ pub fn classify_key(key: &str) -> KeyKind {
     }
 }
 
-/// Tombstones that delete exactly these stored keys. While the store's final stripping is on
-/// (`strip`), a reader strips a tombstone's key before deleting it (§9.1), so a key ending in a
-/// space or tab would delete another key: such tombstones are written with stripping off
-/// around them, then on again (the idea of §19.4's compensating layout).
-pub fn tombstones<'k>(keys: impl IntoIterator<Item = &'k str>, strip: bool) -> Vec<Record> {
+/// Tombstones that delete exactly these stored keys, for a store with this `delimiter`. While
+/// the store's final stripping is on (`strip`), a reader strips a tombstone's key before
+/// deleting it (§9.1), so a key whose encoding ends in a raw space or tab would delete another
+/// key: such tombstones are written with stripping off around them, then on again (§9.6). A
+/// trailing tab in a .tsvz key is written `<sep>`, which needs no guard.
+pub fn tombstones<'k>(
+    keys: impl IntoIterator<Item = &'k str>,
+    strip: bool,
+    delimiter: u8,
+) -> Vec<Record> {
     let mut records: Vec<Record> = keys
         .into_iter()
         .map(|k| Record::Tombstone { key: k.to_string() })
         .collect();
-    let exposed = |r: &Record| matches!(r, Record::Tombstone { key } if key.ends_with([' ', '\t']));
+    let exposed = |r: &Record| {
+        matches!(r, Record::Tombstone { key }
+            if key.ends_with([' ', '\t'])
+                && escape::encode(key, delimiter, true).ends_with([' ', '\t']))
+    };
     if strip && records.iter().any(exposed) {
         let set = |value: &str| Record::Marker {
             key: "#_strip_trailing_whites_#".into(),
@@ -370,13 +379,13 @@ mod tests {
     #[test]
     fn tombstones_guard_keys_that_stripping_would_change() {
         assert_eq!(
-            tombstones(["a", "b"], true),
+            tombstones(["a", "b"], true, b'\t'),
             vec![
                 Record::Tombstone { key: "a".into() },
                 Record::Tombstone { key: "b".into() }
             ]
         );
-        let guarded = tombstones(["a", "k "], true);
+        let guarded = tombstones(["a", "k "], true, b'\t');
         assert_eq!(guarded.len(), 4);
         assert_eq!(
             guarded[0],
@@ -393,9 +402,22 @@ mod tests {
             }
         );
         assert_eq!(
-            tombstones(["k "], false),
+            tombstones(["k "], false, b'\t'),
             vec![Record::Tombstone { key: "k ".into() }]
         );
+    }
+
+    #[test]
+    fn only_a_key_whose_encoding_ends_in_white_space_is_guarded() {
+        // §9.6: in .tsvz a trailing tab is written `<sep>`, which stripping leaves alone.
+        assert_eq!(
+            tombstones(["k\t"], true, b'\t'),
+            vec![Record::Tombstone { key: "k\t".into() }]
+        );
+        assert_eq!(tombstones(["k "], true, b'\t').len(), 3);
+        for d in [b',', b'|', 0] {
+            assert_eq!(tombstones(["k\t"], true, d).len(), 3, "{d}");
+        }
     }
 
     fn read(path: &Path) -> Vec<(String, Vec<String>)> {
