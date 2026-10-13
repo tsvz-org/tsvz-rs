@@ -17,6 +17,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | A damaged part before a rewrite | Copied to `<part>.damaged-<YYYYmmddTHHMMSS>` (`.1`, `.2`, … when taken) and synced | `_specBackupPart` |
 | The backup copy's permissions | Not as TSVZ.py (which uses the default mode): the part's read bits plus owner write (`mode & 0o644`, less the umask), so a private store's copy stays private and never carries setuid, setgid or execute bits | — |
 | A gzip member header | Parsed a byte at a time with no length cap, as zlib accepts it | `zlib.decompressobj(31)` |
+| xz and lzma decoder memory | At most 1 GiB; a member whose header demands more (a legacy `.lzma` header can declare a 4 GiB dictionary) is judged corrupt. TSVZ.py's `lzma` has no limit | `lzma.LZMADecompressor()` |
 | The table format | `pretty_format_table`: rows never shortened; `verify`/`parts` fitted to the terminal; control characters escaped | `_cliEmitRows`, `_cliEmitFields`, `_cliTableCells` |
 | Long options | A unique prefix is accepted (`--delim`), as argparse did | `_cliParseArgs` |
 | `setdefault` with a marker key | Usage error (2), as §21.7.3 asks of a handler | `_ServeStore` |

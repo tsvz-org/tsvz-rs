@@ -149,7 +149,10 @@ impl Decoder {
             #[cfg(feature = "bzip2")]
             Codec::Bzip2 => Decoder::Bzip2(bzip2::Decompress::new(false)),
             #[cfg(feature = "xz")]
-            Codec::Xz => match liblzma::stream::Stream::new_auto_decoder(u64::MAX, 0) {
+            // At most 1 GiB of decoder memory: far above any xz or lzma preset (64 MiB of
+            // dictionary at most), so only a member whose header demands more is refused, as
+            // damaged, instead of reserving up to 4 GiB for a few bytes.
+            Codec::Xz => match liblzma::stream::Stream::new_auto_decoder(1 << 30, 0) {
                 Ok(s) => Decoder::Xz(s),
                 Err(_) => Decoder::Unsupported,
             },
@@ -703,5 +706,23 @@ mod tests {
             assert!(data.starts_with(&out) && out.len() > data.len() / 2, "{codec:?}");
             assert!(started.elapsed().as_secs() < 3, "{codec:?}: took {:?}", started.elapsed());
         }
+    }
+
+    #[cfg(all(feature = "xz", target_os = "linux"))]
+    #[test]
+    fn an_xz_member_demanding_a_huge_dictionary_is_not_allocated() {
+        // A legacy .lzma header (the xz codec auto-detects it) declaring a 4 GiB dictionary: the
+        // decoder must refuse it rather than reserve 4 GiB for 20 bytes (found by cargo fuzz).
+        fn vm_peak_kib() -> u64 {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let line = status.lines().find(|l| l.starts_with("VmPeak:")).unwrap();
+            line.split_whitespace().nth(1).unwrap().parse().unwrap()
+        }
+        let data = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0xef];
+        let before = vm_peak_kib();
+        assert_eq!(member(Codec::Xz, &data), Member::Bad);
+        assert!(matches!(decode_alone(Codec::Xz, &data), Alone::Corrupt(_)));
+        let grown = vm_peak_kib() - before;
+        assert!(grown < 2 * 1024 * 1024, "decoding 18 bytes reserved {grown} KiB");
     }
 }
