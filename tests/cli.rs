@@ -430,3 +430,17 @@ fn many_small_compressed_members_read_in_bounded_memory() {
         part.len() / 1024
     );
 }
+
+#[test]
+fn clear_and_scrub_refuse_a_path_that_names_one_part() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("s.tsvz"), "a\t1\nb\t2\nc\t3\n").unwrap();
+    fs::write(dir.join("s.tsvz.1"), "a\nd\t4\n").unwrap();
+    for op in ["scrub", "clear"] {
+        let (code, _, err) = records(dir, &[op, "s.tsvz.1"]);
+        assert!(code == 1 && err.contains("one part"), "{op}: {code} {err}");
+        assert_eq!(file(dir, "s.tsvz.1"), "a\nd\t4\n", "{op}");
+        assert_eq!(file(dir, "s.tsvz"), "a\t1\nb\t2\nc\t3\n", "{op}");
+    }
+}

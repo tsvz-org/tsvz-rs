@@ -120,6 +120,22 @@ pub fn format_of(path: &Path) -> Option<Format> {
     None
 }
 
+/// Whether a path names one numbered part of a store, `<store>.<ext>.<ordinal>[.rotated][.<codec>]`
+/// (§17.2), rather than a store (§20.1.3).
+pub fn names_a_part(path: &Path) -> bool {
+    let Some(name) = path.to_str() else {
+        return false;
+    };
+    let mut base = split_codec(name).0;
+    let rotated = base.strip_suffix(".rotated");
+    if let Some(stripped) = rotated {
+        base = stripped;
+    }
+    let (root, ext) = split_ext(base);
+    let numbered = ext.is_some_and(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_hexdigit()));
+    numbered && split_ext(root).1.and_then(variant).is_some()
+}
+
 /// A numbered part's name after `<store>.<ext>.`: `<ordinal>[.rotated][.<codec>]` (Appendix A).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Numbered {
@@ -244,6 +260,27 @@ mod tests {
         );
         assert_eq!(f("s.txt"), None);
         assert_eq!(f("tsvz"), None);
+    }
+
+    #[test]
+    fn paths_that_name_one_part() {
+        for p in [
+            "s.tsvz.1",
+            "dir/s.csvz.0190c3a1.gz",
+            "s.tsvz.B.rotated",
+            "s.tsv.2.xz",
+        ] {
+            assert!(names_a_part(Path::new(p)), "{p}");
+        }
+        for p in [
+            "s.tsvz",
+            "s.tsvz.gz",
+            "s.tsvz.damaged-20261012T101010",
+            "x.1",
+            "s.tsvz.1x",
+        ] {
+            assert!(!names_a_part(Path::new(p)), "{p}");
+        }
     }
 
     #[test]

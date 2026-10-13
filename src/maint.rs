@@ -268,6 +268,18 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     Ok(target)
 }
 
+/// A path naming one numbered part is not a store: rewriting that part alone would drop the
+/// tombstones and markers the rest of the store needs (TSVZ.py refuses it too).
+fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
+    if crate::name::names_a_part(path) {
+        return Err(Error::Refused(format!(
+            "{}: {op} skipped: the path names one part of a multi-part store; {op} the store path instead; nothing was written",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
@@ -278,6 +290,7 @@ fn whole(options: &Options) -> Options {
 
 /// Compact a one-part store in place with §19.4 fidelity (§19.8, §20.2 `scrub`).
 pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
+    refuse_a_part("scrub", store)?;
     let mut backed_up: Option<(Stamp, PathBuf)> = None;
     for _ in 0..ATTEMPTS {
         let list = parts::list(store)?;
@@ -337,6 +350,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
 /// markers (§19.8); append a tombstone for every live key of a multi-part store (§18.8); create a
 /// missing store (§20.2.2).
 pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
+    refuse_a_part("clear", store)?;
     for _ in 0..ATTEMPTS {
         let list = parts::list(store)?;
         if list.is_empty() {

@@ -14,6 +14,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | `scrub` rows | Fully resolved, padded with empty cells to the final defaults' width; the §19.4 compensating layout only when a row would not read back the same | `_specScrubCells`, `_specRoundTrips` |
 | `scrub` and checksum markers | Not kept: a snapshot has no segments to verify | `_specScrub` |
 | `clear` of one part | Header comment and markers, without `#_version_#` | `_specClearTabularFile` |
+| A path that names one part (`s.tsvz.1`, §20.1.3) | `clear` and `scrub` refuse it, exit 1, nothing written; other operations treat it as a store of its own | `_specClearTabularFile`, `_specScrub` |
 | A damaged part before a rewrite | Copied to `<part>.damaged-<YYYYmmddTHHMMSS>` (`.1`, `.2`, … when taken) and synced | `_specBackupPart` |
 | The backup copy's permissions | Not as TSVZ.py (which uses the default mode): the part's read bits plus owner write (`mode & 0o644`, less the umask), so a private store's copy stays private and never carries setuid, setgid or execute bits | — |
 | A gzip member header | Parsed a byte at a time with no length cap, as zlib accepts it | `zlib.decompressobj(31)` |
