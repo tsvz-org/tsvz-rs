@@ -139,7 +139,7 @@ impl Store {
     pub fn len(&self) -> usize;
     pub fn stopped(&self) -> Option<&Damage>;             // a stop policy ended the read (§4.10)
     pub fn mismatches(&self) -> &[Mismatch];              // with Options::verify
-    pub fn markers(&self) -> &MarkerState;                // final marker state
+    pub fn markers(&self) -> &Markers;                    // final marker state
     pub fn parts(&self) -> &[PartInfo];
     pub fn refresh(&mut self) -> Result<Refreshed, Error>; // section 3.7
 }
@@ -164,22 +164,22 @@ pub mod maint {
     pub fn scrub(path: &Path, options: &Options) -> Result<Outcome, Error>;
 }
 
-// Streaming, for programs that want lines rather than a store
-pub mod replay { pub struct Lines { /* yields classified lines with part, line number, offset */ } }
+// Streaming, for programs that want lines rather than a store: frame::Framer turns bytes into
+// committed lines, replay::Replay applies them to any replay::Sink.
 ```
 
 The supporting types:
 
 | Type | Holds |
 |---|---|
-| `Error` | A missing store, an I/O failure (with the path), an unsupported codec, a refused operation (with the reason), or a store that kept changing during maintenance |
+| `Error` | A missing store, an I/O failure (with the path), an unsupported codec, a path with no variant extension, or a refused operation with the reason (a multi-part `scrub`, a store that kept changing during maintenance, a loose field that cannot be written) |
 | `Warning` | The part path, the byte offset when there is one, and a message saying what was found and what was done |
 | `Damage` | Where a `stop` policy ended the read: part path, byte offset, and whether it was zero fill or a corrupt member |
 | `Mismatch` | One failed segment: part path, line number in that part, algorithm, expected and computed digest |
-| `MarkerState` | The final value of every marker of §12.4 except the checksum markers |
+| `Markers` | The final value of every marker of §12.4 except the checksum markers |
 | `PartInfo` | Index, ordinal as written (none for the unnumbered part), path, codec, whether it is the active part |
 | `Refreshed` | `Unchanged`, `Followed` (appends replayed) or `Reloaded` |
-| `Outcome` | `Written`, `Unchanged` (identical bytes, nothing written), or `Refused` with the reason |
+| `Outcome` | `Written`, `Unchanged` (identical bytes, nothing written), or `Partial` (the read stopped at damage; the part was rewritten from what was read and its original kept). A refusal is `Error::Refused`, with nothing written |
 | `KeyKind` | `Marker` or `Data` |
 
 A `stop` policy is not an `Error`: the store keeps what it read and reports it
@@ -402,16 +402,22 @@ reserved for the handler's pointer file (sub-project 2).
 What `scrub` writes (§19.2.3, §19.4):
 
 - the header comment, when the first committed line of the part is a comment;
-- `#_version_#`, then every other marker whose final value is not its built-in
-  default (the advisory `#_rotate_#`, `#_write_ack_#` and `#_member_size_#`
-  included, as TSVZ.py writes them), then `#_defaults_#` last;
-- one row per live key in first-appearance order, sparse (only the written
-  cells) when re-reading them under the final marker state gives the same rows:
-  every live row's binding has the final defaults and fill-empty setting, and,
-  while the final stripping is on, no live key or cell ends in space or tab;
-- otherwise the compensating layout of §19.4: `#_strip_trailing_whites_#` false
-  and `#_fill_empty_with_default_#` false before the rows, every row fully
-  resolved, and the final markers again after the rows.
+- `#_version_#` with the value `1`; then, in this order and only when not the
+  built-in default: `#_strip_trailing_whites_#` false, `#_fill_empty_with_default_#`
+  true, `#_return_defaults_when_missing_#` false, `#_rotate_#`, `#_write_ack_#`,
+  `#_member_size_#`, `#_on_corruption_#`; then `#_defaults_#` last, when any
+  default is non-empty (TSVZ.py's order);
+- one row per live key in first-appearance order, every row **fully
+  resolved** (its defaults baked in) and padded with empty cells to the width
+  of the final defaults, so no final default fills a column the row was never
+  bound to;
+- when some row would not read back the same under the final marker state (a
+  key or cell ending in space or tab while stripping is on, or an empty cell
+  whose final default is non-empty while fill-empty is on), the compensating
+  layout of §19.4 instead: `#_strip_trailing_whites_#` false and
+  `#_fill_empty_with_default_#` false in place of their usual lines before the
+  rows, and after the rows `#_strip_trailing_whites_#` true and
+  `#_fill_empty_with_default_#` true again where the final state has them.
 
 When the read met a `stop` policy or a corrupt member, the part's original
 bytes are first copied to `<part>.damaged-<timestamp>` (`.1`, `.2`, ... when the
@@ -419,7 +425,10 @@ name is taken) and synced, as TSVZ.py does; after a `stop`, `scrub` still
 exits 1 (§4.10).
 
 `clear` of a one-part store rewrites it keeping only the header comment and
-the marker lines `scrub` would write. `clear` of a multi-part store appends a
+the marker lines `scrub` would write without the `#_version_#` line, as
+TSVZ.py does. A read that stopped at damaged data refuses `clear` (§4.10: no
+changes are based on such a read). The backup copy above is made whenever the
+read met zero fill, or a member that was cut short or corrupt. `clear` of a multi-part store appends a
 tombstone for every live key to the active part (§18.8). `scrub` of a
 multi-part store is refused with exit 1 and nothing written (§20.2), until
 sub-project 3.
