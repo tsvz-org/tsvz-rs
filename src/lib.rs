@@ -15,7 +15,7 @@ pub mod store;
 pub mod write;
 
 pub use error::{Error, WarnFn, Warning};
-pub use store::{Options, PartInfo, Row, Scope, Store};
+pub use store::{Options, PartInfo, Refreshed, Row, Scope, Store};
 
 #[cfg(feature = "cli")]
 pub mod cli;

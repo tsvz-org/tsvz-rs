@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -186,7 +186,6 @@ pub(crate) const RACY_NS: i128 = 2_000_000_000;
 
 /// What `refresh` (Task 16) needs to follow the files.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // the directory fields are read by `refresh` (Task 16), which removes this line
 pub(crate) struct Follow {
     pub dir_mtime: i128,
     pub dir_racy: bool,
@@ -197,6 +196,17 @@ pub(crate) struct Follow {
     pub tail: Vec<u8>,
     /// Up to CHECK_BYTES bytes just before `offset`.
     pub check: Vec<u8>,
+}
+
+/// What `Store::refresh` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refreshed {
+    /// Nothing changed.
+    Unchanged,
+    /// Records appended to the last part were replayed.
+    Followed,
+    /// Something else changed: the store was read again.
+    Reloaded,
 }
 
 pub(crate) fn dir_mtime(store: &Path) -> i128 {
@@ -410,6 +420,87 @@ impl Store {
     pub fn parts(&self) -> &[PartInfo] {
         &self.parts
     }
+
+    /// Catch up with the files (design section 3.7, TSVZ.py's `sync`): replay what was appended
+    /// to the last part since the last read; read the whole store again when anything else
+    /// changed — the part list, an earlier part, a compressed last part, a stopped read, or an
+    /// in-place rewrite (the bytes before the old read offset no longer match).
+    pub fn refresh(&mut self) -> Result<Refreshed, Error> {
+        let dir = dir_mtime(&self.path);
+        if dir != self.follow.dir_mtime || self.follow.dir_racy {
+            let now = parts::list(&self.path)?;
+            if now.iter().map(|p| &p.path).ne(self.parts.iter().map(|p| &p.path)) {
+                return self.reload();
+            }
+            self.follow.dir_mtime = dir;
+            self.follow.dir_racy = racy(dir);
+        }
+        let mut followed = false;
+        for i in 0..self.parts.len() {
+            let stamp = match std::fs::metadata(&self.parts[i].path) {
+                Ok(meta) => Stamp::of(&meta),
+                Err(_) => return self.reload(),
+            };
+            if self.follow.stamps.get(i).copied().flatten() == Some(stamp) {
+                continue;
+            }
+            if i + 1 != self.parts.len() || !self.follow_append(stamp)? {
+                return self.reload();
+            }
+            followed = true;
+        }
+        Ok(if followed { Refreshed::Followed } else { Refreshed::Unchanged })
+    }
+
+    fn reload(&mut self) -> Result<Refreshed, Error> {
+        *self = Store::open(&self.path, self.options.clone())?;
+        Ok(Refreshed::Reloaded)
+    }
+
+    /// Replay what was appended to the last part; false when it changed some other way.
+    fn follow_append(&mut self, stamp: Stamp) -> Result<bool, Error> {
+        let last = self.parts.len() - 1;
+        let path = self.parts[last].path.clone();
+        let Some(old) = self.follow.stamps[last] else { return Ok(false) };
+        let offset = self.follow.offset;
+        let want = offset.min(CHECK_BYTES) as usize;
+        if self.replay.stopped.is_some()
+            || self.parts[last].codec.is_some()
+            || stamp.ino != old.ino
+            || stamp.size < offset
+            || stamp.size <= old.size
+            || self.follow.check.len() != want
+        {
+            return Ok(false); // an append only ever grows the same file
+        }
+        let io = |e: std::io::Error| Error::io(&path, e);
+        let file = File::open(&path).map_err(io)?;
+        let mut check = vec![0u8; want];
+        if file.read_exact_at(&mut check, offset - want as u64).is_err() || check != self.follow.check {
+            return Ok(false); // rewritten in place (§19.8)
+        }
+        let mut data = Vec::new();
+        (&file).seek(SeekFrom::Start(offset)).map_err(io)?;
+        (&file).read_to_end(&mut data).map_err(io)?;
+        let mut framer = Framer::resume(offset, self.follow.line);
+        let (replay, table) = (&mut self.replay, &mut self.table);
+        replay.begin_part(&path, last == 0 && offset == 0);
+        framer.push(&data, &mut |l| replay.line(l, table));
+        let committed = (framer.committed() - offset) as usize;
+        if self.replay.stopped.is_none() && !framer.tail().is_empty() && framer.tail() != self.follow.tail.as_slice() {
+            self.replay.tail(framer.tail().len());
+        }
+        let mut check = std::mem::take(&mut self.follow.check);
+        check.extend_from_slice(&data[..committed.min(data.len())]);
+        let cut = check.len().saturating_sub(CHECK_BYTES as usize);
+        check.drain(..cut);
+        self.follow.check = check;
+        self.follow.offset = framer.committed();
+        self.follow.line = framer.number();
+        self.follow.tail = framer.tail().to_vec();
+        self.follow.stamps[last] = Some(Stamp { size: offset + data.len() as u64, ..stamp });
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +641,80 @@ mod tests {
         let strict = write(dir.path(), "s.tsvz", b"a;x\tb\n");
         let s = Store::open(&strict, Options { delimiter: Some(b';'), ..Options::default() }).unwrap();
         assert_eq!(rows(&s), vec![v(&["a;x", "b"])]);
+    }
+
+    fn append(p: &Path, data: &[u8]) {
+        use std::io::Write;
+        fs::OpenOptions::new().append(true).open(p).unwrap().write_all(data).unwrap();
+    }
+
+    fn keys(s: &Store) -> Vec<String> {
+        s.iter().map(|(k, _)| k.to_string()).collect()
+    }
+
+    #[test]
+    fn refresh_follows_appends_and_notices_nothing_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Unchanged);
+        append(&p, b"b\t2\nc\t");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(keys(&s), vec!["a", "b"]);
+        append(&p, b"3\na\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(keys(&s), vec!["b", "c"]);
+        assert_eq!(s.get("c").unwrap().to_vec(), vec!["3".to_string()]);
+    }
+
+    #[test]
+    fn an_in_place_rewrite_then_appends_past_the_old_size_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\nb\t2\n");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        crate::maint::clear(&p, &Options::default()).unwrap();
+        append(&p, b"x\t9\ny\t8\nz\t7\n");
+        assert!(fs::metadata(&p).unwrap().len() > 8);
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn new_and_removed_parts_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["a", "b"]);
+        fs::remove_file(dir.path().join("s.tsvz.1")).unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["a"]);
+    }
+
+    #[test]
+    fn compressed_and_stopped_stores_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("s.tsvz.gz");
+        fs::write(&gz, crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\n").unwrap()).unwrap();
+        let mut s = Store::open(&gz, Options::default()).unwrap();
+        append(&gz, &crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t2\n").unwrap());
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), vec!["a", "b"]);
+        let p = write(dir.path(), "t.tsvz", b"#_on_corruption_#\tstop\na\t1\n\0\0\n");
+        let mut t = Store::open(&p, Options::default()).unwrap();
+        append(&p, b"b\t2\n");
+        assert_eq!(t.refresh().unwrap(), Refreshed::Reloaded);
+        assert!(t.stopped().is_some());
+    }
+
+    #[test]
+    fn a_header_written_after_opening_an_empty_store_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        append(&p, b"#hdr\nk\tv\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(s.header(), Some("#hdr"));
     }
 }
