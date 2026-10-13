@@ -194,46 +194,8 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             }
         }
     }
-    validate(&a)?;
+    crate::ops::check_args(&a.op, &a.args)?;
     Ok(Parsed::Run(a))
-}
-
-fn validate(a: &Args) -> Result<(), String> {
-    let op = a.op.as_str();
-    let n = a.args.len();
-    if matches!(
-        op,
-        "read" | "clear" | "scrub" | "verify" | "parts" | "len" | "keys" | "serve" | "stop"
-    ) && n > 0
-    {
-        return Err(format!("{op} takes no arguments after STORE"));
-    }
-    if op == "popitem" && !(n == 0 || (n == 1 && matches!(a.args[0].as_str(), "first" | "last"))) {
-        return Err("popitem takes first or last".into());
-    }
-    if matches!(op, "has" | "pop") && n > 1 {
-        return Err(format!("{op} takes one KEY"));
-    }
-    if op == "setdefault" && n == 1 {
-        return Err("setdefault needs a KEY and a VALUE".into());
-    }
-    if matches!(
-        op,
-        "get" | "set" | "append" | "delete" | "has" | "pop" | "setdefault"
-    ) {
-        if n == 0 {
-            return Err(format!("{op} needs a KEY"));
-        }
-        let keys = if matches!(op, "get" | "delete") {
-            &a.args[..]
-        } else {
-            &a.args[..1]
-        };
-        if keys.iter().any(String::is_empty) {
-            return Err(format!("{op}: a KEY must not be empty"));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

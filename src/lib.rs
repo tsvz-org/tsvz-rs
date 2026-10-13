@@ -25,6 +25,8 @@ pub mod maint;
 #[doc(hidden)]
 pub mod name;
 #[doc(hidden)]
+pub mod ops;
+#[doc(hidden)]
 pub mod parts;
 #[doc(hidden)]
 pub mod replay;
