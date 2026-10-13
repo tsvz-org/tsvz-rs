@@ -2,6 +2,8 @@
 //! producers and command lines share one loaded store and one appender.
 
 #[doc(hidden)]
+pub mod engine;
+#[doc(hidden)]
 pub mod protocol;
 
 pub use protocol::Response;
