@@ -39,6 +39,9 @@ Python on the same file system measures 720 µs at p50, 788 µs at p95).
 
 The handler loads a 100k-row store in 36-41 ms against 175-179 ms, holding 37 MiB against 92 MiB.
 
+The last minute of run 2 (its maint family, 01:27-01:28) overlapped a whole-file-system `find`
+run by another process; run 1 was undisturbed, and the two runs agree on every conclusion.
+
 ## Run 1
 
 ```
