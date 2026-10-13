@@ -163,6 +163,8 @@ pub struct Replay {
     pub stopped: Option<Damage>,
     /// The read met zero fill, or a member that was cut short or corrupt.
     pub damaged: bool,
+    /// The read met a checksum marker of a known algorithm (§15), verified or not.
+    pub checksums: bool,
     /// The first committed line of the first part, when it is a comment (§19.2.3c).
     pub header: Option<String>,
     /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
@@ -215,6 +217,7 @@ impl Replay {
             mismatches: Vec::new(),
             stopped: None,
             damaged: false,
+            checksums: false,
             header: None,
             width: None,
             first_line: false,
@@ -326,6 +329,7 @@ impl Replay {
                     .and_then(|n| n.strip_suffix("_#"))
                 {
                     let algo = Algo::from_name(name);
+                    self.checksums |= algo.is_some();
                     self.feed(line.raw, algo);
                     if let (Some(algo), true) = (algo, self.verify) {
                         self.checksum(algo, rest, line.number);

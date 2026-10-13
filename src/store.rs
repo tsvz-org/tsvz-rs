@@ -297,13 +297,29 @@ pub struct Store {
     replay: Replay,
     parts: Vec<PartInfo>,
     unreadable: Vec<PathBuf>,
+    /// Read only the first this many parts (a prefix to snapshot, §19.2).
+    limit: Option<usize>,
     pub(crate) follow: Follow,
 }
 
 impl Store {
     /// Read the store at `path` (the unnumbered file's path, §20.1.3).
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Store, Error> {
-        let path = path.as_ref().to_path_buf();
+        Store::open_limited(path.as_ref(), options, None)
+    }
+
+    /// Read only the first `count` parts of the store at `path`: the immutable prefix a
+    /// snapshot subsumes (§19.2). Its last part is reported as the active one.
+    pub(crate) fn open_prefix(
+        path: impl AsRef<Path>,
+        options: Options,
+        count: usize,
+    ) -> Result<Store, Error> {
+        Store::open_limited(path.as_ref(), options, Some(count))
+    }
+
+    fn open_limited(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
+        let path = path.to_path_buf();
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
             format.delimiter = d;
@@ -316,6 +332,7 @@ impl Store {
             options,
             parts: Vec::new(),
             unreadable: Vec::new(),
+            limit,
             follow: Follow::default(),
         };
         store.load()?;
@@ -323,7 +340,10 @@ impl Store {
     }
 
     fn load(&mut self) -> Result<(), Error> {
-        let list = parts::list(&self.path)?;
+        let mut list = parts::list(&self.path)?;
+        if let Some(n) = self.limit {
+            list.truncate(n);
+        }
         if list.is_empty() {
             return Err(Error::Missing(self.path.clone()));
         }
@@ -549,6 +569,11 @@ impl Store {
         self.replay.stopped.as_ref()
     }
 
+    /// Whether the read met a checksum marker of a known algorithm (§15).
+    pub(crate) fn has_checksums(&self) -> bool {
+        self.replay.checksums
+    }
+
     /// The parts skipped because they could not be read (with [`Options::skip_unreadable`]).
     pub fn unreadable(&self) -> &[PathBuf] {
         &self.unreadable
@@ -583,7 +608,10 @@ impl Store {
     pub fn refresh(&mut self) -> Result<Refreshed, Error> {
         let dir = dir_mtime(&self.path);
         if dir != self.follow.dir_mtime || self.follow.dir_racy {
-            let now = parts::list(&self.path)?;
+            let mut now = parts::list(&self.path)?;
+            if let Some(n) = self.limit {
+                now.truncate(n);
+            }
             if now
                 .iter()
                 .map(|p| &p.path)
@@ -615,8 +643,8 @@ impl Store {
         })
     }
 
-    fn reload(&mut self) -> Result<Refreshed, Error> {
-        *self = Store::open(&self.path, self.options.clone())?;
+    pub(crate) fn reload(&mut self) -> Result<Refreshed, Error> {
+        *self = Store::open_limited(&self.path, self.options.clone(), self.limit)?;
         Ok(Refreshed::Reloaded)
     }
 
@@ -1176,5 +1204,33 @@ mod tests {
         assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
         assert_eq!(keys(&s), vec!["a", "b"]);
         assert!(!s.incomplete());
+    }
+
+    #[test]
+    fn a_prefix_of_the_parts_reads_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"#_defaults_#\td\na\t1\n");
+        write(dir.path(), "s.tsvz.1", b"b\t2\n#_checksum_crc32_#\n");
+        write(dir.path(), "s.tsvz.2", b"a\n");
+        let mut two = Store::open_prefix(&p, Options::default(), 2).unwrap();
+        assert_eq!(keys(&two), vec!["a", "b"]);
+        assert_eq!(two.parts().len(), 2);
+        assert!(
+            two.parts()[1].active,
+            "the last part read is the prefix's last"
+        );
+        assert!(two.has_checksums());
+        two.reload().unwrap();
+        assert_eq!(keys(&two), vec!["a", "b"], "a reload keeps the limit");
+        assert_ne!(
+            two.refresh().unwrap(),
+            Refreshed::Reloaded,
+            "the parts after it are not its"
+        );
+        let one = Store::open_prefix(&p, Options::default(), 1).unwrap();
+        assert_eq!(keys(&one), vec!["a"]);
+        assert!(!one.has_checksums());
+        let all = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(keys(&all), vec!["b"]);
     }
 }
