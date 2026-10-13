@@ -79,12 +79,17 @@ const FIELDS: [(u8, Stage); 4] = [
 ];
 
 /// An RFC 1952 header parsed a byte at a time, with constant work per byte, so a long or
-/// unterminated name or comment costs linear time however the bytes arrive.
-#[derive(Debug, Default)]
+/// unterminated name or comment costs linear time however the bytes arrive. As zlib does, it
+/// rejects reserved flag bits and checks the header CRC when FHCRC is set.
+#[derive(Default)]
 struct GzipHeader {
     seen: usize,
     flags: u8,
     stage: Stage,
+    /// CRC-32 of the header bytes before the FHCRC field.
+    crc: crc32fast::Hasher,
+    /// The FHCRC field's first byte.
+    crc_low: u8,
 }
 
 impl GzipHeader {
@@ -100,6 +105,9 @@ impl GzipHeader {
     /// deflate member.
     fn push(&mut self, b: u8) -> Result<bool, ()> {
         self.seen += 1;
+        if !matches!(self.stage, Stage::Crc(_) | Stage::Done) {
+            self.crc.update(&[b]);
+        }
         self.stage = match self.stage {
             Stage::Fixed => {
                 let i = self.seen - 1;
@@ -107,6 +115,9 @@ impl GzipHeader {
                     return Err(());
                 }
                 if i == 3 {
+                    if b & 0xe0 != 0 {
+                        return Err(()); // reserved flag bits: not a member a gzip writer made
+                    }
                     self.flags = b;
                 }
                 if self.seen == 10 {
@@ -124,8 +135,18 @@ impl GzipHeader {
             Stage::Extra(n) => Stage::Extra(n - 1),
             Stage::Name if b == 0 => self.from(2),
             Stage::Comment if b == 0 => self.from(3),
-            Stage::Crc(1) => Stage::Done,
-            Stage::Crc(n) => Stage::Crc(n - 1),
+            Stage::Crc(2) => {
+                self.crc_low = b;
+                Stage::Crc(1)
+            }
+            Stage::Crc(_) => {
+                if u16::from_le_bytes([self.crc_low, b])
+                    != (self.crc.clone().finalize() & 0xffff) as u16
+                {
+                    return Err(()); // the header CRC does not match
+                }
+                Stage::Done
+            }
             stage => stage,
         };
         Ok(self.stage == Stage::Done)
@@ -936,5 +957,29 @@ mod tests {
             grown < 2 * 1024 * 1024,
             "decoding 18 bytes reserved {grown} KiB"
         );
+    }
+
+    #[test]
+    fn a_gzip_header_with_reserved_flags_is_corrupt() {
+        // A damaged flag byte (found by the differential harness): zlib rejects reserved flags.
+        let mut m = fixture(Codec::Gzip, b"hello\n");
+        m[3] = 0xff;
+        assert_eq!(member(Codec::Gzip, &m), Member::Bad);
+        assert!(matches!(decode_alone(Codec::Gzip, &m), Alone::Corrupt(_)));
+        assert_eq!(gzip_header_len(&m), None);
+    }
+
+    #[test]
+    fn a_gzip_header_crc_is_checked() {
+        let body = &fixture(Codec::Gzip, b"hello\n")[10..];
+        let header = b"\x1f\x8b\x08\x02\0\0\0\0\0\xff";
+        let crc16 = (crc32fast::hash(header) & 0xffff) as u16;
+        let good = [&header[..], &crc16.to_le_bytes(), body].concat();
+        assert!(matches!(
+            member(Codec::Gzip, &good),
+            Member::Complete { .. }
+        ));
+        let bad = [&header[..], &(crc16 ^ 1).to_le_bytes(), body].concat();
+        assert_eq!(member(Codec::Gzip, &bad), Member::Bad);
     }
 }
