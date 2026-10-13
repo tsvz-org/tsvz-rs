@@ -351,3 +351,103 @@ fn a_stale_pointer_is_taken_over() {
     let _served = Served::start(&s, &[]);
     assert_eq!(ask(&s, "len").lines, ["1"]);
 }
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn the_rust_client_speaks_to_a_handler() {
+    use tsvz::handler::Client;
+    use tsvz::{Error, Record};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n#_defaults_#\td\n");
+    let mut served = Served::start(&s, &[]);
+    let mut c = Client::connect(&s).unwrap().sync(true);
+    let data = |k: &str, v: &str| Record::Data {
+        key: k.into(),
+        values: vec![v.into()],
+    };
+    c.set(&[data("#k", "x\ty")]).unwrap();
+    assert_eq!(c.get("#k").unwrap(), Some(strings(&["#k", "x\ty"])));
+    assert_eq!(
+        c.get("zz").unwrap(),
+        None,
+        "a missing key, even with defaults"
+    );
+    assert!(c.has("a").unwrap() && !c.has("zz").unwrap());
+    assert_eq!(c.len().unwrap(), 2);
+    assert_eq!(c.keys().unwrap(), strings(&["a", "#k"]));
+    c.set(&[data("b", "2"), data("c", "3")]).unwrap();
+    assert_eq!(c.pop("b").unwrap(), Some(strings(&["b", "2"])));
+    assert_eq!(c.pop("b").unwrap(), None);
+    assert_eq!(c.popitem(true).unwrap(), Some(strings(&["c", "3"])), "last");
+    assert_eq!(
+        c.popitem(false).unwrap(),
+        Some(strings(&["a", "1"])),
+        "first"
+    );
+    assert_eq!(c.setdefault("n", &["v"]).unwrap(), strings(&["n", "v"]));
+    c.delete(&["n"]).unwrap();
+    assert_eq!(c.read().unwrap(), [strings(&["#k", "x\ty"])]);
+    assert!(c.verify().unwrap().is_empty());
+    c.scrub().unwrap();
+    assert_eq!(
+        c.request(&["get"], None).unwrap().status,
+        2,
+        "raw requests keep their status"
+    );
+    match c.setdefault("k", &[]) {
+        Err(Error::Handler { status: 2, .. }) => {}
+        other => panic!("setdefault without a value: {other:?}"),
+    }
+    c.clear().unwrap();
+    assert_eq!(c.len().unwrap(), 0);
+    c.stop().unwrap();
+    assert_eq!(served.wait(), 0);
+    assert!(matches!(Client::connect(&s), Err(Error::NoHandler(_))));
+}
+
+#[test]
+fn many_clients_at_once_all_get_their_answers() {
+    use tsvz::handler::Client;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "");
+    let _served = Served::start(&s, &[]);
+    let threads: Vec<_> = (0..32)
+        .map(|t| {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let mut c = Client::connect(&s).unwrap();
+                for i in 0..50 {
+                    let key = format!("k{t}-{i}");
+                    c.set(&[tsvz::Record::Data {
+                        key: key.clone(),
+                        values: vec![i.to_string()],
+                    }])
+                    .unwrap();
+                    assert_eq!(c.get(&key).unwrap(), Some(vec![key, i.to_string()]));
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(Client::connect(&s).unwrap().len().unwrap(), 32 * 50);
+}
+
+#[test]
+fn a_client_whose_handler_dies_reports_the_request_as_lost() {
+    use tsvz::handler::Client;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let mut served = Served::start(&s, &[]);
+    let mut c = Client::connect(&s).unwrap();
+    assert_eq!(c.len().unwrap(), 1);
+    served.child.kill().unwrap();
+    served.child.wait().unwrap();
+    let err = c.len().unwrap_err();
+    assert!(matches!(err, tsvz::Error::HandlerLost(_)), "{err:?}");
+    assert!(err.to_string().contains("may or may not"), "{err}");
+}

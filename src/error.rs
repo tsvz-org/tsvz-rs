@@ -18,6 +18,14 @@ pub enum Error {
     BadPath(PathBuf),
     /// The operation was refused; nothing was written. The text says why.
     Refused(String),
+    /// No handler can be used for the store: none runs, or its pointer file or socket cannot be
+    /// trusted (§21.2.4). The text says why.
+    NoHandler(String),
+    /// The handler answered a request with status 1 (failed) or 2 (usage error) (§20.6, §21.6).
+    Handler { status: i32, message: String },
+    /// The connection to the handler broke during a request, which may or may not have been
+    /// applied.
+    HandlerLost(String),
 }
 
 impl Error {
@@ -48,6 +56,14 @@ impl fmt::Display for Error {
                 path.display()
             ),
             Error::Refused(why) => f.write_str(why),
+            Error::NoHandler(why) => write!(f, "no handler: {why}"),
+            Error::Handler { status, message } => {
+                write!(f, "the handler answered status {status}: {message}")
+            }
+            Error::HandlerLost(why) => write!(
+                f,
+                "lost the handler ({why}); the request may or may not have been applied"
+            ),
         }
     }
 }
