@@ -348,6 +348,68 @@ pub fn items(codec: Codec, data: &[u8]) -> Vec<Item> {
     items
 }
 
+/// One member holding `data`, or None when this build does not include the codec.
+/// gzip members have a fixed header (no name, mtime 0, OS 255); zstd frames carry the content
+/// checksum (§16.8).
+pub fn encode_member(codec: Codec, data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    match codec {
+        Codec::Gzip => {
+            let mut out = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff".to_vec();
+            let mut e = flate2::write::DeflateEncoder::new(out.split_off(10), flate2::Compression::default());
+            e.write_all(data).ok()?;
+            out.extend(e.finish().ok()?);
+            out.extend(crc32fast::hash(data).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            Some(out)
+        }
+        #[cfg(feature = "bzip2")]
+        Codec::Bzip2 => {
+            let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            e.write_all(data).ok()?;
+            e.finish().ok()
+        }
+        #[cfg(feature = "xz")]
+        Codec::Xz => {
+            let mut e = liblzma::write::XzEncoder::new(Vec::new(), 6);
+            e.write_all(data).ok()?;
+            e.finish().ok()
+        }
+        #[cfg(feature = "zstd")]
+        Codec::Zstd => {
+            let mut c = zstd::bulk::Compressor::new(3).ok()?;
+            c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true)).ok()?;
+            c.compress(data).ok()
+        }
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// `payload` (whole records ending in `\n`) as members of at most `member_size` uncompressed
+/// bytes each, ending at record boundaries; a single longer record is a member of its own
+/// (§16.7). None when this build does not include the codec.
+pub fn encode_members(codec: Codec, payload: &[u8], member_size: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < payload.len() {
+        let mut end = start;
+        loop {
+            let next = memchr::memchr(b'\n', &payload[end..]).map_or(payload.len(), |i| end + i + 1);
+            if end > start && next - start > member_size {
+                break;
+            }
+            end = next;
+            if end >= payload.len() {
+                break;
+            }
+        }
+        out.extend(encode_member(codec, &payload[start..end])?);
+        start = end;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +568,54 @@ mod tests {
         let mut region = full[..cut].to_vec();
         region.extend([0u8; 10]);
         assert_eq!(gzip_keep(&region), cut + 5);
+    }
+
+    #[test]
+    fn encoded_members_decode_back() {
+        for codec in codecs() {
+            let data = b"a\tx\nb\ty\n";
+            let m = encode_member(codec, data).unwrap();
+            assert_eq!(member(codec, &m), Member::Complete { out: data.to_vec(), end: m.len() }, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn gzip_members_have_a_fixed_header() {
+        let m = encode_member(Codec::Gzip, b"x\n").unwrap();
+        assert_eq!(&m[..10], b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff");
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_frames_carry_a_checksum() {
+        let m = encode_member(Codec::Zstd, b"x\n").unwrap();
+        assert_ne!(m[4] & 0x04, 0, "frame header descriptor has the content checksum flag");
+    }
+
+    #[test]
+    fn members_split_at_record_boundaries() {
+        let payload: Vec<u8> = (0..100).flat_map(|i| format!("k{i:03}\t{}\n", "v".repeat(20)).into_bytes()).collect();
+        for codec in codecs() {
+            let all = encode_members(codec, &payload, 300).unwrap();
+            let got = items(codec, &all);
+            let outs: Vec<&Vec<u8>> = got.iter().map(|i| match i { Item::Data(d) => d, other => panic!("{other:?}") }).collect();
+            assert!(outs.len() > 5, "{codec:?}");
+            assert!(outs.iter().all(|o| o.len() <= 300 && o.ends_with(b"\n")), "{codec:?}");
+            assert_eq!(outs.into_iter().flatten().copied().collect::<Vec<u8>>(), payload, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn a_record_longer_than_the_size_is_its_own_member() {
+        let payload = [b"short\n".to_vec(), vec![b'x'; 1000], b"\nend\n".to_vec()].concat();
+        let all = encode_members(Codec::Gzip, &payload, 100).unwrap();
+        let got = items(Codec::Gzip, &all);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[1], Item::Data([vec![b'x'; 1000], b"\n".to_vec()].concat()));
+    }
+
+    #[test]
+    fn empty_payload_is_no_member() {
+        assert_eq!(encode_members(Codec::Gzip, b"", 100).unwrap(), Vec::<u8>::new());
     }
 }
