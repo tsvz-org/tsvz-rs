@@ -590,6 +590,29 @@ impl Store {
         self.replay.newest
     }
 
+    /// Whether the store still has the parts it read, by name: known without listing them while
+    /// the directory is as the last check found it and old enough for its timestamp to show a
+    /// change; else they are listed, and the directory's timestamp recorded when they are.
+    pub(crate) fn same_parts(&mut self) -> Result<bool, Error> {
+        let dir = dir_mtime(&self.path);
+        if dir != self.follow.dir_mtime || self.follow.dir_racy {
+            let mut now = parts::list(&self.path)?;
+            if let Some(n) = self.limit {
+                now.truncate(n);
+            }
+            if now
+                .iter()
+                .map(|p| &p.path)
+                .ne(self.parts.iter().map(|p| &p.path))
+            {
+                return Ok(false);
+            }
+            self.follow.dir_mtime = dir;
+            self.follow.dir_racy = racy(dir);
+        }
+        Ok(true)
+    }
+
     /// Whether the read met a checksum marker of a known algorithm (§15).
     pub(crate) fn has_checksums(&self) -> bool {
         self.replay.checksums
@@ -627,21 +650,8 @@ impl Store {
     /// changed — the part list, an earlier part, a compressed last part, a stopped read, or an
     /// in-place rewrite (the bytes before the old read offset no longer match).
     pub fn refresh(&mut self) -> Result<Refreshed, Error> {
-        let dir = dir_mtime(&self.path);
-        if dir != self.follow.dir_mtime || self.follow.dir_racy {
-            let mut now = parts::list(&self.path)?;
-            if let Some(n) = self.limit {
-                now.truncate(n);
-            }
-            if now
-                .iter()
-                .map(|p| &p.path)
-                .ne(self.parts.iter().map(|p| &p.path))
-            {
-                return self.reload();
-            }
-            self.follow.dir_mtime = dir;
-            self.follow.dir_racy = racy(dir);
+        if !self.same_parts()? {
+            return self.reload();
         }
         let mut followed = false;
         for i in 0..self.parts.len() {

@@ -205,10 +205,70 @@ fn set_bool(slot: &mut bool, default: bool, lower: &str) -> bool {
     true
 }
 
-/// An integer marker value: ASCII digits only, at least 1 (§12.4.1).
+/// Apply the stateful marker `key` (lowercase, `#_defaults_#` aside) with `value` to `m`, as a
+/// reader does (§12.4); false when the value is invalid, which leaves `m` as it was (§12.5).
+pub(crate) fn apply_marker(m: &mut Markers, key: &str, value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    match key {
+        "#_version_#" => match (value, positive(value)) {
+            ("", _) => {
+                m.version = 1;
+                true
+            }
+            (_, Some(n)) => {
+                m.version = n;
+                true
+            }
+            _ => false,
+        },
+        "#_strip_trailing_whites_#" => set_bool(&mut m.strip, true, &lower),
+        "#_fill_empty_with_default_#" => set_bool(&mut m.fill_empty, false, &lower),
+        "#_return_defaults_when_missing_#" => set_bool(&mut m.return_missing, true, &lower),
+        "#_on_corruption_#" => {
+            m.on_corruption = match lower.as_str() {
+                "" | "recover" => Policy::Recover,
+                "skip" => Policy::Skip,
+                "stop" => Policy::Stop,
+                _ => m.on_corruption,
+            };
+            matches!(lower.as_str(), "" | "recover" | "skip" | "stop")
+        }
+        "#_rotate_#" => {
+            m.rotate = match lower.as_str() {
+                "" | "keep" => "keep",
+                "rename" => "rename",
+                "delete" => "delete",
+                _ => m.rotate,
+            };
+            matches!(lower.as_str(), "" | "keep" | "rename" | "delete")
+        }
+        "#_write_ack_#" => {
+            m.write_ack = match lower.as_str() {
+                "" | "memory" => "memory",
+                "disk" => "disk",
+                _ => m.write_ack,
+            };
+            matches!(lower.as_str(), "" | "memory" | "disk")
+        }
+        "#_member_size_#" => match (value, positive(value)) {
+            ("", _) => {
+                m.member_size = DEFAULT_MEMBER_SIZE;
+                true
+            }
+            (_, Some(n)) => {
+                m.member_size = n;
+                true
+            }
+            _ => false,
+        },
+        _ => true, // a marker version 1 does not define: no effect (§12.3)
+    }
+}
+
 /// The highest tsvz-spec version this crate implements (§6.3).
 pub(crate) const SPEC_VERSION: u64 = 1;
 
+/// An integer marker value: ASCII digits only, at least 1 (§12.4.1).
 fn positive(value: &str) -> Option<u64> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -398,67 +458,12 @@ impl Replay {
             .map(|f| escape::decode(f, d))
             .unwrap_or(Cow::Borrowed(""));
         let value: &str = &value;
-        let lower = value.to_ascii_lowercase();
-        let m = &mut self.markers;
-        let valid = match key {
-            "#_version_#" => match (value, positive(value)) {
-                ("", _) => {
-                    m.version = 1;
-                    true
-                }
-                (_, Some(n)) => {
-                    m.version = n;
-                    self.newest = self.newest.max(n);
-                    true
-                }
-                _ => false,
-            },
-            "#_strip_trailing_whites_#" => set_bool(&mut m.strip, true, &lower),
-            "#_fill_empty_with_default_#" => {
-                let ok = set_bool(&mut m.fill_empty, false, &lower);
-                self.binding = None;
-                ok
-            }
-            "#_return_defaults_when_missing_#" => set_bool(&mut m.return_missing, true, &lower),
-            "#_on_corruption_#" => {
-                m.on_corruption = match lower.as_str() {
-                    "" | "recover" => Policy::Recover,
-                    "skip" => Policy::Skip,
-                    "stop" => Policy::Stop,
-                    _ => m.on_corruption,
-                };
-                matches!(lower.as_str(), "" | "recover" | "skip" | "stop")
-            }
-            "#_rotate_#" => {
-                m.rotate = match lower.as_str() {
-                    "" | "keep" => "keep",
-                    "rename" => "rename",
-                    "delete" => "delete",
-                    _ => m.rotate,
-                };
-                matches!(lower.as_str(), "" | "keep" | "rename" | "delete")
-            }
-            "#_write_ack_#" => {
-                m.write_ack = match lower.as_str() {
-                    "" | "memory" => "memory",
-                    "disk" => "disk",
-                    _ => m.write_ack,
-                };
-                matches!(lower.as_str(), "" | "memory" | "disk")
-            }
-            "#_member_size_#" => match (value, positive(value)) {
-                ("", _) => {
-                    m.member_size = DEFAULT_MEMBER_SIZE;
-                    true
-                }
-                (_, Some(n)) => {
-                    m.member_size = n;
-                    true
-                }
-                _ => false,
-            },
-            _ => true, // a marker version 1 does not define: no effect (§12.3)
-        };
+        let valid = apply_marker(&mut self.markers, key, value);
+        match key {
+            "#_version_#" => self.newest = self.newest.max(self.markers.version),
+            "#_fill_empty_with_default_#" => self.binding = None,
+            _ => {}
+        }
         if !valid {
             self.warn(
                 Some(line.offset),

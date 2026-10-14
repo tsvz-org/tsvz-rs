@@ -160,6 +160,18 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
 ///
 /// Each append holds the write lock shared with TSVZ.py (see `lock`): where only a classic
 /// POSIX lock is available, closing another descriptor of the part in this process releases it.
+/// Where [`Writer::append_payload_at`] appended, and the part's stamp just before and after.
+#[doc(hidden)]
+pub struct Appended {
+    pub part: PathBuf,
+    pub before: parts::Stamp,
+    pub after: parts::Stamp,
+}
+
+fn stamp(file: &File) -> io::Result<parts::Stamp> {
+    file.metadata().map(|m| parts::Stamp::of(&m))
+}
+
 pub struct Writer {
     store: PathBuf,
     format: Format,
@@ -220,6 +232,14 @@ impl Writer {
 
     /// Append encoded records (each ending in `\n`) as one batch.
     pub fn append_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
+        self.append_payload_at(payload).map(|_| ())
+    }
+
+    /// [`Writer::append_payload`], saying where the batch went and how the part looked, under
+    /// the lock, just before and after it: what the handler needs to tell its own appends from
+    /// other writers'.
+    #[doc(hidden)]
+    pub fn append_payload_at(&mut self, payload: &[u8]) -> Result<Appended, Error> {
         let part = parts::active(&self.store)?;
         let path = part.path.as_path();
         let io = |e: io::Error| Error::io(path, e);
@@ -238,10 +258,16 @@ impl Writer {
                     .open(path)
                     .map_err(io)?;
                 let _guard = lock::lock(&file, path).map_err(io)?;
+                let before = stamp(&file).map_err(io)?;
                 (&file).write_all(&bytes).map_err(io)?;
                 if self.fsync {
                     file.sync_data().map_err(io)?;
                 }
+                Ok(Appended {
+                    part: part.path.clone(),
+                    before,
+                    after: stamp(&file).map_err(io)?,
+                })
             }
             None => {
                 let file = OpenOptions::new()
@@ -251,14 +277,19 @@ impl Writer {
                     .open(path)
                     .map_err(io)?;
                 let _guard = lock::lock(&file, path).map_err(io)?;
+                let before = stamp(&file).map_err(io)?;
                 self.cut_torn_tail(&file, path).map_err(io)?;
                 (&file).write_all(payload).map_err(io)?;
                 if self.fsync {
                     file.sync_data().map_err(io)?;
                 }
+                Ok(Appended {
+                    part: part.path.clone(),
+                    before,
+                    after: stamp(&file).map_err(io)?,
+                })
             }
         }
-        Ok(())
     }
 
     /// An uncommitted tail would join the first appended record: cut it first, as TSVZ.py does.

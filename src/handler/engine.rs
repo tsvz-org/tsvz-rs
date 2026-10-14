@@ -16,6 +16,7 @@ use crate::handler::protocol::{Request, Response};
 use crate::maint::{self, Outcome};
 use crate::name::{self, Format};
 use crate::ops::{self, Out, Plan};
+use crate::parts::Stamp;
 use crate::write::{Record, Writer, encode_record};
 use crate::{Error, Options, Scope, Store, WarnFn, Warning, escape, parts};
 
@@ -47,6 +48,11 @@ struct Queue {
     failures: VecDeque<(u64, u64, String)>,
     /// The last batch's error, until a batch is written again.
     failing: Option<String>,
+    /// The part the last batch went to and its stamp just after; None before the first batch
+    /// and after a failed one.
+    own: Option<(PathBuf, Stamp)>,
+    /// How many batches found their part changed since the last one: other writers wrote.
+    foreign: u64,
     unsynced: bool,
     closing: bool,
 }
@@ -88,6 +94,27 @@ impl Batcher {
             Some(f) => Err(f.2.clone()),
             None => Ok(()),
         }
+    }
+
+    /// The last sequence number written (or failed), and the count of batches that found
+    /// other writers' data.
+    fn progress(&self) -> (u64, u64) {
+        let q = lock(&self.queue);
+        (q.written, q.foreign)
+    }
+
+    /// Whether the files may hold data of other writers that the last follow, which saw
+    /// `foreign` such batches, did not: none when every batch since found its part as the last
+    /// one left it, and the part and the directory are still so.
+    fn others_wrote(&self, foreign: u64) -> bool {
+        let (count, own) = {
+            let q = lock(&self.queue);
+            (q.foreign, q.own.clone())
+        };
+        count != foreign
+            || own.is_none_or(|(part, at)| {
+                std::fs::metadata(&part).map_or(true, |m| Stamp::of(&m) != at)
+            })
     }
 
     /// Wait until everything queued so far is written (§21.8.1).
@@ -146,12 +173,20 @@ impl Batcher {
                 w.member_size(member_size as usize)
                     .fsync(durable)
                     .warnings(self.log.clone())
-                    .append_payload(&payload)
+                    .append_payload_at(&payload)
             });
             let mut q = lock(&self.queue);
             q.written = last;
             match result {
-                Ok(()) => {
+                Ok(appended) => {
+                    let ours = q
+                        .own
+                        .as_ref()
+                        .is_some_and(|(part, at)| *part == appended.part && *at == appended.before);
+                    if !ours {
+                        q.foreign += 1;
+                    }
+                    q.own = Some((appended.part, appended.after));
                     q.failing = None;
                     if durable {
                         q.durable = last;
@@ -160,6 +195,7 @@ impl Batcher {
                     }
                 }
                 Err(e) => {
+                    q.own = None;
                     let message = e.to_string();
                     if let Some(errors) = &self.errors {
                         errors(&Warning {
@@ -198,6 +234,14 @@ struct State {
     /// Warnings raised while handling the current request: its `#!` lines.
     said: Arc<Mutex<Vec<String>>>,
     closed: bool,
+    /// The last `#_write_ack_#` and `#_member_size_#` values queued, with their sequence
+    /// numbers: until the store follows the files past them, they govern later writes.
+    queued_ack: Option<(u64, &'static str)>,
+    queued_member_size: Option<(u64, u64)>,
+    /// The last sequence number written when the store last followed the files, and the
+    /// writer's count of batches that found other writers' data then.
+    reflected: u64,
+    foreign: u64,
 }
 
 /// Output lines of a response (§21.6.1): rows and keys as `read --format records` prints them
@@ -256,6 +300,12 @@ fn record(raw: &str, key: &str, values: &[String]) -> Record {
 }
 
 /// A write queued by a request: wait for it as §21.9 says before answering.
+/// The value of a queued marker the store has not followed yet (`reflected`: the last sequence
+/// number written when it last did).
+fn queued<T>(slot: Option<(u64, T)>, reflected: u64) -> Option<T> {
+    slot.filter(|(seq, _)| *seq > reflected).map(|(_, v)| v)
+}
+
 struct Queued {
     seq: u64,
     durable: bool,
@@ -306,6 +356,10 @@ impl Engine {
                 store: Some(store),
                 said,
                 closed: false,
+                queued_ack: None,
+                queued_member_size: None,
+                reflected: 0,
+                foreign: 0,
             }),
             batcher,
             thread: Mutex::new(Some(thread)),
@@ -352,9 +406,18 @@ impl Engine {
     /// Catch up with the files: wait for queued writes, then follow them (§21.8.1).
     fn fresh(&self, st: &mut State) -> Result<(), Error> {
         self.batcher.barrier();
+        self.follow(st)
+    }
+
+    /// Follow the files as they are now, without waiting for queued writes.
+    fn follow(&self, st: &mut State) -> Result<(), Error> {
+        let (written, foreign) = self.batcher.progress(); // what the files hold at least
         let reopened = match &mut st.store {
             Some(store) => match store.refresh() {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    (st.reflected, st.foreign) = (written, foreign);
+                    return Ok(());
+                }
                 Err(Error::Missing(_)) => None,
                 Err(e) => return Err(e),
             },
@@ -365,13 +428,16 @@ impl Engine {
             },
         };
         st.store = reopened;
+        (st.reflected, st.foreign) = (written, foreign);
         Ok(())
     }
 
     /// Encode `records` for the store and queue them; None when there is nothing to write.
+    /// Whether the write is made durable, and its member size, follow the markers as they stand
+    /// where it will be appended: the files followed now, then the markers still queued.
     fn submit(
         &self,
-        st: &State,
+        st: &mut State,
         records: &[Record],
         sync: bool,
         member_size: Option<u64>,
@@ -383,15 +449,44 @@ impl Engine {
         if payload.is_empty() {
             return Ok(None);
         }
+        // The store's markers are current unless another writer wrote since it last followed
+        // the files: then follow them (cheaply, without waiting for queued writes). A file
+        // that cannot be followed leaves the state last read; reads report it.
+        let others = self.batcher.others_wrote(st.foreign)
+            || !st
+                .store
+                .as_mut()
+                .is_some_and(|s| s.same_parts().unwrap_or(false));
+        if others {
+            let _ = self.follow(st);
+        }
+        let reflected = st.reflected;
         let markers = st.store.as_ref().map(Store::markers);
-        let disk = markers.is_some_and(|m| m.write_ack == "disk");
+        let ack = queued(st.queued_ack, reflected).or(markers.map(|m| m.write_ack));
         let member_size = member_size
+            .or(queued(st.queued_member_size, reflected))
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
-        let durable = sync || disk;
+        let durable = sync || ack == Some("disk");
         let seq = self
             .batcher
             .submit(payload.into_bytes(), durable, member_size);
+        for r in records {
+            let Record::Marker { key, values } = r else {
+                continue;
+            };
+            let key = key.to_ascii_lowercase();
+            let value = values.first().map_or("", String::as_str);
+            let mut m = crate::Markers::default();
+            if !crate::replay::apply_marker(&mut m, &key, value) {
+                continue; // an invalid value changes nothing (§12.5)
+            }
+            match key.as_str() {
+                "#_write_ack_#" => st.queued_ack = Some((seq, m.write_ack)),
+                "#_member_size_#" => st.queued_member_size = Some((seq, m.member_size)),
+                _ => {}
+            }
+        }
         Ok(Some(Queued { seq, durable }))
     }
 
@@ -822,6 +917,132 @@ mod tests {
         assert_eq!(ask(&e, "len").lines, ["1"], "the marker is read");
         assert_eq!(ask(&e, "set\tb\t2").status, 0);
         assert!(fs::read_to_string(&p).unwrap().ends_with("b\t2\n"));
+    }
+
+    #[test]
+    fn write_ack_and_member_size_follow_other_writers_and_markers_not_yet_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            e.submit(&mut st, records, false, None).unwrap().unwrap()
+        };
+        let data = || {
+            [Record::Data {
+                key: "k".into(),
+                values: vec!["v".into()],
+            }]
+        };
+        let marker = |key: &str, value: &str| {
+            [Record::Marker {
+                key: key.into(),
+                values: vec![value.into()],
+            }]
+        };
+        // Another writer asks for acknowledgements on disk: the next write is made durable.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"#_write_ack_#\tdisk\n")
+            .unwrap();
+        assert!(submit(&data()).durable, "a marker another writer appended");
+        // Markers queued but not yet written (the writer waits for the lock) govern what follows.
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file, &p).unwrap();
+        submit(&marker("#_WRITE_ACK_#", "Memory"));
+        submit(&marker("#_member_size_#", "7"));
+        assert!(!submit(&data()).durable, "#_write_ack_# memory, queued");
+        assert_eq!(lock(&e.batcher.queue).member_size, 7);
+        submit(&marker("#_member_size_#", "zero")); // invalid: ignored, as a reader ignores it
+        submit(&data());
+        assert_eq!(lock(&e.batcher.queue).member_size, 7);
+        drop(held);
+        assert_eq!(ask(&e, "get\tk").lines, ["k\tv"]);
+    }
+
+    #[test]
+    fn a_marker_another_writer_appends_between_two_of_ours_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        // A directory last changed long ago, whose timestamp shows a new part: the engine then
+        // trusts its own bookkeeping to tell whether another writer wrote.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(dir.path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let data = |k: &str| {
+            [Record::Data {
+                key: k.into(),
+                values: vec!["v".into()],
+            }]
+        };
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            e.submit(&mut st, records, false, None).unwrap().unwrap()
+        };
+        assert!(!submit(&data("x")).durable);
+        e.batcher.barrier();
+        assert!(!submit(&data("y")).durable);
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file, &p).unwrap(); // y waits for the lock
+        assert!(!submit(&data("z")).durable);
+        (&file).write_all(b"#_write_ack_#\tdisk\n").unwrap(); // before y is written
+        drop(held);
+        e.batcher.barrier();
+        assert!(
+            submit(&data("w")).durable,
+            "written after y, but before it on file"
+        );
+        e.batcher.barrier();
+        // After our last append: the part is no longer as we left it.
+        (&file).write_all(b"#_write_ack_#\tmemory\n").unwrap();
+        assert!(!submit(&data("v")).durable, "appended after w");
+        assert_eq!(ask(&e, "keys").lines, ["a", "x", "y", "z", "w", "v"]);
+        // A new part: the directory changes.
+        fs::write(dir.path().join("s.tsvz.1"), "#_write_ack_#\tdisk\n").unwrap();
+        assert!(submit(&data("u")).durable, "a part another writer added");
+        e.batcher.barrier();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
+            "#_write_ack_#\tdisk\nu\tv\n"
+        );
+    }
+
+    #[test]
+    fn its_own_markers_govern_until_it_follows_the_files_past_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(dir.path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            e.submit(&mut st, records, false, None).unwrap().unwrap()
+        };
+        let data = [Record::Data {
+            key: "k".into(),
+            values: vec!["v".into()],
+        }];
+        submit(&data);
+        e.batcher.barrier();
+        submit(&data); // follows once after the first batch, then trusts its bookkeeping
+        e.batcher.barrier();
+        submit(&[Record::Marker {
+            key: "#_write_ack_#".into(),
+            values: vec!["disk".into()],
+        }]);
+        e.batcher.barrier(); // written, but the store has not followed the files since
+        assert!(submit(&data).durable);
     }
 
     #[test]

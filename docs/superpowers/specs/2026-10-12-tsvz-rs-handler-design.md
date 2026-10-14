@@ -214,8 +214,16 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   when unsynced.
 - The thread never takes the engine mutex, so a request holding the mutex can
   wait on it.
-- The member size used for a compressed active part is the store's
-  `#_member_size_#` when the entry was submitted.
+- Whether an entry is durable (`#_write_ack_#`) and the member size used for a
+  compressed active part (`#_member_size_#`) are the markers as they stand where
+  the entry will be appended, as far as can be known when it is submitted: the
+  markers the engine last followed, then the last values of those two markers
+  queued since (they govern until the engine follows the files past them). The
+  engine follows the files first when another writer may have written since:
+  the writer thread counts batches that found their part not as the previous
+  batch left it, and `submit` checks that the last part appended to is still as
+  that batch left it and that the store has the same parts (by name; the
+  directory is listed only while its timestamp cannot show a change).
 
 ### 4.3 Acknowledgement (§21.9)
 
