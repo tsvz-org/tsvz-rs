@@ -340,9 +340,11 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>, info: InfoFn) {
     }
 }
 
-/// Serve `stream` on a thread of its own, made by `builder`. When no thread can be made (a task
-/// limit, no memory), the connection is closed, the fact is reported, and the handler keeps
-/// serving: `std::thread::spawn` would panic, and the release build aborts on panic.
+/// Serve `stream` on a thread of its own, made by `builder`. The connection is counted and
+/// registered here, as it is accepted: the idle timeout never sees an accepted connection as
+/// none, and a stop always ends it. When no thread can be made (a task limit, no memory), the
+/// connection is closed, the fact is reported, and the handler keeps serving:
+/// `std::thread::spawn` would panic, and the release build aborts on panic.
 fn start_connection(
     builder: std::thread::Builder,
     stream: UnixStream,
@@ -351,10 +353,17 @@ fn start_connection(
     info: InfoFn,
     verbose: bool,
 ) -> bool {
+    lock(&shared.activity).0 += 1;
+    let id = shared.next.fetch_add(1, Ordering::SeqCst);
+    if let Ok(handle) = stream.try_clone() {
+        lock(&shared.open).insert(id, handle);
+    }
     let report = info.clone();
-    match builder.spawn(move || serve_connection(stream, &engine, &shared, &info, verbose)) {
+    let mine = shared.clone();
+    match builder.spawn(move || serve_connection(id, stream, &engine, &shared, &info, verbose)) {
         Ok(_) => true,
         Err(e) => {
+            end_connection(&mine, id);
             report(&format!(
                 "cannot start a thread for a connection ({e}); closed it"
             ));
@@ -363,19 +372,22 @@ fn start_connection(
     }
 }
 
-/// Answer the requests of one connection, one at a time (§21.3.2), until it ends.
+fn end_connection(shared: &Shared, id: u64) {
+    lock(&shared.open).remove(&id);
+    let mut activity = lock(&shared.activity);
+    activity.0 -= 1;
+    activity.1 = Instant::now();
+}
+
+/// Answer the requests of connection `id`, one at a time (§21.3.2), until it ends.
 fn serve_connection(
+    id: u64,
     stream: UnixStream,
     engine: &Engine,
     shared: &Shared,
     info: &InfoFn,
     verbose: bool,
 ) {
-    let id = shared.next.fetch_add(1, Ordering::SeqCst);
-    if let Ok(handle) = stream.try_clone() {
-        lock(&shared.open).insert(id, handle);
-    }
-    lock(&shared.activity).0 += 1;
     if let Ok(reader) = stream.try_clone() {
         answer(
             BufReader::new(reader),
@@ -386,10 +398,7 @@ fn serve_connection(
             verbose,
         );
     }
-    lock(&shared.open).remove(&id);
-    let mut activity = lock(&shared.activity);
-    activity.0 -= 1;
-    activity.1 = Instant::now();
+    end_connection(shared, id);
 }
 
 fn answer(
@@ -492,6 +501,53 @@ mod tests {
         );
     }
 
+    fn shared() -> Arc<Shared> {
+        let (wake, _) = UnixStream::pair().unwrap();
+        Arc::new(Shared {
+            stopping: AtomicBool::new(false),
+            wake,
+            activity: Mutex::new((0, Instant::now())),
+            open: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn a_connection_is_counted_when_it_is_accepted_not_when_its_thread_runs() {
+        // Else the idle timeout can stop the handler under a client it has just accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None).unwrap());
+        let shared = shared();
+        let info: InfoFn = Arc::new(|_: &str| {});
+        let (_client, end) = UnixStream::pair().unwrap();
+        let held = lock(&shared.open); // stalls whatever registers the connection next
+        let started = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                start_connection(
+                    std::thread::Builder::new(),
+                    end,
+                    engine,
+                    shared,
+                    info,
+                    false,
+                )
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&shared.activity).0 == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lock(&shared.activity).0, 1, "counted before anything else");
+        drop(held);
+        assert!(started.join().unwrap());
+        assert_eq!(
+            lock(&shared.open).len(),
+            1,
+            "registered for a stop by the accept loop"
+        );
+    }
+
     #[test]
     fn a_connection_that_gets_no_thread_is_closed_and_serving_goes_on() {
         let dir = tempfile::tempdir().unwrap();
@@ -525,6 +581,8 @@ mod tests {
             "the connection is closed"
         );
         assert!(lock(&said)[0].contains("thread"), "{:?}", lock(&said));
+        assert_eq!(lock(&shared.activity).0, 0, "no longer counted");
+        assert!(lock(&shared.open).is_empty(), "nor registered");
         let (mut client, end) = UnixStream::pair().unwrap();
         assert!(start_connection(
             std::thread::Builder::new(),
