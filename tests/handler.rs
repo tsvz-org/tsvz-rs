@@ -221,6 +221,42 @@ fn a_quiet_handler_still_reports_writes_that_fail() {
 }
 
 #[test]
+fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
+    // The handler deletes the row before the command prints it: a row that cannot be printed
+    // (here to a pipe nobody reads) is put back, not lost.
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let _served = Served::start(&s, &[]);
+    let mut fds = [0; 2];
+    // SAFETY: pipe writes two new descriptors into fds.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors are new and owned here alone.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read);
+    for op in [&["pop", "s.tsvz", "a"][..], &["popitem", "s.tsvz"][..]] {
+        let out = tsvz()
+            .current_dir(dir.path())
+            .args(op)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(write.try_clone().unwrap()))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{op:?}: {}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains("it was put back"),
+            "{}",
+            text(&out.stderr)
+        );
+        let mut keys = ask(&s, "keys").lines;
+        keys.sort();
+        assert_eq!(keys, ["a", "b"], "{op:?}: {}", text(&out.stderr));
+    }
+    assert_eq!(ask(&s, "get\ta").lines, ["a\t1"]);
+}
+
+#[test]
 fn a_second_serve_exits_1_and_the_first_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "k\tv\n");

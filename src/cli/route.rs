@@ -1,6 +1,6 @@
 //! Forwarding a command line to the store's handler (§20.8).
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 use crate::cli::Ctx;
 use crate::cli::output::{Printer, stdout_error};
@@ -95,6 +95,13 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
         None
     };
     match client.send(&line, records.as_deref()) {
+        Ok(response)
+            if matches!(op.as_str(), "pop" | "popitem")
+                && response.status == 0
+                && !response.lines.is_empty() =>
+        {
+            Some(deliver(ctx, &mut client, &response))
+        }
         Ok(response) => Some(print(ctx, &response)),
         Err(e) if READ_ONLY.contains(&op.as_str()) => {
             warn(ctx, format!("{e}; using the files directly"));
@@ -102,6 +109,71 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
         }
         Err(e) => Some(Err(e)),
     }
+}
+
+/// SIGPIPE ignored while this lives, so that writing to a closed pipe fails instead of ending
+/// the process; its default action is restored after.
+struct NoSigpipe;
+
+impl NoSigpipe {
+    fn new() -> NoSigpipe {
+        // SAFETY: the command line runs one thread; this only changes SIGPIPE's action.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        NoSigpipe
+    }
+}
+
+impl Drop for NoSigpipe {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+}
+
+/// Print the row a `pop` or `popitem` took. The handler deleted it before answering (on the
+/// files the row is printed first): when it cannot be printed (a closed pipe, a full disk), it
+/// is put back with `setdefault`, which keeps a row written for its key since, and the command
+/// fails.
+fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i32, Error> {
+    let printed = {
+        let _sigpipe = NoSigpipe::new();
+        let printed = print(ctx, response)
+            .and_then(|status| ctx.out.flush().map_err(stdout_error).map(|()| status));
+        if printed.is_err() {
+            // What stdout did not take is dropped, not written again at the end.
+            let unwritten =
+                std::mem::replace(&mut ctx.out, BufWriter::new(std::io::stdout().lock()));
+            let _ = unwritten.into_parts();
+        }
+        printed
+    };
+    let Err(e) = printed else {
+        return printed;
+    };
+    let fields = decode_fields(&response.lines[0]);
+    let mut line = String::from("setdefault");
+    for f in &fields {
+        line.push('\t');
+        line.push_str(&field(f, false));
+    }
+    let row = fields.join("\t");
+    let store = ctx.store.display();
+    match client.send(&line, None) {
+        Ok(r) if r.status == 0 && r.lines.first() == Some(&response.lines[0]) => {
+            diag!("tsvz: {store}: the row taken could not be printed; it was put back");
+        }
+        Ok(r) if r.status == 0 => diag!(
+            "tsvz: {store}: the row taken could not be printed, and its key was written since: {row}"
+        ),
+        Ok(r) => diag!(
+            "tsvz: {store}: the row taken could not be printed nor put back ({}): {row}",
+            r.message
+        ),
+        Err(put) => {
+            diag!("tsvz: {store}: the row taken could not be printed nor put back ({put}): {row}")
+        }
+    }
+    Err(e)
 }
 
 /// Print a response as the operation prints on the files (§20.8.1).

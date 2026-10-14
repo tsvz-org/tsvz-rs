@@ -404,7 +404,11 @@ ended by `#`.
 The response is printed as the operation prints on the files: `#!` lines go to
 stderr (hidden by `-q`); rows and lines go through the same `Emitter`/`Fields`,
 as records or a table; the status line's number is the exit status, and its
-message is printed for status 1 and 2.
+message is printed for status 1 and 2. The handler deletes the row a `pop` or `popitem`
+takes before answering, whereas on the files the row is printed first: the
+command prints and flushes that row with SIGPIPE ignored, and a row it cannot
+print (a closed pipe, a full disk) is put back with `setdefault` (which keeps a
+row written for its key since), reported on stderr, and the command exits 1.
 
 If the connection is lost during the request, a read-only operation (`read`,
 `get`, `has`, `len`, `keys`) warns and runs on the files; any other exits 1 with
