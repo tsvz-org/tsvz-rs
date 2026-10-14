@@ -799,3 +799,57 @@ fn a_multi_part_clear_is_synced_before_it_answers() {
         "b\t2\na\nb\n"
     );
 }
+
+#[test]
+fn a_write_that_fails_part_way_leaves_nothing_of_its_batch() {
+    // A batch answered as failed must not be partly in the file: a refused bulk set would
+    // leave some of its rows, and a pop whose batch failed would lose its row.
+    use std::os::unix::process::CommandExt;
+    let dir = store("k\tv\n");
+    let mut input = String::new();
+    for i in 0..100 {
+        input.push_str(&format!("r{i}\t{}\n", "x".repeat(20)));
+    }
+    let mut child = tsvz();
+    child
+        .current_dir(dir.path())
+        .args(["set", "s.tsvz", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: between fork and exec only async-signal-safe calls: signal and setrlimit.
+    unsafe {
+        child.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 200,
+                rlim_max: 200,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = child.spawn().unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("s.tsvz")).unwrap(),
+        "k\tv\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

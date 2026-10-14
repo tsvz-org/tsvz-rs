@@ -262,10 +262,7 @@ impl Writer {
                 let (before, after) = {
                     let _guard = lock::lock(&file, path).map_err(io)?;
                     let before = stamp(&file).map_err(io)?;
-                    (&file).write_all(&bytes).map_err(io)?;
-                    if self.fsync {
-                        file.sync_data().map_err(io)?;
-                    }
+                    self.write_batch(&file, path, &bytes, before.size)?;
                     (before, stamp(&file).map_err(io)?)
                 };
                 Ok(Appended {
@@ -286,10 +283,8 @@ impl Writer {
                     let _guard = lock::lock(&file, path).map_err(io)?;
                     let before = stamp(&file).map_err(io)?;
                     self.cut_torn_tail(&file, path).map_err(io)?;
-                    (&file).write_all(payload).map_err(io)?;
-                    if self.fsync {
-                        file.sync_data().map_err(io)?;
-                    }
+                    let start = file.metadata().map_err(io)?.len();
+                    self.write_batch(&file, path, payload, start)?;
                     (before, stamp(&file).map_err(io)?)
                 };
                 Ok(Appended {
@@ -300,6 +295,34 @@ impl Writer {
                 })
             }
         }
+    }
+
+    /// Write `bytes` at the end of `file` (which ends at `start`), synced when asked, all or
+    /// nothing: a batch that fails part-way (a full disk, a size limit, a failed sync) is cut
+    /// back to `start` before the error is returned, so that a write answered as failed is not
+    /// partly made. When even that fails, the error says the part may hold part of the batch.
+    fn write_batch(&self, file: &File, path: &Path, bytes: &[u8], start: u64) -> Result<(), Error> {
+        let written = (&*file)
+            .write_all(bytes)
+            .and_then(|()| if self.fsync { file.sync_data() } else { Ok(()) });
+        let Err(e) = written else {
+            return Ok(());
+        };
+        let undone = file
+            .set_len(start)
+            .and_then(|()| if self.fsync { file.sync_data() } else { Ok(()) });
+        Err(Error::io(
+            path,
+            match undone {
+                Ok(()) => e,
+                Err(cut) => io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{e}; the part may hold part of the batch, which could not be cut back ({cut})"
+                    ),
+                ),
+            },
+        ))
     }
 
     /// An uncommitted tail would join the first appended record: cut it first, as TSVZ.py does.
