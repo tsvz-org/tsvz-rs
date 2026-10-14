@@ -164,6 +164,13 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
             path.display()
         ));
     }
+    if meta.nlink() != 1 {
+        // Its owner wrote it, but not necessarily here: anyone may link a file they can see.
+        return Err(format!(
+            "{} has another name (a hard link), so its owner may not have put it there",
+            path.display()
+        ));
+    }
     if let Some(name) = fields
         .iter()
         .find(|(_, value)| value.chars().any(|c| (c as u32) < 32))
@@ -531,6 +538,14 @@ mod tests {
             std::os::unix::fs::chown(path_of(&s), Some(65534), Some(65534)).unwrap();
             assert!(lookup(&s).unwrap_err().contains("uid 65534"));
         }
+        // A second name for the file: whoever linked it there need not be its owner.
+        let _ = fs::remove_file(path_of(&s));
+        plant(&s, &text("unix:/x/s", &host), 0o644);
+        let other = dir.path().join("elsewhere");
+        fs::hard_link(path_of(&s), &other).unwrap();
+        assert!(lookup(&s).unwrap_err().contains("hard link"));
+        fs::remove_file(&other).unwrap();
+        assert!(lookup(&s).unwrap().is_some());
     }
 
     #[test]

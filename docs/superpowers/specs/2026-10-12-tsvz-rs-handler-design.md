@@ -306,6 +306,8 @@ A client (the CLI's routing, `stop`, and `Client`) uses a pointer file only when
 - it is a regular file (opened with `O_NOFOLLOW|O_NONBLOCK`), at most 64 KiB;
 - it is owned by the client's user or by the store's owner (the owner of the
   unnumbered file, else of the first part), and not writable by group or others;
+- it has one name (link count 1): a hard link lets anyone place a file its owner wrote
+  elsewhere;
 - its first line is `tsvz-handler<TAB>1`, it has `address` and `host`, and no
   value has a control character;
 - `host` is this host's name and `address` begins with `unix:`;
