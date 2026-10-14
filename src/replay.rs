@@ -269,11 +269,15 @@ pub(crate) fn apply_marker(m: &mut Markers, key: &str, value: &str) -> bool {
 pub(crate) const SPEC_VERSION: u64 = 1;
 
 /// An integer marker value: ASCII digits only, at least 1 (§12.4.1).
+/// One too large for a u64 is u64::MAX: still an integer, above every version implemented.
 fn positive(value: &str) -> Option<u64> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    value.parse::<u64>().ok().filter(|&n| n >= 1)
+    match value.trim_start_matches('0') {
+        "" => None,
+        digits => Some(digits.parse::<u64>().unwrap_or(u64::MAX)),
+    }
 }
 
 impl Replay {
@@ -630,6 +634,24 @@ mod tests {
 
     fn row(k: &str, cells: &[&str]) -> (String, Vec<String>) {
         (k.to_string(), cells.iter().map(|c| c.to_string()).collect())
+    }
+
+    #[test]
+    fn an_integer_value_too_large_for_u64_is_still_one() {
+        // §6, §12.4: an integer of any length; one above u64::MAX is a version above every one
+        // implemented, and a member size beyond any part.
+        let long = "9".repeat(5000);
+        let (r, _, w) = run(
+            TSVZ,
+            false,
+            format!("#_version_#\t{long}\n#_version_#\t1\n#_member_size_#\t{long}\n").as_bytes(),
+        );
+        assert_eq!(r.newest, u64::MAX);
+        assert_eq!(r.markers.member_size, u64::MAX);
+        assert!(w.is_empty(), "valid values: {w:?}");
+        let (r, _, w) = run(TSVZ, false, b"#_version_#\t000\n#_member_size_#\t0\n");
+        assert_eq!((r.newest, r.markers.member_size), (1, DEFAULT_MEMBER_SIZE));
+        assert_eq!(w.len(), 2, "zero is no integer >= 1: {w:?}");
     }
 
     #[test]

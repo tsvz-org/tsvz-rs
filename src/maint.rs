@@ -208,6 +208,16 @@ fn restating_snapshot(s: &Store, earlier: &Store) -> String {
     out
 }
 
+/// The spec version newer than this tsvz implements that a `#_version_#` line of the read
+/// declared, as words; None when every one is implemented (§6.3).
+fn newer_version(s: &Store) -> Option<String> {
+    match s.newest_version() {
+        n if n <= SPEC_VERSION => None,
+        u64::MAX => Some("a spec version of 20 digits or more".into()),
+        n => Some(format!("spec version {n}")),
+    }
+}
+
 fn stamp(path: &Path) -> Result<Stamp, Error> {
     std::fs::metadata(path)
         .map(|m| Stamp::of(&m))
@@ -490,16 +500,15 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
         {
             continue; // the parts changed under the read
         }
-        if s.newest_version() > SPEC_VERSION {
+        if let Some(version) = newer_version(&s) {
             return refused(&format!(
-                "{} declare{} spec version {} (#_version_#), newer than this tsvz implements, which reads {} as version {SPEC_VERSION} only (§6.3)",
+                "{} declare{} {version} (#_version_#), newer than this tsvz implements, which reads {} as version {SPEC_VERSION} only (§6.3)",
                 if multi {
                     "the parts before the active one"
                 } else {
                     "it"
                 },
                 if multi { "" } else { "s" },
-                s.newest_version(),
                 if multi { "them" } else { "it" },
             ));
         }
@@ -767,6 +776,12 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             return Ok(Outcome::Written);
         }
         let Some(before) = before else { continue };
+        if let Some(version) = newer_version(&s) {
+            return Err(Error::Refused(format!(
+                "{}: clear skipped: it declares {version} (#_version_#), newer than this tsvz implements, whose markers it cannot keep (§19.8); nothing was written",
+                store.display()
+            )));
+        }
         let mut content = String::new();
         if let Some(h) = s.header() {
             content.push_str(h);
@@ -1258,6 +1273,33 @@ mod tests {
             damaged(&e),
             "scrub keeps the recovery copy of a damaged part"
         );
+    }
+
+    #[test]
+    fn clear_in_place_refuses_a_part_that_declares_a_newer_spec_version() {
+        // Its active markers cannot be kept for a version this tsvz does not know (§19.8).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        let long = "9".repeat(5000);
+        for text in [
+            "#hdr\n#_version_#\t2\na\tx\n".to_string(),
+            "#_version_#\t2\na\tx\n#_version_#\t1\nb\ty\n".to_string(),
+            format!("#_version_#\t{long}\na\tx\n"),
+        ] {
+            fs::write(&p, &text).unwrap();
+            let e = clear(&p, &opts()).unwrap_err();
+            assert!(matches!(e, Error::Refused(_)), "{e}");
+            assert_eq!(fs::read_to_string(&p).unwrap(), text, "nothing written");
+            assert!(
+                matches!(scrub(&p, &opts()), Err(Error::Refused(_))),
+                "nor scrubbed"
+            );
+        }
+        // Several parts are cleared by appending tombstones, not in place.
+        fs::write(&p, "#_version_#\t2\na\tx\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "b\ty\n").unwrap();
+        assert_eq!(clear(&p, &opts()).unwrap(), Outcome::Written);
+        assert!(rows(&p).is_empty());
     }
 
     #[test]
