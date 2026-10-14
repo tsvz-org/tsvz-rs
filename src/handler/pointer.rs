@@ -211,6 +211,107 @@ fn unreachable(message: String) -> Unreachable {
     }
 }
 
+/// Connect to the socket at `path`, waiting at most `patience` while its listen queue is full: a
+/// handler that does not accept (stuck, or stopped by a signal) is given up on, not waited for
+/// forever, as a blocking `connect` would.
+fn connect_within(path: &Path, patience: Duration) -> io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: sockaddr_un is plain data, for which all zeroes is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path is too long for a socket",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+        *to = *from as libc::c_char;
+    }
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    #[cfg(target_vendor = "apple")]
+    {
+        addr.sun_len = len as u8;
+    }
+    // SAFETY: socket makes a new descriptor, owned below.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a new descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let raw = fd.as_raw_fd();
+    // SAFETY: fcntl reads and sets the flags of the descriptor `fd` owns.
+    let flags = unsafe {
+        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(raw, libc::F_GETFL)
+    };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = Instant::now() + patience;
+    loop {
+        // SAFETY: connect reads `len` bytes of `addr`, a sockaddr_un.
+        let r = unsafe { libc::connect(raw, (&raw const addr).cast::<libc::sockaddr>(), len) };
+        if r == 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10)); // the listen queue is full
+            }
+            Some(libc::EAGAIN) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the handler is not accepting connections",
+                ));
+            }
+            Some(libc::EINPROGRESS) => {
+                let mut poll = libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let wait = deadline.saturating_duration_since(Instant::now());
+                // SAFETY: poll reads and writes the one pollfd entry.
+                if unsafe { libc::poll(&mut poll, 1, wait.as_millis() as libc::c_int) } != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the handler is not accepting connections",
+                    ));
+                }
+                let mut error: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: getsockopt writes one c_int and its size.
+                unsafe {
+                    libc::getsockopt(
+                        raw,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&raw mut error).cast(),
+                        &mut size,
+                    )
+                };
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+                break;
+            }
+            _ => return Err(e),
+        }
+    }
+    // SAFETY: as above: the connection blocks again, as callers expect.
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(UnixStream::from(fd))
+}
+
 /// The uid of the process on the other end of `stream`.
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     #[cfg(target_os = "linux")]
@@ -270,22 +371,10 @@ pub fn connect(info: &Info, timeout: Option<Duration>) -> Result<UnixStream, Unr
             meta.uid()
         )));
     }
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let stream = loop {
-        match UnixStream::connect(path) {
-            Ok(stream) => break stream,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10)); // the listen queue is full
-            }
-            Err(e) => {
-                let quiet = e.kind() == io::ErrorKind::PermissionDenied;
-                return Err(Unreachable {
-                    quiet,
-                    message: format!("{}: {e}", path.display()),
-                });
-            }
-        }
-    };
+    let stream = connect_within(path, Duration::from_millis(500)).map_err(|e| Unreachable {
+        quiet: e.kind() == io::ErrorKind::PermissionDenied,
+        message: format!("{}: {e}", path.display()),
+    })?;
     let uid = peer_uid(&stream).map_err(|e| unreachable(format!("{}: {e}", path.display())))?;
     if uid != info.owner {
         return Err(unreachable(format!(
@@ -406,6 +495,46 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::net::UnixListener;
+
+    /// A socket at `path` listening with a backlog of 0 and never accepting: a stuck handler.
+    fn listen_without_room(path: &Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let std = UnixListener::bind(path).unwrap();
+        // SAFETY: listen only changes the backlog of the socket that `std` owns.
+        assert_eq!(unsafe { libc::listen(std.as_raw_fd(), 0) }, 0);
+        // SAFETY: into_raw_fd hands over the descriptor, which the OwnedFd now owns.
+        unsafe { OwnedFd::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(std)) }
+    }
+
+    #[test]
+    fn a_handler_that_does_not_accept_is_given_up_on_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let _listener = listen_without_room(&path);
+        for _ in 0..3 {
+            // Fill the queue; a filler that blocks is left behind with the test.
+            let path = path.clone();
+            std::thread::spawn(move || UnixStream::connect(path));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let info = Info {
+            address: format!("unix:{}", path.display()),
+            host: hostname(),
+            pid: String::new(),
+            // SAFETY: geteuid only reads the process's user id.
+            owner: unsafe { libc::geteuid() },
+        };
+        let (done, outcome) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = done.send(connect(&info, None).map(|_| ()).map_err(|e| e.message));
+        });
+        let result = outcome
+            .recv_timeout(Duration::from_secs(3))
+            .expect("connect hung on a handler that does not accept");
+        assert!(result.is_err(), "nobody accepted: {result:?}");
+        assert!(started.elapsed() >= Duration::from_millis(400) || cfg!(target_os = "macos"));
+    }
 
     fn root() -> bool {
         // SAFETY: geteuid only reads the process's user id.
