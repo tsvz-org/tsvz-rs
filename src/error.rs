@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 /// Why an operation on a store failed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The store has no part (§20.2.2).
     Missing(PathBuf),
@@ -79,6 +80,7 @@ impl std::error::Error for Error {
 
 /// A problem a reader or writer tolerated, and what it did about it (§4.10).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Warning {
     pub part: PathBuf,
     pub offset: Option<u64>,

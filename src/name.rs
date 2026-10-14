@@ -4,6 +4,7 @@ use std::path::Path;
 
 /// A compression codec of §16.2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Codec {
     Gzip,
     Bzip2,

@@ -117,6 +117,7 @@ pub fn decode_fields(line: &str) -> Vec<String> {
 
 /// A response (§21.6).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Response {
     /// The exit status of §20.6.
     pub status: i32,

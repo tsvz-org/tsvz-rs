@@ -31,6 +31,7 @@ pub enum Scope {
 
 /// How to open a store.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct Options {
     pub scope: Scope,
     /// Compute digests and record mismatches (§15); off for plain reads.
@@ -46,6 +47,7 @@ pub struct Options {
 
 /// One part as `parts` lists it (§20.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PartInfo {
     pub index: usize,
     pub ordinal: Option<String>,
@@ -246,6 +248,7 @@ pub(crate) struct Follow {
 
 /// What `Store::refresh` did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refreshed {
     /// Nothing changed.
     Unchanged,

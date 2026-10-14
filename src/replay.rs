@@ -17,6 +17,7 @@ pub const DEFAULT_MEMBER_SIZE: u64 = 1 << 20;
 
 /// What a reader does with damaged data (§4.10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Policy {
     Recover,
     Skip,
@@ -35,6 +36,7 @@ impl Policy {
 
 /// The marker state of §12.4, the checksum markers aside.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Markers {
     pub version: u64,
     /// The defaults of value columns 1, 2, … at index 0, 1, … (§14.1).
@@ -119,6 +121,7 @@ impl Cells {
 
 /// A segment whose digest does not match its closing marker (§15.3, §20.2 `verify`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mismatch {
     pub part: PathBuf,
     /// The 1-based line, within `part`, of the marker that closes the segment.
@@ -129,6 +132,7 @@ pub struct Mismatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DamageKind {
     ZeroFill,
     CorruptMember,
@@ -136,6 +140,7 @@ pub enum DamageKind {
 
 /// Where a `stop` policy ended the read (§4.10).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Damage {
     pub part: PathBuf,
     pub offset: u64,

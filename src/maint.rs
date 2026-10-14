@@ -15,6 +15,7 @@ use crate::{Error, Options, Scope, Store, Warning, codec, lock};
 
 /// What a clear or scrub did.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Outcome {
     /// The part was rewritten (or, for a multi-part `clear`, tombstones were appended).
     Written,

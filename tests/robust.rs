@@ -51,13 +51,9 @@ fn random_plain_parts_never_panic() {
                 .concat();
             }
             fs::write(&path, &data).unwrap();
-            if let Ok(s) = Store::open(
-                &path,
-                Options {
-                    verify: true,
-                    ..Options::default()
-                },
-            ) {
+            let mut verify = Options::default();
+            verify.verify = true;
+            if let Ok(s) = Store::open(&path, verify) {
                 let _ = s.iter().count();
                 let _ = s.missing().map(|r| r.to_vec());
             }
