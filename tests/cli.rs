@@ -750,3 +750,52 @@ fn a_delete_that_must_read_the_store_writes_nothing_when_it_cannot() {
         "k names itself: no read"
     );
 }
+
+#[test]
+fn a_multi_part_clear_is_synced_before_it_answers() {
+    // An acknowledged clear is durable, as a one-part clear (rewritten and synced) is: the
+    // tombstones it appends to the active part are fdatasync'd before it exits.
+    let dir = store("a\t1\n");
+    fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+    let traced = Command::new("strace")
+        .current_dir(dir.path())
+        .args([
+            "-f",
+            "-e",
+            "trace=openat,fsync,fdatasync",
+            "-o",
+            "trace.txt",
+        ])
+        .arg(env!("CARGO_BIN_EXE_tsvz"))
+        .args(["clear", "s.tsvz"])
+        .output();
+    let Ok(out) = traced else {
+        eprintln!("no strace here: skipped");
+        return;
+    };
+    let Ok(trace) = fs::read_to_string(dir.path().join("trace.txt")) else {
+        eprintln!("strace cannot trace here: skipped");
+        return;
+    };
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fd = trace
+        .lines()
+        .filter(|l| l.contains("\"s.tsvz.1\"") && l.contains("O_APPEND"))
+        .filter_map(|l| l.rsplit("= ").next()?.trim().parse::<u32>().ok())
+        .next()
+        .unwrap_or_else(|| panic!("no append to s.tsvz.1:\n{trace}"));
+    assert!(
+        trace
+            .lines()
+            .any(|l| l.contains(&format!("fdatasync({fd})")) || l.contains(&format!("fsync({fd})"))),
+        "the tombstones were never synced:\n{trace}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
+        "b\t2\na\nb\n"
+    );
+}

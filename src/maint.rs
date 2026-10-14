@@ -768,8 +768,11 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             if tombstones.is_empty() {
                 return Ok(Outcome::Unchanged);
             }
+            // Synced as a one-part clear is (rewritten and synced): a clear that answers is
+            // durable, whatever #_write_ack_# says (§19.8, §21.9.2).
             Writer::open(store)?
                 .member_size(s.markers().member_size as usize)
+                .fsync(true)
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
                 .append(&tombstones)?;
