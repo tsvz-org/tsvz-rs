@@ -318,6 +318,19 @@ impl Store {
         Store::open_limited(path.as_ref(), options, Some(count))
     }
 
+    /// This read continued with the plain file `path` as one more part: what a reader would see
+    /// were it the next part. For a check that is then thrown away; the store is not refreshed.
+    pub(crate) fn read_after(mut self, path: &Path) -> Result<Store, Error> {
+        let part = parts::Part {
+            path: path.to_path_buf(),
+            ordinal: None,
+            codec: None,
+        };
+        self.replay.begin_part(path, false);
+        self.read_part(&part, true)?;
+        Ok(self)
+    }
+
     fn open_limited(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
         let path = path.to_path_buf();
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
@@ -567,6 +580,11 @@ impl Store {
 
     pub fn stopped(&self) -> Option<&Damage> {
         self.replay.stopped.as_ref()
+    }
+
+    /// The highest spec version a `#_version_#` line of the read declared (1 when none did).
+    pub(crate) fn newest_version(&self) -> u64 {
+        self.replay.newest
     }
 
     /// Whether the read met a checksum marker of a known algorithm (§15).

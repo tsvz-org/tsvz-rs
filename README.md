@@ -27,9 +27,10 @@ tsvz --help
 
 Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz, zstd) and split
 into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
-one-part store in place, and in a multi-part store writes the parts before the active one as one
-snapshot part between them (§19.2), then applies the store's `#_rotate_#` (`keep`, `rename` or
-`delete`) to them; writers keep appending to the active part throughout.
+one-part store in place; in a multi-part store it compacts the parts before the active one into
+the last of them, in place (§19.8), then applies the store's `#_rotate_#` (`keep`, `rename` or
+`delete`) to the others; writers keep appending to the active part throughout. It refuses parts
+that declare a spec version newer than the one it implements (§6.3).
 
 ## Handler
 

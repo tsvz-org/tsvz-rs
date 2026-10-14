@@ -365,13 +365,12 @@ fn clear_and_scrub_from_the_command_line() {
     assert_eq!(records(d.path(), &["clear", "s.tsvz"]).0, 0);
     assert_eq!(file(d.path(), "s.tsvz"), "#hdr\n");
     fs::write(d.path().join("s.tsvz.1"), "z\t1\n").unwrap();
-    // A multi-part store: the parts before the active one become a snapshot part (§19.2).
+    // A multi-part store: the parts before the active one are compacted into the last of them.
+    fs::write(d.path().join("s.tsvz"), "#hdr\na\t1\na\n").unwrap();
     assert_eq!(records(d.path(), &["scrub", "s.tsvz"]).0, 0);
-    assert_eq!(file(d.path(), "s.tsvz.0"), "#hdr\n#_version_#\t1\n");
+    assert_eq!(file(d.path(), "s.tsvz"), "#hdr\n#_version_#\t1\n");
     assert_eq!(records(d.path(), &["read", "s.tsvz"]).1, "z\t1\n");
-    // No ordinal is free between .0 and .1 for another one.
-    let (code, _, err) = records(d.path(), &["scrub", "s.tsvz"]);
-    assert!(code == 1 && err.contains("no ordinal is free"), "{err}");
+    assert_eq!(records(d.path(), &["scrub", "s.tsvz"]).0, 0, "and again");
     assert_eq!(records(d.path(), &["scrub", "none.tsvz"]).0, 1);
     let damaged = store("#_on_corruption_#\tstop\na\t1\n\0\0c\t3\n");
     let (code, _, err) = records(damaged.path(), &["scrub", "s.tsvz"]);

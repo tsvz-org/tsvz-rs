@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::escape;
 use crate::name::Codec;
 use crate::parts::{self, Stamp};
-use crate::replay::{DEFAULT_MEMBER_SIZE, Markers, Policy};
+use crate::replay::{DEFAULT_MEMBER_SIZE, Markers, Policy, SPEC_VERSION};
 use crate::write::Writer;
 use crate::{Error, Options, Scope, Store, Warning, codec, lock};
 
@@ -148,6 +148,65 @@ pub fn snapshot(s: &Store) -> String {
     out
 }
 
+/// The content of the part a multi-part scrub compacts into, while the parts before it are
+/// still read first (§19.5 `keep`, or until they are rotated): it must leave no trace of their
+/// state. Stripping goes off and every key they leave live is deleted, every stateful marker is
+/// set explicitly, then come the rows, fully resolved (§19.4), and the final stripping and
+/// fill-empty settings. Read after those parts, or alone, it reads as the whole prefix does.
+fn restating_snapshot(s: &Store, earlier: &Store) -> String {
+    let d = s.format().delimiter;
+    let m = s.markers();
+    let flag = |on: bool| if on { "true" } else { "false" };
+    let mut out = String::new();
+    if let Some(h) = s.header() {
+        out.push_str(h);
+        out.push('\n');
+    }
+    marker_line(&mut out, d, "#_version_#", "1");
+    marker_line(&mut out, d, "#_strip_trailing_whites_#", "false");
+    for (key, _) in earlier.iter() {
+        escape::encode_into(&mut out, key, d, true);
+        out.push('\n');
+    }
+    marker_line(&mut out, d, "#_fill_empty_with_default_#", "false");
+    marker_line(
+        &mut out,
+        d,
+        "#_return_defaults_when_missing_#",
+        flag(m.return_missing),
+    );
+    marker_line(&mut out, d, "#_rotate_#", m.rotate);
+    marker_line(&mut out, d, "#_write_ack_#", m.write_ack);
+    marker_line(&mut out, d, "#_member_size_#", &m.member_size.to_string());
+    marker_line(&mut out, d, "#_on_corruption_#", m.on_corruption.name());
+    out.push_str("#_defaults_#");
+    for v in m.defaults.iter() {
+        out.push(d as char);
+        escape::encode_into(&mut out, v, d, false);
+    }
+    out.push('\n');
+    for (key, row) in s.iter() {
+        let mut cells = row.to_vec();
+        if cells.len() < m.defaults.len() {
+            cells.resize(m.defaults.len(), String::new());
+        }
+        escape::encode_into(&mut out, key, d, true);
+        for c in &cells {
+            out.push(d as char);
+            escape::encode_into(&mut out, c, d, false);
+        }
+        out.push('\n');
+    }
+    marker_line(&mut out, d, "#_strip_trailing_whites_#", flag(m.strip));
+    marker_line(
+        &mut out,
+        d,
+        "#_fill_empty_with_default_#",
+        flag(m.fill_empty),
+    );
+    out
+}
+
 fn stamp(path: &Path) -> Result<Stamp, Error> {
     std::fs::metadata(path)
         .map(|m| Stamp::of(&m))
@@ -163,6 +222,7 @@ pub(crate) fn rewrite(
     expect: Stamp,
     codec: Option<Codec>,
     member_size: u64,
+    recovery: Option<&Path>,
 ) -> Result<Option<bool>, Error> {
     let io = |e: io::Error| Error::io(path, e);
     let raw = match codec {
@@ -190,7 +250,7 @@ pub(crate) fn rewrite(
     // Reserve the space first (§19.8), so a full disk or a file-size limit refuses the rewrite
     // before any byte changes.
     reserve(&file, raw.len() as u64).map_err(io)?;
-    replace(path, &raw, &old, |bytes| put(&file, bytes))?;
+    replace(path, &raw, &old, recovery, |bytes| put(&file, bytes))?;
     Ok(Some(true))
 }
 
@@ -203,30 +263,47 @@ fn put(file: &File, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Why a part holds neither its old bytes nor its new ones: an in-place rewrite failed, and so
+/// did putting the old bytes back.
+#[derive(Debug)]
+struct Damaged(String);
+
+impl std::fmt::Display for Damaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Damaged {}
+
+/// Whether `e` says a part was left damaged by a failed rewrite.
+fn damaged(e: &Error) -> bool {
+    matches!(e, Error::Io { source, .. } if source.get_ref().is_some_and(|r| r.is::<Damaged>()))
+}
+
 /// Put `new` in place of `old` with `put`. When that fails, put the old bytes back (they fit
 /// before) rather than leave a half-rewritten part; when that fails too, the part holds
-/// neither, and the error says so, as TSVZ.py's does ("the part is damaged").
+/// neither, and the error says so ("the part is damaged") and where the `recovery` copy of
+/// the new content is.
 fn replace(
     path: &Path,
     new: &[u8],
     old: &[u8],
+    recovery: Option<&Path>,
     mut put: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> Result<(), Error> {
     let Err(e) = put(new) else {
         return Ok(());
     };
-    match put(old) {
-        Ok(()) => Err(Error::io(path, e)),
-        Err(again) => Err(Error::io(
-            path,
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "{e}; putting its old bytes back failed too ({again}): the part is damaged"
-                ),
-            ),
-        )),
-    }
+    let Err(again) = put(old) else {
+        return Err(Error::io(path, e));
+    };
+    let kept = recovery
+        .map(|r| format!("; its new content is in {}", r.display()))
+        .unwrap_or_default();
+    let why =
+        format!("{e}; putting its old bytes back failed too ({again}): the part is damaged{kept}");
+    Err(Error::io(path, io::Error::new(e.kind(), Damaged(why))))
 }
 
 /// Reserve `len` bytes from the start of `file` before it is rewritten. A file system that
@@ -367,55 +444,154 @@ fn whole(options: &Options) -> Options {
     }
 }
 
-/// Compact a store with §19.4 fidelity (§20.2 `scrub`): a one-part store in place (§19.8); in a
-/// multi-part store, the parts before the active one into one new snapshot part (§19.2).
+/// Compact a store with §19.4 fidelity (§20.2 `scrub`), in place (§19.8): the part of a
+/// one-part store; in a multi-part store, the parts before the active one into the last of them,
+/// which no writer appends to (§17.7), after which `#_rotate_#` applies to the others (§19.5).
+/// The active part of a multi-part store is never touched, so writers go on appending. The new
+/// content is first written to a recovery copy beside the part, removed once the part holds it.
+/// A multi-part scrub is refused, with nothing written, when those parts cannot be read whole
+/// or hold checksum segments (§15), which compacting them would break for the active part.
 pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     refuse_a_part("scrub", store)?;
+    let refused = |why: &str| {
+        Err(Error::Refused(format!(
+            "{}: scrub skipped: {why}; nothing was written",
+            store.display()
+        )))
+    };
     let mut backed_up: Option<(Stamp, PathBuf)> = None;
     for _ in 0..ATTEMPTS {
         let list = parts::list(store)?;
         if list.is_empty() {
             return Err(Error::Missing(store.to_path_buf()));
         }
-        if list.len() > 1 {
-            return snapshot_prefix(store, options);
-        }
-        let before = stamp(&list[0].path)?;
-        let s = Store::open(store, whole(options))?;
-        if s.parts().len() != 1 {
+        let multi = list.len() > 1;
+        let prefix = if multi {
+            &list[..list.len() - 1]
+        } else {
+            &list[..]
+        };
+        let (others, target) = prefix.split_at(prefix.len() - 1);
+        let target = &target[0];
+        let before: Vec<Stamp> = prefix
+            .iter()
+            .map(|p| stamp(&p.path))
+            .collect::<Result<_, _>>()?;
+        let s = if multi {
+            Store::open_prefix(store, whole(options), prefix.len())?
+        } else {
+            Store::open(store, whole(options))?
+        };
+        if s.parts()
+            .iter()
+            .map(|p| &p.path)
+            .ne(prefix.iter().map(|p| &p.path))
+        {
             continue; // the parts changed under the read
         }
-        let part = &s.parts()[0];
+        if s.newest_version() > SPEC_VERSION {
+            return refused(&format!(
+                "{} declare{} spec version {} (#_version_#), newer than this tsvz implements, which reads {} as version {SPEC_VERSION} only (§6.3)",
+                if multi {
+                    "the parts before the active one"
+                } else {
+                    "it"
+                },
+                if multi { "" } else { "s" },
+                s.newest_version(),
+                if multi { "them" } else { "it" },
+            ));
+        }
+        if multi && s.incomplete() {
+            return refused("the parts before the active one could not be read whole (§4.10)");
+        }
+        if multi && s.has_checksums() {
+            return refused(
+                "the parts before the active one hold checksum segments (§15), which compacting them would break for the active part",
+            );
+        }
         let mut copy = None;
         if s.damaged() || s.stopped().is_some() {
             copy = match &backed_up {
-                Some((at, path)) if *at == before => Some(path.clone()),
+                Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
                 _ => {
-                    let path = backup(&part.path, options)?;
-                    backed_up = Some((before, path.clone()));
+                    let path = backup(&target.path, options)?;
+                    backed_up = Some((before[before.len() - 1], path.clone()));
                     Some(path)
                 }
             };
         }
-        let content = snapshot(&s);
-        match rewrite(
-            &part.path,
-            content.as_bytes(),
-            before,
-            part.codec,
-            s.markers().member_size,
-        )? {
-            None => continue, // another writer committed after the read
-            Some(written) => {
-                return Ok(if s.stopped().is_some() {
-                    Outcome::Partial { backup: copy }
-                } else if written {
-                    Outcome::Written
-                } else {
-                    Outcome::Unchanged
-                });
+        // The parts left before the one compacted into, read whole: what it must undo.
+        let earlier = if others.is_empty() {
+            None
+        } else {
+            let earlier = Store::open_prefix(store, whole(options), others.len())?;
+            if earlier
+                .parts()
+                .iter()
+                .map(|p| &p.path)
+                .ne(others.iter().map(|p| &p.path))
+            {
+                continue; // the parts changed under the read
             }
+            Some(earlier)
+        };
+        let content = match &earlier {
+            None => snapshot(&s),
+            Some(earlier) => restating_snapshot(&s, earlier),
+        };
+        if multi {
+            narrow_mode(&target.path, prefix)?;
         }
+        let recovery = write_recovery(store, &target.path, content.as_bytes())?;
+        if multi
+            && !(reads_as(&recovery, &s)
+                && earlier.is_none_or(|e| reads_as_after(e, &recovery, &s)))
+        {
+            let _ = std::fs::remove_file(&recovery);
+            return refused(
+                "the compacted content did not read back as the parts it replaces (please report this)",
+            );
+        }
+        let unchanged = others
+            .iter()
+            .zip(&before)
+            .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b));
+        if !unchanged {
+            let _ = std::fs::remove_file(&recovery);
+            continue; // another process changed a part being compacted
+        }
+        let written = rewrite(
+            &target.path,
+            content.as_bytes(),
+            before[before.len() - 1],
+            target.codec,
+            s.markers().member_size,
+            Some(&recovery),
+        );
+        // The recovery copy goes, unless the part was left damaged: then it is all there is.
+        if !written.as_ref().is_err_and(damaged) {
+            let _ = std::fs::remove_file(&recovery);
+        }
+        let written = written?;
+        let Some(written) = written else {
+            continue; // another writer committed after the read
+        };
+        if multi {
+            // A part whose damage was recovered is never deleted: rename instead (§19.5).
+            let action = match s.markers().rotate {
+                "delete" if s.damaged() => "rename",
+                action => action,
+            };
+            rotate(others, action)?;
+        }
+        return Ok(if s.stopped().is_some() {
+            Outcome::Partial { backup: copy }
+        } else if written {
+            Outcome::Written
+        } else {
+            Outcome::Unchanged
+        });
     }
     Err(Error::Refused(format!(
         "{}: scrub skipped: the store kept changing while it was being compacted; nothing was written",
@@ -423,63 +599,84 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     )))
 }
 
-/// The file name of a part, for messages.
-fn file_name(part: &Path) -> String {
-    part.file_name().map_or_else(
-        || part.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    )
+/// The variant extension of a store path as it is spelled (`tsvz`, `CSV`, …).
+fn variant_ext(store: &Path) -> String {
+    let name = store
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = crate::name::split_codec(&name).0;
+    base.rsplit_once('.')
+        .map_or_else(|| "tsvz".to_string(), |(_, ext)| ext.to_string())
 }
 
-/// Write `bytes` as the new part `target`, never replacing a file (§18.7): through a temporary
-/// file in the same directory, made only after it is synced and has its owner and permissions,
-/// then linked to `target`, which fails when `target` exists. It takes the owner of the last
-/// part it continues (§18.7) and is never more readable than any part whose rows it holds: the
-/// intersection of their modes, without group access unless they all share its group.
-fn create_part(target: &Path, bytes: &[u8], prefix: &[parts::Part]) -> Result<(), Error> {
-    use std::os::unix::fs::MetadataExt;
-    let io = |e: io::Error| Error::io(target, e);
-    let tmp = target.with_file_name(format!(
-        ".{}.tsvz-snapshot-{}",
-        file_name(target),
-        std::process::id()
+/// Write the new content of `part` to a recovery copy beside it, private and synced, before the
+/// part is rewritten in place (§19.8 is not crash-atomic): `<part>.scrub-<time>-<pid>.<ext>`, a
+/// plain store of its own (no part of this store) that a crash would leave behind.
+fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, Error> {
+    let path = PathBuf::from(format!(
+        "{}.scrub-{}-{}.{}",
+        part.display(),
+        local_timestamp(),
+        std::process::id(),
+        variant_ext(store)
     ));
-    let metas: Vec<std::fs::Metadata> = prefix
-        .iter()
-        .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
-        .collect::<Result<_, _>>()?;
-    let Some(like) = metas.last() else {
-        return Err(Error::Refused("a snapshot needs parts to continue".into()));
-    };
-    let mode = metas
-        .iter()
-        .fold(0o666, |m, meta| m & meta.permissions().mode());
+    let io = |e: io::Error| Error::io(&path, e);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| Error::io(&tmp, e))?;
-    let made = file
-        .write_all(bytes)
-        .and_then(|()| match_owner(&file, like))
-        .and_then(|()| file.metadata())
-        .and_then(|made| {
-            let shared = metas.iter().all(|m| m.gid() == made.gid());
-            let mode = if shared { mode } else { mode & !0o070 };
-            file.set_permissions(std::fs::Permissions::from_mode(mode))
-        })
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::hard_link(&tmp, target));
-    let _ = std::fs::remove_file(&tmp);
-    match made {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Refused(format!(
-            "{}: scrub skipped: the snapshot's part already exists; nothing was written",
-            target.display()
-        ))),
-        Err(e) => Err(io(e)),
+        .open(&path)
+        .map_err(io)?;
+    if let Err(e) = file.write_all(content).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(io(e));
     }
+    Ok(path)
+}
+
+/// Whether the recovery copy reads as the store it compacts: the same rows (padding aside, §3.6)
+/// and the same final markers (§19.4). A guard before a part is rewritten.
+fn reads_as(recovery: &Path, s: &Store) -> bool {
+    let options = Options {
+        scope: Scope::All,
+        ..Options::default()
+    };
+    Store::open(recovery, options).is_ok_and(|r| same_reading(&r, s))
+}
+
+/// Whether the recovery copy, read after the parts `earlier` read, reads as the store it
+/// compacts: what a reader of the store sees while those parts stay (§19.5).
+fn reads_as_after(earlier: Store, recovery: &Path, s: &Store) -> bool {
+    earlier
+        .read_after(recovery)
+        .is_ok_and(|r| same_reading(&r, s))
+}
+
+fn same_reading(r: &Store, s: &Store) -> bool {
+    !r.incomplete() && r.markers() == s.markers() && trimmed_rows(r) == trimmed_rows(s)
+}
+
+/// Make `target` no more readable than any of `prefix`, whose rows it is about to hold: the
+/// intersection of their modes, without group access unless they all share its group.
+fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+    let metas: Vec<std::fs::Metadata> = prefix
+        .iter()
+        .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
+        .collect::<Result<_, _>>()?;
+    let own = std::fs::metadata(target).map_err(|e| Error::io(target, e))?;
+    let mut mode = metas
+        .iter()
+        .fold(own.mode() & 0o7777, |m, meta| m & meta.mode());
+    if metas.iter().any(|m| m.gid() != own.gid()) {
+        mode &= !0o070;
+    }
+    if mode != own.mode() & 0o7777 {
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| Error::io(target, e))?;
+    }
+    Ok(())
 }
 
 fn sync_dir(path: &Path) {
@@ -492,8 +689,8 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// Live rows with the empty cells a reader pads them with removed (§3.6): what a snapshot must
-/// reproduce, however the reader pads it.
+/// Live rows with the empty cells a reader pads them with removed (§3.6): what compacted content
+/// must reproduce, however the reader pads it.
 fn trimmed_rows(s: &Store) -> Vec<(String, Vec<String>)> {
     s.iter()
         .map(|(k, r)| {
@@ -506,10 +703,10 @@ fn trimmed_rows(s: &Store) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Apply `#_rotate_#` to the parts a durable snapshot subsumes (§19.5): `rename` gives each
+/// Apply `#_rotate_#` to parts whose rows another part now holds (§19.5): `rename` gives each
 /// the `.rotated` component, never replacing a file; `delete` removes them; `keep` leaves them.
-fn rotate(prefix: &[parts::Part], action: &str) -> Result<(), Error> {
-    for part in prefix {
+fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
+    for part in parts {
         let io = |e: io::Error| Error::io(&part.path, e);
         match action {
             "rename" => {
@@ -520,104 +717,10 @@ fn rotate(prefix: &[parts::Part], action: &str) -> Result<(), Error> {
             _ => return Ok(()),
         }
     }
-    if let Some(first) = prefix.first() {
+    if let Some(first) = parts.first() {
         sync_dir(&first.path);
     }
     Ok(())
-}
-
-/// Snapshot every part of a multi-part store before the active one into one new part between
-/// them (§19.2), then apply `#_rotate_#` to them (§19.5). The active part is never touched, so
-/// writers go on appending throughout. Refused, with nothing written, when no ordinal is free
-/// between them (§19.3: this tsvz does not quiesce writers), when they cannot be read whole, or
-/// when they hold checksum segments, which a snapshot cannot carry into the active part.
-fn snapshot_prefix(store: &Path, options: &Options) -> Result<Outcome, Error> {
-    let refused = |why: String| {
-        Err(Error::Refused(format!(
-            "{}: scrub skipped: {why}; nothing was written",
-            store.display()
-        )))
-    };
-    for _ in 0..ATTEMPTS {
-        let list = parts::list(store)?;
-        if list.len() < 2 {
-            return scrub(store, options);
-        }
-        let (prefix, active) = list.split_at(list.len() - 1);
-        let (last, active) = (&prefix[prefix.len() - 1], &active[0]);
-        let ordinal = active
-            .ordinal
-            .as_deref()
-            .and_then(|a| parts::snapshot_ordinal(last.ordinal.as_deref(), a));
-        let Some(ordinal) = ordinal else {
-            return refused(format!(
-                "no ordinal is free between {} and the active part {} for a snapshot (§19.3); parts with sparse ordinals, such as UUIDv7 (§17.6), leave room",
-                file_name(&last.path),
-                file_name(&active.path)
-            ));
-        };
-        let before: Vec<Stamp> = prefix
-            .iter()
-            .map(|p| stamp(&p.path))
-            .collect::<Result<_, _>>()?;
-        let s = Store::open_prefix(store, whole(options), prefix.len())?;
-        if s.parts()
-            .iter()
-            .map(|p| &p.path)
-            .ne(prefix.iter().map(|p| &p.path))
-        {
-            continue; // the parts changed under the read
-        }
-        if s.incomplete() {
-            return refused(
-                "the parts before the active one could not be read whole (§4.10)".into(),
-            );
-        }
-        if s.has_checksums() {
-            return refused("the parts before the active one hold checksum segments (§15), which a snapshot cannot carry into the active part".into());
-        }
-        let content = snapshot(&s);
-        let bytes = match last.codec {
-            Some(c) if !content.is_empty() => {
-                codec::encode_members(c, content.as_bytes(), s.markers().member_size as usize)
-                    .ok_or_else(|| Error::UnsupportedCodec {
-                        path: last.path.clone(),
-                        codec: c.name(),
-                    })?
-            }
-            _ => content.into_bytes(),
-        };
-        let suffix = parts::codec_suffix(&last.path);
-        let target = parts::numbered_path(store, &ordinal, suffix.as_deref())?;
-        create_part(&target, &bytes, prefix)?;
-        let unchanged = prefix
-            .iter()
-            .zip(&before)
-            .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b));
-        if !unchanged {
-            let _ = std::fs::remove_file(&target);
-            continue; // another writer changed a part it subsumes
-        }
-        // A guard before anything is rotated: the snapshot alone reads as the parts it replaces.
-        let alone = Store::open(&target, whole(options));
-        let faithful = alone.as_ref().is_ok_and(|a| {
-            trimmed_rows(a) == trimmed_rows(&s) && a.markers() == s.markers() && !a.incomplete()
-        });
-        if !faithful {
-            let _ = std::fs::remove_file(&target);
-            return refused(format!(
-                "the snapshot {} did not read back as the parts it replaces, so it was removed (please report this)",
-                file_name(&target)
-            ));
-        }
-        sync_dir(&target);
-        rotate(prefix, s.markers().rotate)?;
-        return Ok(Outcome::Written);
-    }
-    Err(Error::Refused(format!(
-        "{}: scrub skipped: the store kept changing while it was being compacted; nothing was written",
-        store.display()
-    )))
 }
 
 /// Make the store empty (§20.2 `clear`): rewrite a one-part store keeping its header comment and
@@ -684,6 +787,7 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             before,
             part.codec,
             s.markers().member_size,
+            None,
         )? {
             None => continue,
             Some(true) => return Ok(Outcome::Written),
@@ -737,7 +841,7 @@ mod tests {
     fn scrub_markers_in_tsvz_py_order() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
-        fs::write(&p, "#_on_corruption_#\tskip\n#_member_size_#\t9\n#_write_ack_#\tdisk\n#_rotate_#\trename\n#_return_defaults_when_missing_#\tno\n#_fill_empty_with_default_#\ton\n#_strip_trailing_whites_#\toff\n#_version_#\t7\nk\tv\n").unwrap();
+        fs::write(&p, "#_on_corruption_#\tskip\n#_member_size_#\t9\n#_write_ack_#\tdisk\n#_rotate_#\trename\n#_return_defaults_when_missing_#\tno\n#_fill_empty_with_default_#\ton\n#_strip_trailing_whites_#\toff\n#_version_#\t1\nk\tv\n").unwrap();
         scrub(&p, &opts()).unwrap();
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
@@ -760,22 +864,23 @@ mod tests {
     }
 
     #[test]
-    fn scrub_refuses_a_multipart_store_without_a_free_ordinal_and_a_missing_store() {
+    fn scrub_of_consecutive_parts_and_of_a_missing_store() {
+        // No ordinal lies between .1 and .2: the part before the active one is compacted in place.
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("s.tsvz.1"), "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "a\t1\na\t9\n").unwrap();
         fs::write(dir.path().join("s.tsvz.2"), "b\t2\n").unwrap();
-        match scrub(&dir.path().join("s.tsvz"), &opts()) {
-            Err(Error::Refused(why)) => assert!(why.contains("no ordinal is free"), "{why}"),
-            other => panic!("{other:?}"),
-        }
+        let p = dir.path().join("s.tsvz");
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
         assert_eq!(
             fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
-            "a\t1\n"
+            "#_version_#\t1\na\t9\n"
         );
+        assert_eq!(files(dir.path()), ["s.tsvz.1", "s.tsvz.2"]);
+        assert_eq!(rows(&p), [["a", "9"], ["b", "2"]]);
         assert_eq!(
-            fs::read_dir(dir.path()).unwrap().count(),
-            2,
-            "nothing was written"
+            scrub(&p, &opts()).unwrap(),
+            Outcome::Unchanged,
+            "again: nothing to do"
         );
         assert!(matches!(
             scrub(&dir.path().join("none.tsvz"), &opts()),
@@ -862,7 +967,7 @@ mod tests {
         let stale = Stamp::of(&fs::metadata(&p).unwrap());
         fs::write(&p, "a\t1\nb\t2\n").unwrap();
         assert_eq!(
-            rewrite(&p, b"x\n", stale, None, DEFAULT_MEMBER_SIZE).unwrap(),
+            rewrite(&p, b"x\n", stale, None, DEFAULT_MEMBER_SIZE, None).unwrap(),
             None
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\nb\t2\n");
@@ -974,27 +1079,29 @@ mod tests {
     }
 
     #[test]
-    fn scrub_of_a_multipart_store_snapshots_the_parts_before_the_active_one() {
-        // The conformance store of 20.2-scrub-of-a-multipart-store.
+    fn scrub_of_a_multipart_store_compacts_the_parts_before_the_active_one_into_the_last() {
+        // The conformance store of 20.2-scrub-of-a-multipart-store: part 0 is compacted in place.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
-        fs::write(&p, "#hdr\n#_defaults_#\td1\td2\na\t1\n").unwrap();
+        fs::write(&p, "#hdr\n#_defaults_#\td1\td2\na\t1\na\t3\n").unwrap();
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\na\n").unwrap();
         let before = rows(&p);
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
-        // The unnumbered part 0 precedes every ordinal: the snapshot is part .0 (§19.2.3).
-        assert_eq!(files(dir.path()), ["s.tsvz", "s.tsvz.0", "s.tsvz.1"]);
         assert_eq!(
-            fs::read_to_string(dir.path().join("s.tsvz.0")).unwrap(),
-            "#hdr\n#_version_#\t1\n#_defaults_#\td1\td2\na\t1\td2\n"
+            files(dir.path()),
+            ["s.tsvz", "s.tsvz.1"],
+            "no new part, nothing left over"
         );
-        assert_eq!(rows(&p), before);
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
-            "#hdr\n#_defaults_#\td1\td2\na\t1\n",
-            "kept (§19.5 keep)"
+            "#hdr\n#_version_#\t1\n#_defaults_#\td1\td2\na\t3\td2\n"
         );
-        // Appends still go to the active part, after the snapshot.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
+            "b\t2\na\n"
+        );
+        assert_eq!(rows(&p), before);
+        // Appends still go to the active part, after the compacted one.
         crate::Writer::open(&p)
             .unwrap()
             .append(&[crate::Record::Data {
@@ -1002,25 +1109,18 @@ mod tests {
                 values: vec!["9".into()],
             }])
             .unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
-            "b\t2\na\na\t9\n"
-        );
         assert_eq!(rows(&p), [["b", "2", "d2"], ["a", "9", "d2"]]);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged);
     }
 
     #[test]
-    fn the_rotate_marker_renames_or_deletes_the_parts_a_snapshot_subsumes() {
-        let renamed = [
-            "s.tsvz.3.rotated.gz",
-            "s.tsvz.5.gz",
-            "s.tsvz.8",
-            "s.tsvz.rotated",
+    fn the_rotate_marker_renames_deletes_or_keeps_the_other_parts_compacted() {
+        let cases = [
+            ("rename", &["s.tsvz.3.gz", "s.tsvz.8", "s.tsvz.rotated"][..]),
+            ("delete", &["s.tsvz.3.gz", "s.tsvz.8"][..]),
+            ("keep", &["s.tsvz", "s.tsvz.3.gz", "s.tsvz.8"][..]),
         ];
-        for (action, left) in [
-            ("rename", &renamed[..]),
-            ("delete", &["s.tsvz.5.gz", "s.tsvz.8"][..]),
-        ] {
+        for (action, left) in cases {
             let dir = tempfile::tempdir().unwrap();
             let p = dir.path().join("s.tsvz");
             fs::write(&p, format!("#_rotate_#\t{action}\na\t1\n")).unwrap();
@@ -1029,13 +1129,14 @@ mod tests {
             fs::write(dir.path().join("s.tsvz.8"), "c\t3\na\n").unwrap();
             let before = rows(&p);
             assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written, "{action}");
-            let mut want: Vec<String> = left.iter().map(|s| s.to_string()).collect();
-            want.sort();
-            assert_eq!(files(dir.path()), want, "{action}");
+            assert_eq!(files(dir.path()), left, "{action}");
             assert_eq!(rows(&p), before, "{action}");
-            // The snapshot is compressed as the last part it subsumes was.
-            let snapshot = fs::read(dir.path().join("s.tsvz.5.gz")).unwrap();
-            assert_eq!(&snapshot[..2], b"\x1f\x8b", "{action}");
+            // The part compacted into keeps its codec and holds every row it subsumes.
+            let gz = fs::read(dir.path().join("s.tsvz.3.gz")).unwrap();
+            assert_eq!(&gz[..2], b"\x1f\x8b", "{action}");
+            let alone = Store::open(dir.path().join("s.tsvz.3.gz"), opts()).unwrap();
+            let keys: Vec<&str> = alone.iter().map(|(k, _)| k).collect();
+            assert_eq!(keys, ["a", "b"], "{action}");
         }
     }
 
@@ -1064,48 +1165,13 @@ mod tests {
         fs::write(dir.path().join("s.tsvz.4"), "b\t2\n").unwrap();
         assert!(matches!(scrub(&p, &opts()), Err(Error::Io { .. })));
         assert_eq!(files(dir.path()), ["s.tsvz", "s.tsvz.1", "s.tsvz.4"]);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\n");
     }
 
     #[test]
-    fn the_snapshot_takes_the_mode_of_the_part_it_continues() {
+    fn the_part_compacted_into_is_never_more_readable_than_a_part_it_holds_rows_of() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("s.tsvz");
-        fs::write(&p, "a\t1\n").unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
-        fs::write(dir.path().join("s.tsvz.2"), "b\t2\n").unwrap();
-        scrub(&p, &opts()).unwrap();
-        let meta = fs::metadata(dir.path().join("s.tsvz.0")).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
-        assert_eq!(meta.uid(), fs::metadata(&p).unwrap().uid());
-        assert!(
-            !files(dir.path()).iter().any(|n| n.starts_with('.')),
-            "no temporary file is left"
-        );
-    }
-
-    #[test]
-    fn a_second_scrub_needs_a_free_ordinal_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("s.tsvz");
-        fs::write(&p, "a\t1\n").unwrap();
-        fs::write(dir.path().join("s.tsvz.10"), "b\t2\n").unwrap();
-        scrub(&p, &opts()).unwrap();
-        scrub(&p, &opts()).unwrap();
-        scrub(&p, &opts()).unwrap();
-        // .07 between part 0 and .10, then .0b between .07 and .10, then .0d.
-        assert_eq!(
-            files(dir.path()),
-            ["s.tsvz", "s.tsvz.07", "s.tsvz.0b", "s.tsvz.0d", "s.tsvz.10"]
-        );
-        assert_eq!(rows(&p), [["a", "1"], ["b", "2"]]);
-    }
-
-    #[test]
-    fn a_snapshot_is_never_more_readable_than_a_part_it_holds_rows_of() {
-        use std::os::unix::fs::PermissionsExt;
-        // Part 0 is private; the last part before the active one is not: the snapshot holds
-        // part 0's rows, so it takes the most restrictive of their modes.
+        // Part 0 is private; the part compacted into is not: it ends as private as part 0.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "secret\t1\n").unwrap();
@@ -1115,26 +1181,61 @@ mod tests {
         fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(dir.path().join("s.tsvz.8"), "c\t3\n").unwrap();
         scrub(&p, &opts()).unwrap();
-        let mode = fs::metadata(dir.path().join("s.tsvz.5"))
-            .unwrap()
-            .permissions()
-            .mode();
+        let mode = fs::metadata(&open).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode {:o}", mode & 0o777);
+        assert!(fs::read_to_string(&open).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn a_damaged_prefix_is_backed_up_and_never_deleted() {
+        // Recovered damage (a corrupt member under `recover`): the rewritten part is copied first
+        // and `delete` is downgraded to `rename` (§19.5), so no damaged byte is destroyed.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_rotate_#\tdelete\na\t1\n").unwrap();
+        let mut bad = crate::codec::encode_member(crate::name::Codec::Gzip, b"b\t2\n").unwrap();
+        let n = bad.len();
+        bad[n - 8] ^= 1; // a CRC mismatch: corrupt, but what it decoded is used
+        fs::write(dir.path().join("s.tsvz.2.gz"), &bad).unwrap();
+        fs::write(dir.path().join("s.tsvz.5"), "c\t3\n").unwrap();
+        let before = rows(&p);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let names = files(dir.path());
+        assert!(names.contains(&"s.tsvz.rotated".to_string()), "{names:?}");
+        let copy = names
+            .iter()
+            .find(|n| n.contains(".damaged-"))
+            .expect("a backup");
+        assert_eq!(fs::read(dir.path().join(copy)).unwrap(), bad);
+        assert_eq!(rows(&p), before);
+    }
+
+    #[test]
+    fn no_recovery_copy_is_left_after_a_scrub() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\na\t2\n").unwrap();
+        scrub(&p, &opts()).unwrap();
+        fs::write(dir.path().join("s.tsvz.4"), "b\t2\nb\t3\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.9"), "c\t3\n").unwrap();
+        scrub(&p, &opts()).unwrap();
+        assert_eq!(files(dir.path()), ["s.tsvz", "s.tsvz.4", "s.tsvz.9"]);
     }
 
     #[test]
     fn a_rewrite_whose_old_bytes_cannot_be_put_back_says_the_part_is_damaged() {
         let p = Path::new("s.tsvz");
+        let copy = Path::new("s.tsvz.scrub-copy.tsvz");
         let full = || io::Error::new(io::ErrorKind::StorageFull, "no space left");
         let mut calls = Vec::new();
-        replace(p, b"new", b"old", |b| {
+        replace(p, b"new", b"old", None, |b| {
             calls.push(b.to_vec());
             Ok(())
         })
         .unwrap();
         assert_eq!(calls, [b"new".to_vec()], "a rewrite that works writes once");
         calls.clear();
-        let e = replace(p, b"new", b"old", |b| {
+        let e = replace(p, b"new", b"old", Some(copy), |b| {
             calls.push(b.to_vec());
             if b == b"new" { Err(full()) } else { Ok(()) }
         })
@@ -1144,12 +1245,102 @@ mod tests {
             [b"new".to_vec(), b"old".to_vec()],
             "the old bytes go back"
         );
-        assert!(!e.to_string().contains("damaged"), "{e}");
-        let e = replace(p, b"new", b"old", |_| Err(full())).unwrap_err();
+        assert!(!e.to_string().contains("damaged") && !damaged(&e), "{e}");
+        let e = replace(p, b"new", b"old", Some(copy), |_| Err(full())).unwrap_err();
         let text = e.to_string();
         assert!(
             text.contains("s.tsvz") && text.contains("the part is damaged"),
             "{text}"
         );
+        assert!(text.contains("s.tsvz.scrub-copy.tsvz"), "{text}");
+        assert!(
+            damaged(&e),
+            "scrub keeps the recovery copy of a damaged part"
+        );
+    }
+
+    #[test]
+    fn scrub_refuses_to_rewrite_parts_that_declare_a_newer_spec_version() {
+        // This tsvz reads version-2 lines as version 1 (§6.3); a rewrite would make that
+        // degraded reading permanent for every reader.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_version_#\t2\na\t1\n").unwrap();
+        let e = scrub(&p, &opts()).unwrap_err();
+        assert!(matches!(e, Error::Refused(_)), "{e}");
+        assert!(e.to_string().contains("version 2"), "{e}");
+        assert_eq!(fs::read(&p).unwrap(), b"#_version_#\t2\na\t1\n");
+        // Declared in the parts to compact, even when set back to 1 later.
+        fs::write(dir.path().join("s.tsvz.1"), "#_version_#\t1\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "c\t3\n").unwrap();
+        assert!(matches!(scrub(&p, &opts()), Err(Error::Refused(_))));
+        assert_eq!(
+            fs::read(dir.path().join("s.tsvz.1")).unwrap(),
+            b"#_version_#\t1\nb\t2\n"
+        );
+        // Declared only in the active part, which a scrub never rewrites: compacted.
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "#_version_#\t2\nc\t3\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+    }
+
+    #[test]
+    fn the_guard_reads_the_new_content_after_the_parts_left_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "a\n").unwrap();
+        let s = Store::open_prefix(&p, opts(), 2).unwrap();
+        let earlier = || Store::open_prefix(&p, opts(), 1).unwrap();
+        let copy = dir.path().join("copy.tsvz");
+        // A plain snapshot reads right alone but brings `a` back after the part before it.
+        fs::write(&copy, snapshot(&s)).unwrap();
+        assert!(reads_as(&copy, &s));
+        assert!(
+            !reads_as_after(earlier(), &copy, &s),
+            "seed 107: `a` resurrects"
+        );
+        fs::write(&copy, restating_snapshot(&s, &earlier())).unwrap();
+        assert!(reads_as(&copy, &s));
+        assert!(reads_as_after(earlier(), &copy, &s));
+    }
+
+    #[test]
+    fn compacting_into_the_last_part_keeps_what_the_parts_before_it_read_as() {
+        // The parts before the one compacted into are still read first (#_rotate_# keep): what
+        // that part deleted, re-ordered or reset must stay so (difftest seed 107).
+        for (first, last) in [
+            ("a\t1\nb\t2\n", "a\n"),
+            ("x\t1\ny\t2\n", "x\nx\t3\n"),
+            (
+                "#_fill_empty_with_default_#\ttrue\n#_defaults_#\td\na\t\n",
+                "#_fill_empty_with_default_#\n#_defaults_#\nb\t\n",
+            ),
+            (
+                "k \tv\n#_strip_trailing_whites_#\tfalse\nk \tw\n",
+                "#_strip_trailing_whites_#\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, first).unwrap();
+            fs::write(dir.path().join("s.tsvz.1"), last).unwrap();
+            fs::write(dir.path().join("s.tsvz.2"), "z\t9\nc\t\n").unwrap();
+            let before = rows(&p);
+            let markers = Store::open(&p, opts()).unwrap().markers().clone();
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written, "{first:?}");
+            assert_eq!(rows(&p), before, "{first:?} then {last:?}");
+            assert_eq!(
+                Store::open(&p, opts()).unwrap().markers(),
+                &markers,
+                "{first:?}"
+            );
+            // Read alone, as a reader starting at it would, it holds the same rows.
+            let alone = Store::open(dir.path().join("s.tsvz.1"), opts()).unwrap();
+            let all = Store::open_prefix(&p, opts(), 2).unwrap();
+            assert_eq!(trimmed_rows(&alone), trimmed_rows(&all), "{first:?}");
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged, "{first:?}");
+        }
     }
 }

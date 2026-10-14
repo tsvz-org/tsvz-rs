@@ -153,6 +153,8 @@ def make(rng, directory):
         if rng.random() < 0.3:
             suffix = rng.choice(sorted(CODECS))
             name, data = name + '.' + suffix, compressed_part(rng, data, suffix)
+            if name == 's.%s.%s' % (ext, suffix):
+                store = os.path.join(directory, name)  # a compressed part 0 is named by its path
         with open(os.path.join(directory, name), 'wb') as f:
             f.write(data)
     return store, d
@@ -243,16 +245,19 @@ def trimmed(output, delimiter):
 
 
 def check_scrub(rust, python, store, delimiter, directory):
-    """(refused, problems) of scrubbing a copy of the store: TSVZ.py and tsvz-rs must read the
-    copy as they read the original."""
+    """(why it was refused or None, problems) of scrubbing a copy of the store: TSVZ.py and
+    tsvz-rs must read the copy as they read the original. A refusal by scrub's own fidelity
+    guard is a problem: the content it built would have read differently."""
     copy = directory + '-scrubbed'
     shutil.copytree(directory, copy)
     try:
         scrubbed = os.path.join(copy, os.path.basename(store))
         done = subprocess.run(rust + ['-q', 'scrub', scrubbed], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=60)
+                              stderr=subprocess.PIPE, timeout=60)
         if done.returncode != 0:
-            return True, []
+            lines = done.stderr.decode(errors='replace').strip().split('\n')
+            why = lines[-1].partition('scrub skipped: ')[2] or lines[-1].replace(copy, '<store>')
+            return why, ['  scrub refused by its fidelity guard: %s' % why] if 'please report' in why else []
         problems = []
         for who, command in (('TSVZ.py', python), ('tsvz-rs', rust)):
             for op in (['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp']):
@@ -260,7 +265,7 @@ def check_scrub(rust, python, store, delimiter, directory):
                 if (before[0], trimmed(before[1], delimiter)) != (after[0], trimmed(after[1], delimiter)):
                     problems.append('  scrub, then %s %s: before %s %r\n%s after %s %r' % (
                         who, ' '.join(op), before[0], before[1][:300], ' ' * (len(who) + 13), after[0], after[1][:300]))
-        return False, problems
+        return None, problems
     finally:
         shutil.rmtree(copy, ignore_errors=True)
 
@@ -293,7 +298,7 @@ def main():
         python.append('--x-direct')  # the files, not the handler that serves them
     keep = args.keep or tempfile.mkdtemp(prefix='difftest-')
     failed = 0
-    refused = 0
+    refused = {}
     seen = {}
     ops = [['read'], ['len'], ['keys'], ['verify'], ['parts'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp'],
            ['read', '-d', 'comma']]
@@ -322,8 +327,9 @@ def main():
             if handler is not None:
                 unserve(rust, store, handler)
             if args.scrub:
-                was_refused, scrub_problems = check_scrub(rust, python, store, delimiter, directory)
-                refused += was_refused
+                why, scrub_problems = check_scrub(rust, python, store, delimiter, directory)
+                if why is not None:
+                    refused[why] = refused.get(why, 0) + 1
                 problems += scrub_problems
             if problems:
                 failed += 1
@@ -335,7 +341,9 @@ def main():
     for reason, count in seen.items():
         print('known TSVZ.py difference, %d times: %s' % (count, reason))
     if args.scrub:
-        print('%d scrubs refused (not compared)' % refused)
+        print('%d scrubs refused (not compared)' % sum(refused.values()))
+        for why, count in sorted(refused.items(), key=lambda r: -r[1]):
+            print('  %d: %s' % (count, why))
     print('%d of %d seeds disagree' % (failed, end - start))
     return 1 if failed else 0
 

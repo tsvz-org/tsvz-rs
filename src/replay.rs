@@ -165,6 +165,8 @@ pub struct Replay {
     pub damaged: bool,
     /// The read met a checksum marker of a known algorithm (§15), verified or not.
     pub checksums: bool,
+    /// The highest spec version a `#_version_#` line declared (1 when none did, §6).
+    pub newest: u64,
     /// The first committed line of the first part, when it is a comment (§19.2.3c).
     pub header: Option<String>,
     /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
@@ -199,6 +201,9 @@ fn set_bool(slot: &mut bool, default: bool, lower: &str) -> bool {
 }
 
 /// An integer marker value: ASCII digits only, at least 1 (§12.4.1).
+/// The highest tsvz-spec version this crate implements (§6.3).
+pub(crate) const SPEC_VERSION: u64 = 1;
+
 fn positive(value: &str) -> Option<u64> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -218,6 +223,7 @@ impl Replay {
             stopped: None,
             damaged: false,
             checksums: false,
+            newest: 1,
             header: None,
             width: None,
             first_line: false,
@@ -397,6 +403,7 @@ impl Replay {
                 }
                 (_, Some(n)) => {
                     m.version = n;
+                    self.newest = self.newest.max(n);
                     true
                 }
                 _ => false,
