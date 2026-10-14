@@ -315,15 +315,24 @@ fn refuse(mut stream: UnixStream) {
     refuse_within(&mut stream, Duration::from_millis(200));
 }
 
-/// [`refuse`], waiting at most `patience` for the client to close.
+/// [`refuse`], waiting at most `patience` in all for the client to close (a client that sends
+/// a byte now and then gets no more time), and reading at most 64 KiB of its request.
 fn refuse_within(stream: &mut UnixStream, patience: Duration) {
     let _ = stream.write_all(&Response::failed(1, "the handler is stopping").encode());
     let _ = stream.shutdown(std::net::Shutdown::Write);
     // Closing with the request unread would reset the connection, and the answer with it: read
     // and drop what the client sent, for a moment, until it closes.
-    let _ = stream.set_read_timeout(Some(patience.max(Duration::from_millis(1))));
+    let deadline = Instant::now() + patience;
     let mut sink = [0u8; 4096];
-    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+    for _ in 0..16 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        if !matches!(stream.read(&mut sink), Ok(n) if n > 0) {
+            break;
+        }
+    }
 }
 
 /// Refuse the clients still waiting in the listen queue, rather than reset them as closing the
@@ -659,6 +668,26 @@ mod tests {
             b"",
             "nothing written"
         );
+    }
+
+    #[test]
+    fn a_client_sending_slowly_cannot_hold_a_refusal() {
+        // The wait is one deadline, not a timeout per read that a trickle of bytes renews.
+        let (mut client, mut end) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        refuse_within(&mut end, Duration::from_millis(200));
+        let took = started.elapsed();
+        drop(end);
+        trickle.join().unwrap();
+        assert!(took < Duration::from_millis(600), "held for {took:?}");
     }
 
     #[test]
