@@ -96,14 +96,10 @@ fn wait_for_signal(set: libc::sigset_t, shared: Arc<Shared>, info: InfoFn) {
     }
 }
 
-/// A new directory for the socket: under `$XDG_RUNTIME_DIR` when it is a writable directory and
-/// the socket is private, else under the temporary directory (others cannot enter a private
-/// runtime directory).
+/// A new directory for the socket, under [`socket_base`].
 fn socket_dir(shared: bool) -> Result<PathBuf, Error> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|d| !shared && d.is_dir() && writable(d));
-    let base = runtime.unwrap_or_else(std::env::temp_dir);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let base = socket_base(runtime, std::env::temp_dir(), shared);
     let template = base.join("tsvz-XXXXXX");
     let mut bytes = template.as_os_str().as_bytes().to_vec();
     bytes.push(0);
@@ -114,6 +110,16 @@ fn socket_dir(shared: bool) -> Result<PathBuf, Error> {
     }
     bytes.pop();
     Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// Where socket directories go: the runtime directory when it is an absolute, writable directory
+/// and the socket is private (others cannot enter a private runtime directory), else the
+/// temporary directory, made absolute: the published address must mean the same to every client.
+fn socket_base(runtime: Option<PathBuf>, temp: PathBuf, shared: bool) -> PathBuf {
+    match runtime.filter(|d| !shared && d.is_absolute() && d.is_dir() && writable(d)) {
+        Some(dir) => dir,
+        None => std::path::absolute(&temp).unwrap_or_else(|_| PathBuf::from("/tmp")),
+    }
 }
 
 fn writable(dir: &Path) -> bool {
@@ -470,6 +476,21 @@ pub fn stop(store: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn the_socket_directory_is_always_absolute() {
+        // Clients resolve the published address from their own working directory.
+        let base = socket_base(Some("run".into()), "tmp".into(), false);
+        assert!(base.is_absolute() && base.ends_with("tmp"), "{base:?}");
+        let runtime = tempfile::tempdir().unwrap();
+        let own = Some(runtime.path().to_path_buf());
+        assert_eq!(socket_base(own.clone(), "/t".into(), false), runtime.path());
+        assert_eq!(
+            socket_base(own, "/t".into(), true),
+            Path::new("/t"),
+            "shared: not private"
+        );
+    }
 
     #[test]
     fn a_connection_that_gets_no_thread_is_closed_and_serving_goes_on() {

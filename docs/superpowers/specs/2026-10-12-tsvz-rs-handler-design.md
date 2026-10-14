@@ -287,9 +287,10 @@ read or write raised. Each warning also goes to `serve`'s stderr (unless `-q`).
    the store if it is missing and loads it.
 4. Binds the socket at `DIR/s`, where DIR is a new `tsvz-XXXXXX` directory made
    by `mkdtemp`:
-   - under `$XDG_RUNTIME_DIR` when it is a writable directory and neither
-     `--x-group` nor `--x-mode` is given; otherwise under `$TMPDIR`, else `/tmp`
-     (others cannot enter a private runtime directory);
+   - under `$XDG_RUNTIME_DIR` when it is an absolute, writable directory and neither
+     `--x-group` nor `--x-mode` is given; otherwise under `$TMPDIR` made absolute, else
+     `/tmp` (others cannot enter a private runtime directory; the published address must
+     mean the same to every client);
    - the socket's mode is 0600 by default, 0660 with `--x-group G`, or
      `--x-mode M` (octal); with `--x-group` the directory and socket get group G;
    - DIR is 0700, plus group or other search permission when the socket's mode
