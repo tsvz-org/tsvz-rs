@@ -257,6 +257,53 @@ fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
 }
 
 #[test]
+fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
+    // A pop answered after its tombstone is written must reach its client, or not be made:
+    // a stop lets requests already read finish and answer, and refuses the ones after.
+    let dir = tempfile::tempdir().unwrap();
+    let rows = 100_000;
+    let mut content = String::from("#_write_ack_#\tdisk\n");
+    for i in 0..rows {
+        content.push_str(&format!("k{i}\tv{i}\n"));
+    }
+    let s = store(dir.path(), &content);
+    let mut served = Served::start(&s, &[]);
+    let consumers: Vec<_> = (0..4)
+        .map(|_| {
+            let mut client = tsvz::handler::Client::connect(&s).unwrap();
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while let Ok(Some(row)) = client.popitem(false) {
+                    got.push(row[0].clone());
+                }
+                got
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
+    assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
+    let answered: Vec<String> = consumers
+        .into_iter()
+        .flat_map(|c| c.join().unwrap())
+        .collect();
+    assert_eq!(served.wait(), 0, "{}", served.stderr());
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    let answered: std::collections::HashSet<String> = answered.into_iter().collect();
+    let lost: Vec<String> = (0..rows)
+        .map(|i| format!("k{i}"))
+        .filter(|k| !answered.contains(k) && left.get(k).is_none())
+        .collect();
+    assert!(!left.is_empty(), "stopped before the queue was empty");
+    assert!(
+        answered.len() > 10,
+        "the consumers popped: {}",
+        answered.len()
+    );
+    assert!(lost.is_empty(), "deleted and never answered: {lost:?}");
+}
+
+#[test]
 fn a_second_serve_exits_1_and_the_first_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "k\tv\n");

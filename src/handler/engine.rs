@@ -745,6 +745,12 @@ impl Engine {
         self.batcher.flush().map_err(Error::Refused)
     }
 
+    /// Refuse every request from now on ("the handler is stopping"); requests already past that
+    /// point finish, and the writer thread goes on writing what they queue.
+    pub fn refuse(&self) {
+        lock(&self.state).closed = true;
+    }
+
     /// Answer no more requests; write and fsync everything queued, and end the writer thread.
     pub fn close(&self) {
         lock(&self.state).closed = true;
