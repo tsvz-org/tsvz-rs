@@ -312,27 +312,45 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
 /// Tell a client the handler is stopping, before reading anything of its request: nothing of it
 /// is made, and the client knows so.
 fn refuse(mut stream: UnixStream) {
+    refuse_within(&mut stream, Duration::from_millis(200));
+}
+
+/// [`refuse`], waiting at most `patience` for the client to close.
+fn refuse_within(stream: &mut UnixStream, patience: Duration) {
     let _ = stream.write_all(&Response::failed(1, "the handler is stopping").encode());
     let _ = stream.shutdown(std::net::Shutdown::Write);
     // Closing with the request unread would reset the connection, and the answer with it: read
     // and drop what the client sent, for a moment, until it closes.
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = stream.set_read_timeout(Some(patience.max(Duration::from_millis(1))));
     let mut sink = [0u8; 4096];
     while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
 }
 
 /// Refuse the clients still waiting in the listen queue, rather than reset them as closing the
-/// listener would: a reset leaves a client unsure whether its request was made.
+/// listener would: a reset leaves a client unsure whether its request was made. At most
+/// [`QUEUED`] clients, within [`REFUSING`]: clients that keep connecting cannot hold a stop.
 fn refuse_queued(listener: &UnixListener) {
     if listener.set_nonblocking(true).is_err() {
         return;
     }
-    while let Ok((stream, _)) = listener.accept() {
+    let deadline = Instant::now() + REFUSING;
+    for _ in 0..QUEUED {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
         if stream.set_nonblocking(false).is_ok() {
-            refuse(stream);
+            refuse_within(&mut stream, left.min(Duration::from_millis(200)));
         }
     }
 }
+
+/// The most queued clients a stop refuses, and how long it spends on them.
+const QUEUED: usize = 128;
+const REFUSING: Duration = Duration::from_secs(1);
 
 /// How long a stop waits for the requests already read to be answered.
 const FINISH: Duration = Duration::from_secs(5);
@@ -641,6 +659,36 @@ mod tests {
             b"",
             "nothing written"
         );
+    }
+
+    #[test]
+    fn refusing_the_queued_clients_ends_even_when_they_keep_coming() {
+        // A client connecting again and again must not keep a handler from stopping.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let flooding = Arc::new(AtomicBool::new(true));
+        let flood = {
+            let (path, flooding) = (path.clone(), flooding.clone());
+            std::thread::spawn(move || {
+                while flooding.load(Ordering::SeqCst) {
+                    if let Ok(mut c) = UnixStream::connect(&path) {
+                        let _ = c.write_all(b"len\n"); // and keep it open, unread
+                        std::mem::forget(c);
+                    }
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            refuse_queued(&listener);
+            let _ = done.send(());
+        });
+        let ended = finished.recv_timeout(Duration::from_secs(3));
+        flooding.store(false, Ordering::SeqCst);
+        flood.join().unwrap();
+        assert!(ended.is_ok(), "refusing queued clients never ended");
     }
 
     #[test]
