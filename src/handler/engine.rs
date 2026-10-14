@@ -7,7 +7,7 @@
 //! reader of the files returns (§21.8.5). Requests are serialized by one mutex; acknowledgements
 //! are waited for outside it.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -24,8 +24,6 @@ use crate::{Error, Options, Scope, Store, WarnFn, Warning, escape, parts};
 pub const NO_STORE: &str = "no such store";
 /// The message of a read that skipped a part or stopped at damaged data (§21.8.5).
 pub const INCOMPLETE: &str = "could not read every part of the store";
-/// Batch failures remembered for the requests that wait on them.
-const FAILURES: usize = 64;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -35,6 +33,8 @@ struct Entry {
     seq: u64,
     payload: Vec<u8>,
     durable: bool,
+    /// A request waits for its outcome.
+    waited: bool,
 }
 
 #[derive(Default)]
@@ -43,9 +43,9 @@ struct Queue {
     member_size: u64,
     submitted: u64,
     written: u64,
-    durable: u64,
-    /// (first seq, last seq, error) of failed batches.
-    failures: VecDeque<(u64, u64, String)>,
+    /// The outcome of each waited entry once its batch is written (and fsync'd when durable),
+    /// until its request takes it.
+    outcomes: HashMap<u64, Result<(), String>>,
     /// The last batch's error, until a batch is written again.
     failing: Option<String>,
     /// The part the last batch went to and its stamp just after; None before the first batch
@@ -70,7 +70,8 @@ struct Batcher {
 
 impl Batcher {
     /// Queue `payload` (records encoded for the store, each ending in `\n`); its sequence number.
-    fn submit(&self, payload: Vec<u8>, durable: bool, member_size: u64) -> u64 {
+    /// A `waited` entry's outcome is kept for [`Batcher::wait`].
+    fn submit(&self, payload: Vec<u8>, durable: bool, member_size: u64, waited: bool) -> u64 {
         let mut q = lock(&self.queue);
         q.submitted += 1;
         let seq = q.submitted;
@@ -79,20 +80,21 @@ impl Batcher {
             seq,
             payload,
             durable,
+            waited,
         });
         self.changed.notify_all();
         seq
     }
 
-    /// Wait until entry `seq` is written (`durable`: and fsync'd); its batch's error, if any.
-    fn wait(&self, seq: u64, durable: bool) -> Result<(), String> {
+    /// Wait for the outcome of the waited entry `seq`: written (and fsync'd when durable), or
+    /// its batch's error.
+    fn wait(&self, seq: u64) -> Result<(), String> {
         let mut q = lock(&self.queue);
-        while (if durable { q.durable } else { q.written }) < seq {
+        loop {
+            if let Some(outcome) = q.outcomes.remove(&seq) {
+                return outcome;
+            }
             q = self.changed.wait(q).unwrap_or_else(|e| e.into_inner());
-        }
-        match q.failures.iter().find(|f| f.0 <= seq && seq <= f.1) {
-            Some(f) => Err(f.2.clone()),
-            None => Ok(()),
         }
     }
 
@@ -132,8 +134,6 @@ impl Batcher {
         if q.unsynced {
             self.fsync().map_err(|e| e.to_string())?;
             q.unsynced = false;
-            q.durable = q.written;
-            self.changed.notify_all();
         }
         Ok(())
     }
@@ -164,7 +164,7 @@ impl Batcher {
                 (std::mem::take(&mut q.entries), q.member_size)
             };
             let durable = batch.iter().any(|e| e.durable);
-            let (first, last) = (batch[0].seq, batch[batch.len() - 1].seq);
+            let last = batch[batch.len() - 1].seq;
             let mut payload = Vec::with_capacity(batch.iter().map(|e| e.payload.len()).sum());
             for e in &batch {
                 payload.extend_from_slice(&e.payload);
@@ -177,6 +177,10 @@ impl Batcher {
             });
             let mut q = lock(&self.queue);
             q.written = last;
+            let outcome = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+            for e in batch.iter().filter(|e| e.waited) {
+                q.outcomes.insert(e.seq, outcome.clone());
+            }
             match result {
                 Ok(appended) => {
                     let ours = q
@@ -188,9 +192,7 @@ impl Batcher {
                     }
                     q.own = Some((appended.part, appended.after));
                     q.failing = None;
-                    if durable {
-                        q.durable = last;
-                    } else {
+                    if !durable {
                         q.unsynced = true;
                     }
                 }
@@ -203,11 +205,6 @@ impl Batcher {
                             offset: None,
                             message: format!("a batch of {} writes failed: {message}", batch.len()),
                         });
-                    }
-                    q.durable = last;
-                    q.failures.push_back((first, last, message.clone()));
-                    if q.failures.len() > FAILURES {
-                        q.failures.pop_front();
                     }
                     q.failing = Some(message);
                 }
@@ -308,7 +305,8 @@ fn queued<T>(slot: Option<(u64, T)>, reflected: u64) -> Option<T> {
 
 struct Queued {
     seq: u64,
-    durable: bool,
+    /// The request waits for its outcome ([`Batcher::wait`]).
+    waited: bool,
 }
 
 /// One store's handler state: the store as its files give it, and its writer thread.
@@ -434,13 +432,15 @@ impl Engine {
 
     /// Encode `records` for the store and queue them; None when there is nothing to write.
     /// Whether the write is made durable, and its member size, follow the markers as they stand
-    /// where it will be appended: the files followed now, then the markers still queued.
+    /// where it will be appended: the files followed now, then the markers still queued. The
+    /// request waits for a durable write, and for any when `written`.
     fn submit(
         &self,
         st: &mut State,
         records: &[Record],
         sync: bool,
         member_size: Option<u64>,
+        written: bool,
     ) -> Result<Option<Queued>, Error> {
         let mut payload = String::new();
         for r in records {
@@ -468,9 +468,10 @@ impl Engine {
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
         let durable = sync || ack == Some("disk");
+        let waited = durable || written;
         let seq = self
             .batcher
-            .submit(payload.into_bytes(), durable, member_size);
+            .submit(payload.into_bytes(), durable, member_size, waited);
         for r in records {
             let Record::Marker { key, values } = r else {
                 continue;
@@ -487,7 +488,7 @@ impl Engine {
                 _ => {}
             }
         }
-        Ok(Some(Queued { seq, durable }))
+        Ok(Some(Queued { seq, waited }))
     }
 
     /// Answer one request (§21.7). Every failure is a status: the handler keeps serving
@@ -585,14 +586,12 @@ impl Engine {
                     }
                     None => ops::delete_records(&records, d, true, |_| false),
                 };
-                return self.submit(st, &records, req.sync, None);
+                return self.submit(st, &records, req.sync, None, req.written);
             }
-            self.submit(st, &records, req.sync, None)
+            self.submit(st, &records, req.sync, None, req.written)
         });
         let result = result.and_then(|queued| match queued {
-            Some(q) if q.durable || req.written => {
-                self.batcher.wait(q.seq, q.durable).map_err(Error::Refused)
-            }
+            Some(q) if q.waited => self.batcher.wait(q.seq).map_err(Error::Refused),
             _ => Ok(()),
         });
         Engine::answer(result.map(|()| Response::status(0)), said)
@@ -621,7 +620,7 @@ impl Engine {
                     records,
                     member_size,
                 } => {
-                    let queued = self.submit(st, &records, req.sync, Some(member_size))?;
+                    let queued = self.submit(st, &records, req.sync, Some(member_size), true)?;
                     (Engine::row(&key, &cells), queued)
                 }
                 Plan::Put {
@@ -630,7 +629,7 @@ impl Engine {
                     record,
                     member_size,
                 } => {
-                    let queued = self.submit(st, &[record], req.sync, Some(member_size))?;
+                    let queued = self.submit(st, &[record], req.sync, Some(member_size), true)?;
                     (Engine::row(&key, &cells), queued)
                 }
             })
@@ -639,7 +638,7 @@ impl Engine {
         let result = result.and_then(|(response, queued)| match queued {
             Some(q) => self
                 .batcher
-                .wait(q.seq, q.durable)
+                .wait(q.seq)
                 .map(|()| response)
                 .map_err(Error::Refused),
             None => Ok(response),
@@ -927,7 +926,10 @@ mod tests {
         let e = engine(dir.path(), "s.tsvz");
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
-            e.submit(&mut st, records, false, None).unwrap().unwrap()
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, records, false, None, false)
+                .unwrap()
+                .unwrap()
         };
         let data = || {
             [Record::Data {
@@ -948,13 +950,13 @@ mod tests {
             .unwrap()
             .write_all(b"#_write_ack_#\tdisk\n")
             .unwrap();
-        assert!(submit(&data()).durable, "a marker another writer appended");
+        assert!(submit(&data()).waited, "a marker another writer appended");
         // Markers queued but not yet written (the writer waits for the lock) govern what follows.
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file, &p).unwrap();
         submit(&marker("#_WRITE_ACK_#", "Memory"));
         submit(&marker("#_member_size_#", "7"));
-        assert!(!submit(&data()).durable, "#_write_ack_# memory, queued");
+        assert!(!submit(&data()).waited, "#_write_ack_# memory, queued");
         assert_eq!(lock(&e.batcher.queue).member_size, 7);
         submit(&marker("#_member_size_#", "zero")); // invalid: ignored, as a reader ignores it
         submit(&data());
@@ -984,29 +986,32 @@ mod tests {
         };
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
-            e.submit(&mut st, records, false, None).unwrap().unwrap()
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, records, false, None, false)
+                .unwrap()
+                .unwrap()
         };
-        assert!(!submit(&data("x")).durable);
+        assert!(!submit(&data("x")).waited);
         e.batcher.barrier();
-        assert!(!submit(&data("y")).durable);
+        assert!(!submit(&data("y")).waited);
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file, &p).unwrap(); // y waits for the lock
-        assert!(!submit(&data("z")).durable);
+        assert!(!submit(&data("z")).waited);
         (&file).write_all(b"#_write_ack_#\tdisk\n").unwrap(); // before y is written
         drop(held);
         e.batcher.barrier();
         assert!(
-            submit(&data("w")).durable,
+            submit(&data("w")).waited,
             "written after y, but before it on file"
         );
         e.batcher.barrier();
         // After our last append: the part is no longer as we left it.
         (&file).write_all(b"#_write_ack_#\tmemory\n").unwrap();
-        assert!(!submit(&data("v")).durable, "appended after w");
+        assert!(!submit(&data("v")).waited, "appended after w");
         assert_eq!(ask(&e, "keys").lines, ["a", "x", "y", "z", "w", "v"]);
         // A new part: the directory changes.
         fs::write(dir.path().join("s.tsvz.1"), "#_write_ack_#\tdisk\n").unwrap();
-        assert!(submit(&data("u")).durable, "a part another writer added");
+        assert!(submit(&data("u")).waited, "a part another writer added");
         e.batcher.barrier();
         assert_eq!(
             fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
@@ -1027,7 +1032,10 @@ mod tests {
         let e = engine(dir.path(), "s.tsvz");
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
-            e.submit(&mut st, records, false, None).unwrap().unwrap()
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, records, false, None, false)
+                .unwrap()
+                .unwrap()
         };
         let data = [Record::Data {
             key: "k".into(),
@@ -1042,7 +1050,36 @@ mod tests {
             values: vec!["disk".into()],
         }]);
         e.batcher.barrier(); // written, but the store has not followed the files since
-        assert!(submit(&data).durable);
+        assert!(submit(&data).waited);
+    }
+
+    #[test]
+    fn a_failed_write_is_never_acknowledged_however_many_fail_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap(); // every append fails, even as root
+        let submit = |k: String, written: bool| {
+            let mut st = lock(&e.state);
+            let data = [Record::Data {
+                key: k,
+                values: vec!["v".into()],
+            }];
+            e.submit(&mut st, &data, false, None, written)
+                .unwrap()
+                .unwrap()
+        };
+        let first = submit("k0".into(), true);
+        e.batcher.barrier();
+        for i in 1..=100 {
+            submit(format!("k{i}"), i % 2 == 0); // a batch of its own, failing too
+            e.batcher.barrier();
+        }
+        assert!(e.batcher.wait(first.seq).is_err(), "its batch failed");
+        let q = lock(&e.batcher.queue);
+        assert_eq!(q.outcomes.len(), 50, "kept only for the requests that wait");
     }
 
     #[test]

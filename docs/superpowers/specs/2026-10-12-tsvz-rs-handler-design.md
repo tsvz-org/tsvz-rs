@@ -208,8 +208,11 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   entry of the batch is durable, the batch is fsync'd; otherwise the part is
   marked unsynced. A new batch starts as soon as the previous one ends, so
   concurrent producers share appends (§18.3).
-- `wait(seq, durable)` blocks until that entry is written (and fsync'd), and
-  returns its batch's error if the batch failed. `barrier()` waits until
+- An entry is submitted as waited when its request will wait for it (durable,
+  `--x-written`, `pop`, `popitem`, `setdefault`); the writer thread keeps the
+  outcome of each waited entry, after the batch is written (and fsync'd when
+  durable), until `wait(seq)` takes it: a failed write is never answered as
+  written, however many batches fail after it. `barrier()` waits until
   everything submitted is written. `flush()` waits, then fsyncs the active part
   when unsynced.
 - The thread never takes the engine mutex, so a request holding the mutex can
