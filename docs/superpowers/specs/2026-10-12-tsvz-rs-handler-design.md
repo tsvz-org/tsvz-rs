@@ -213,8 +213,10 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   outcome of each waited entry, after the batch is written (and fsync'd when
   durable), until `wait(seq)` takes it: a failed write is never answered as
   written, however many batches fail after it. `barrier()` waits until
-  everything submitted is written. `flush()` waits, then fsyncs the active part
-  when unsynced.
+  everything submitted is written. `flush()` waits, then fsyncs every part a
+  batch was appended to without an fsync since the last one, through the file it
+  was appended through (still right after a `rename` rotation); the writer thread
+  does the same as it ends.
 - The thread never takes the engine mutex, so a request holding the mutex can
   wait on it.
 - Whether an entry is durable (`#_write_ack_#`) and the member size used for a

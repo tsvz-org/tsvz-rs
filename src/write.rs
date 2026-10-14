@@ -160,12 +160,14 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
 ///
 /// Each append holds the write lock shared with TSVZ.py (see `lock`): where only a classic
 /// POSIX lock is available, closing another descriptor of the part in this process releases it.
-/// Where [`Writer::append_payload_at`] appended, and the part's stamp just before and after.
+/// Where [`Writer::append_payload_at`] appended, the part's stamp just before and after, and
+/// the file it appended through (still open: it syncs that file even once renamed).
 #[doc(hidden)]
 pub struct Appended {
     pub part: PathBuf,
     pub before: parts::Stamp,
     pub after: parts::Stamp,
+    pub file: File,
 }
 
 fn stamp(file: &File) -> io::Result<parts::Stamp> {
@@ -257,16 +259,20 @@ impl Writer {
                     .create(true)
                     .open(path)
                     .map_err(io)?;
-                let _guard = lock::lock(&file, path).map_err(io)?;
-                let before = stamp(&file).map_err(io)?;
-                (&file).write_all(&bytes).map_err(io)?;
-                if self.fsync {
-                    file.sync_data().map_err(io)?;
-                }
+                let (before, after) = {
+                    let _guard = lock::lock(&file, path).map_err(io)?;
+                    let before = stamp(&file).map_err(io)?;
+                    (&file).write_all(&bytes).map_err(io)?;
+                    if self.fsync {
+                        file.sync_data().map_err(io)?;
+                    }
+                    (before, stamp(&file).map_err(io)?)
+                };
                 Ok(Appended {
                     part: part.path.clone(),
                     before,
-                    after: stamp(&file).map_err(io)?,
+                    after,
+                    file,
                 })
             }
             None => {
@@ -276,17 +282,21 @@ impl Writer {
                     .create(true)
                     .open(path)
                     .map_err(io)?;
-                let _guard = lock::lock(&file, path).map_err(io)?;
-                let before = stamp(&file).map_err(io)?;
-                self.cut_torn_tail(&file, path).map_err(io)?;
-                (&file).write_all(payload).map_err(io)?;
-                if self.fsync {
-                    file.sync_data().map_err(io)?;
-                }
+                let (before, after) = {
+                    let _guard = lock::lock(&file, path).map_err(io)?;
+                    let before = stamp(&file).map_err(io)?;
+                    self.cut_torn_tail(&file, path).map_err(io)?;
+                    (&file).write_all(payload).map_err(io)?;
+                    if self.fsync {
+                        file.sync_data().map_err(io)?;
+                    }
+                    (before, stamp(&file).map_err(io)?)
+                };
                 Ok(Appended {
                     part: part.path.clone(),
                     before,
-                    after: stamp(&file).map_err(io)?,
+                    after,
+                    file,
                 })
             }
         }

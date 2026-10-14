@@ -8,6 +8,7 @@
 //! are waited for outside it.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -53,7 +54,9 @@ struct Queue {
     own: Option<(PathBuf, Stamp)>,
     /// How many batches found their part changed since the last one: other writers wrote.
     foreign: u64,
-    unsynced: bool,
+    /// Each part a batch was appended to without an fsync since, by path and inode, with the
+    /// file it was appended through.
+    unsynced: Vec<(PathBuf, u64, File)>,
     closing: bool,
 }
 
@@ -131,24 +134,23 @@ impl Batcher {
     fn flush(&self) -> Result<(), String> {
         self.barrier();
         let mut q = lock(&self.queue);
-        if q.unsynced {
-            self.fsync().map_err(|e| e.to_string())?;
-            q.unsynced = false;
-        }
+        sync(&q.unsynced).map_err(|e| e.to_string())?;
+        q.unsynced.clear();
         Ok(())
+    }
+
+    /// The parts awaiting an fsync.
+    #[cfg(test)]
+    fn unsynced(&self) -> Vec<PathBuf> {
+        lock(&self.queue)
+            .unsynced
+            .iter()
+            .map(|(part, _, _)| part.clone())
+            .collect()
     }
 
     fn failing(&self) -> Option<String> {
         lock(&self.queue).failing.clone()
-    }
-
-    fn fsync(&self) -> Result<(), Error> {
-        let part = parts::active(&self.store)?;
-        match std::fs::OpenOptions::new().append(true).open(&part.path) {
-            Ok(file) => file.sync_data().map_err(|e| Error::io(&part.path, e)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::io(&part.path, e)),
-        }
     }
 
     fn run(&self) {
@@ -190,11 +192,15 @@ impl Batcher {
                     if !ours {
                         q.foreign += 1;
                     }
+                    let (part, ino) = (appended.part.clone(), appended.after.ino);
+                    let listed = |(p, i, _): &(PathBuf, u64, File)| *p == part && *i == ino;
+                    if durable {
+                        q.unsynced.retain(|u| !listed(u)); // its fdatasync covers the file
+                    } else if !q.unsynced.iter().any(listed) {
+                        q.unsynced.push((part, ino, appended.file));
+                    }
                     q.own = Some((appended.part, appended.after));
                     q.failing = None;
-                    if !durable {
-                        q.unsynced = true;
-                    }
                 }
                 Err(e) => {
                     q.own = None;
@@ -211,19 +217,30 @@ impl Batcher {
             }
             self.changed.notify_all();
         }
-        let unsynced = lock(&self.queue).unsynced;
-        if unsynced {
-            if let Err(e) = self.fsync() {
-                if let Some(errors) = &self.errors {
-                    errors(&Warning {
-                        part: self.store.clone(),
-                        offset: None,
-                        message: format!("fsync failed: {e}"),
-                    });
-                }
+        let unsynced = std::mem::take(&mut lock(&self.queue).unsynced);
+        if let Err(e) = sync(&unsynced) {
+            if let Some(errors) = &self.errors {
+                errors(&Warning {
+                    part: self.store.clone(),
+                    offset: None,
+                    message: format!("fsync failed: {e}"),
+                });
             }
         }
     }
+}
+
+/// Fsync each of `files`; the first error, once every one was tried.
+fn sync(files: &[(PathBuf, u64, File)]) -> Result<(), Error> {
+    let mut first = Ok(());
+    for (part, _, file) in files {
+        if let Err(e) = file.sync_data() {
+            if first.is_ok() {
+                first = Err(Error::io(part, e));
+            }
+        }
+    }
+    first
 }
 
 struct State {
@@ -1080,6 +1097,28 @@ mod tests {
         assert!(e.batcher.wait(first.seq).is_err(), "its batch failed");
         let q = lock(&e.batcher.queue);
         assert_eq!(q.outcomes.len(), 50, "kept only for the requests that wait");
+    }
+
+    #[test]
+    fn every_part_written_since_the_last_sync_is_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        assert_eq!(ask(&e, "--x-written\tset\tk1\tv").status, 0);
+        assert_eq!(e.batcher.unsynced(), std::slice::from_ref(&p));
+        // Another writer starts a new part: the next batch goes there.
+        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        assert_eq!(ask(&e, "--x-written\tset\tk2\tv").status, 0);
+        assert_eq!(ask(&e, "--x-written\tset\tk3\tv").status, 0);
+        assert_eq!(
+            e.batcher.unsynced(),
+            [p.clone(), dir.path().join("s.tsvz.1")]
+        );
+        // The first part is renamed away (#_rotate_# rename): its data is synced all the same.
+        fs::rename(&p, dir.path().join("s.tsvz.rotated")).unwrap();
+        e.flush().unwrap();
+        assert!(e.batcher.unsynced().is_empty());
     }
 
     #[test]
