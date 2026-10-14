@@ -56,7 +56,10 @@ struct Batcher {
     store: PathBuf,
     queue: Mutex<Queue>,
     changed: Condvar,
+    /// Warnings of the writer (a torn tail cut, …).
     log: Option<WarnFn>,
+    /// Failed batches and fsyncs.
+    errors: Option<WarnFn>,
 }
 
 impl Batcher {
@@ -158,8 +161,8 @@ impl Batcher {
                 }
                 Err(e) => {
                     let message = e.to_string();
-                    if let Some(log) = &self.log {
-                        log(&Warning {
+                    if let Some(errors) = &self.errors {
+                        errors(&Warning {
                             part: self.store.clone(),
                             offset: None,
                             message: format!("a batch of {} writes failed: {message}", batch.len()),
@@ -178,8 +181,8 @@ impl Batcher {
         let unsynced = lock(&self.queue).unsynced;
         if unsynced {
             if let Err(e) = self.fsync() {
-                if let Some(log) = &self.log {
-                    log(&Warning {
+                if let Some(errors) = &self.errors {
+                    errors(&Warning {
                         part: self.store.clone(),
                         offset: None,
                         message: format!("fsync failed: {e}"),
@@ -270,8 +273,8 @@ pub struct Engine {
 
 impl Engine {
     /// Serve the strict store at `path`, creating it when it is missing (§21.13.1). `log` gets
-    /// every warning and failed batch, for `serve`'s standard error.
-    pub fn open(path: &Path, log: Option<WarnFn>) -> Result<Engine, Error> {
+    /// every warning, `errors` every failed batch and fsync, for `serve`'s standard error.
+    pub fn open(path: &Path, log: Option<WarnFn>, errors: Option<WarnFn>) -> Result<Engine, Error> {
         let format = name::format_of(path).ok_or_else(|| Error::BadPath(path.to_path_buf()))?;
         if !format.strict {
             return Err(Error::Refused(format!(
@@ -289,6 +292,7 @@ impl Engine {
             queue: Mutex::new(Queue::default()),
             changed: Condvar::new(),
             log: log.clone(),
+            errors,
         });
         let runner = batcher.clone();
         let thread = std::thread::Builder::new()
@@ -656,7 +660,7 @@ mod tests {
     use crate::handler::protocol::parse;
 
     fn engine(dir: &Path, name: &str) -> Engine {
-        Engine::open(&dir.join(name), None).unwrap()
+        Engine::open(&dir.join(name), None, None).unwrap()
     }
 
     fn ask(e: &Engine, line: &str) -> Response {
@@ -709,7 +713,7 @@ mod tests {
         // The protocol is TAB-delimited whatever the store's variant (§21.4.2).
         assert_eq!(ask(&e, "read").lines, ["k\tv,w"]);
         assert_eq!(fs::read_to_string(&p).unwrap(), "k,v<sep>w\n");
-        assert!(Engine::open(&dir.path().join("s.tsv"), None).is_err());
+        assert!(Engine::open(&dir.path().join("s.tsv"), None, None).is_err());
     }
 
     #[test]

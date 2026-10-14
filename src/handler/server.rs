@@ -28,8 +28,10 @@ pub struct Config {
     pub group: Option<u32>,
     /// The socket's mode (`--x-mode`).
     pub mode: Option<u32>,
-    /// Warnings and failed writes.
+    /// Warnings.
     pub log: Option<WarnFn>,
+    /// Failed writes and fsyncs: errors, which `-q` does not hide.
+    pub errors: Option<WarnFn>,
     pub info: InfoFn,
     /// Report every request and its status.
     pub verbose: bool,
@@ -184,7 +186,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let signals = block_signals();
-    let engine = match Engine::open(store, config.log.clone()) {
+    let engine = match Engine::open(store, config.log.clone(), config.errors.clone()) {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
             held.release();
@@ -516,7 +518,7 @@ mod tests {
     fn a_connection_is_counted_when_it_is_accepted_not_when_its_thread_runs() {
         // Else the idle timeout can stop the handler under a client it has just accepted.
         let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None).unwrap());
+        let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None, None).unwrap());
         let shared = shared();
         let info: InfoFn = Arc::new(|_: &str| {});
         let (_client, end) = UnixStream::pair().unwrap();
@@ -551,7 +553,7 @@ mod tests {
     #[test]
     fn a_connection_that_gets_no_thread_is_closed_and_serving_goes_on() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None).unwrap());
+        let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None, None).unwrap());
         let (wake, _wakened) = UnixStream::pair().unwrap();
         let shared = Arc::new(Shared {
             stopping: AtomicBool::new(false),

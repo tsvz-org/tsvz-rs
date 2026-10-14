@@ -203,6 +203,24 @@ fn serve_answers_until_stop_and_leaves_nothing_behind() {
 }
 
 #[test]
+fn a_quiet_handler_still_reports_writes_that_fail() {
+    // -q prints errors only, and a write that fails is one.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let mut served = Served::start(&s, &["-q"]);
+    fs::remove_file(&s).unwrap();
+    fs::create_dir(&s).unwrap(); // every append fails, even as root
+    assert_eq!(ask(&s, "--x-written\tset\tb\t2").status, 1);
+    fs::remove_dir(&s).unwrap();
+    let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
+    assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
+    assert_eq!(served.wait(), 0, "{}", served.stderr());
+    let said = served.stderr();
+    assert!(said.contains("a batch of 1 writes failed"), "{said:?}");
+    assert!(!said.contains("serving"), "and nothing else: {said:?}");
+}
+
+#[test]
 fn a_second_serve_exits_1_and_the_first_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "k\tv\n");

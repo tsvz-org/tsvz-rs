@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::Error;
 use crate::cli::Ctx;
 use crate::handler::server::{self, Config, InfoFn};
+use crate::{Error, WarnFn, Warning};
 
 pub(crate) fn serve(ctx: &mut Ctx) -> Result<i32, Error> {
     let quiet = ctx.args.quiet;
@@ -18,6 +18,9 @@ pub(crate) fn serve(ctx: &mut Ctx) -> Result<i32, Error> {
         group: ctx.args.group,
         mode: ctx.args.mode,
         log: Some(ctx.warn.clone()),
+        errors: Some(Arc::new(|w: &Warning| {
+            diag!("tsvz: {}: {}", w.part.display(), w.message);
+        }) as WarnFn),
         info,
         verbose: ctx.args.verbose,
     };

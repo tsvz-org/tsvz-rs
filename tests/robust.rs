@@ -128,7 +128,7 @@ fn random_requests_never_panic() {
     use tsvz::handler::engine::Engine;
     use tsvz::handler::protocol::{parse, read_line, read_response};
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(&dir.path().join("s.tsvz"), None).unwrap();
+    let engine = Engine::open(&dir.path().join("s.tsvz"), None, None).unwrap();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     const WORDS: &[&str] = &[
         "read",

@@ -263,7 +263,8 @@ until a write creates it again; reads answer "no such store".
 
 The store's warning callback pushes into a buffer the engine drains per request,
 under the mutex, so each request's `#!` lines are the warnings its own refresh,
-read or write raised. Each warning also goes to `serve`'s stderr (unless `-q`).
+read or write raised. Each warning also goes to `serve`'s stderr (unless `-q`); a failed
+batch or fsync is an error and goes there even with `-q`, which prints errors only.
 
 ## 5. Pointer file and socket (§21.2, §21.3, §21.11)
 
