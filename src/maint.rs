@@ -461,29 +461,41 @@ fn whole(options: &Options) -> Options {
 /// which compacting them would break for the active part.
 pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     refuse_a_part("scrub", store)?;
-    let mut backed_up: Option<(Stamp, PathBuf)> = None;
+    let mut backed_up: Vec<(Stamp, PathBuf)> = Vec::new();
     let mut told = false;
     let mut why = "the store kept changing while it was being compacted".to_string();
+    let mut missing = None;
     for _ in 0..ATTEMPTS {
         match attempt(store, options, &mut backed_up, &mut told) {
             Ok(Step::Done(outcome)) => return Ok(outcome),
-            Ok(Step::Again) => {}
-            // A file gone under the scrub: the parts changed, as for every other change.
-            Err(e) if gone(&e) => {}
+            Ok(Step::Again(gone)) => missing = gone,
             Ok(Step::Refused(reason)) => {
                 why = reason;
+                missing = None;
                 break;
             }
             Err(e) => return Err(e),
         }
     }
+    // A file missing at every attempt is no change of the parts: its error says which.
+    if let Some(e) = missing {
+        return Err(e);
+    }
     // A refusal after an attempt backed up a damaged part says so.
-    let written = match &backed_up {
-        Some((_, copy)) => format!(
+    let copies: Vec<String> = backed_up
+        .iter()
+        .map(|(_, c)| c.display().to_string())
+        .collect();
+    let written = match copies.len() {
+        0 => "nothing was written".to_string(),
+        1 => format!(
             "nothing was written but {}, a copy of the damaged part",
-            copy.display()
+            copies[0]
         ),
-        None => "nothing was written".to_string(),
+        _ => format!(
+            "nothing was written but {}, copies of the damaged part",
+            copies.join(", ")
+        ),
     };
     Err(Error::Refused(format!(
         "{}: scrub skipped: {why}; {written}",
@@ -494,15 +506,29 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
 /// What one attempt of a scrub came to.
 enum Step {
     Done(Outcome),
-    /// The parts changed under the reads: try again.
-    Again,
+    /// The parts changed under the reads: try again (with the error of a file found missing,
+    /// reported should it stay so).
+    Again(Option<Error>),
     /// Refused, for this reason.
     Refused(String),
 }
 
-/// Whether `e` says a file is not there (any more).
+/// Whether `e` says a file being read is not there (any more): never a rewrite that left a
+/// part damaged, whatever its kind.
 fn gone(e: &Error) -> bool {
-    matches!(e, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
+    matches!(e, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound) && !damaged(e)
+}
+
+/// The value of a read, or, when its file is gone (the parts changed), an early return of
+/// `$again` with the error.
+macro_rules! read {
+    ($e:expr, $again:path) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) if gone(&e) => return Ok($again(Some(e))),
+            Err(e) => return Err(e),
+        }
+    };
 }
 
 /// The metadata of each of `parts`.
@@ -518,7 +544,7 @@ fn metas(parts: &[parts::Part]) -> Result<Vec<std::fs::Metadata>, Error> {
 fn attempt(
     store: &Path,
     options: &Options,
-    backed_up: &mut Option<(Stamp, PathBuf)>,
+    backed_up: &mut Vec<(Stamp, PathBuf)>,
     told: &mut bool,
 ) -> Result<Step, Error> {
     let list = parts::list(store)?;
@@ -533,17 +559,23 @@ fn attempt(
     };
     let (others, target) = prefix.split_at(prefix.len() - 1);
     let target = &target[0];
-    let before: Vec<Stamp> = prefix
-        .iter()
-        .map(|p| stamp(&p.path))
-        .collect::<Result<_, _>>()?;
-    let s = if multi {
-        Store::open_prefix(store, whole(options), prefix.len())?
-    } else {
-        Store::open(store, whole(options))?
-    };
+    let before: Vec<Stamp> = read!(
+        prefix
+            .iter()
+            .map(|p| stamp(&p.path))
+            .collect::<Result<_, _>>(),
+        Step::Again
+    );
+    let s = read!(
+        if multi {
+            Store::open_prefix(store, whole(options), prefix.len())
+        } else {
+            Store::open(store, whole(options))
+        },
+        Step::Again
+    );
     if !read_parts(&s, prefix) {
-        return Ok(Step::Again); // the parts changed under the read
+        return Ok(Step::Again(None)); // the parts changed under the read
     }
     if let Some(version) = newer_version(&s) {
         return Ok(Step::Refused(format!(
@@ -583,7 +615,7 @@ fn attempt(
         (true, Some(ordinal)) => {
             match snapshot_part(store, options, prefix, &ordinal, &s, &before)? {
                 Snapshotted::Done(outcome) => return Ok(Step::Done(outcome)),
-                Snapshotted::Again => return Ok(Step::Again),
+                Snapshotted::Again(gone) => return Ok(Step::Again(gone)),
                 Snapshotted::Refused(why) => return Ok(Step::Refused(why)),
                 Snapshotted::InPlace(why) => why,
             }
@@ -596,8 +628,8 @@ fn attempt(
     };
     if multi {
         use std::os::unix::fs::MetadataExt;
-        let owner = stamp_meta(&target.path)?.uid();
-        let others_metas = metas(others)?;
+        let owner = read!(stamp_meta(&target.path), Step::Again).uid();
+        let others_metas = read!(metas(others), Step::Again);
         if let Some((part, uid)) = unreadable_to(owner, others, &others_metas) {
             return Ok(Step::Refused(kept_from(owner, &part, uid)));
         }
@@ -615,17 +647,18 @@ fn attempt(
     }
     let mut copy = None;
     if s.damaged() || s.stopped().is_some() {
-        copy = match &*backed_up {
+        copy = match backed_up.last() {
             Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
-            old => {
+            last => {
                 let path = backup(&target.path, options)?;
                 // A copy of the part as it was before (appends since) holds nothing more.
-                if let Some((_, old)) = old {
+                if let Some((_, old)) = last {
                     if starts_with_file(&path, old) {
                         let _ = std::fs::remove_file(old);
+                        backed_up.pop();
                     }
                 }
-                *backed_up = Some((before[before.len() - 1], path.clone()));
+                backed_up.push((before[before.len() - 1], path.clone()));
                 Some(path)
             }
         };
@@ -634,17 +667,23 @@ fn attempt(
     let earlier = if others.is_empty() {
         None
     } else {
-        let earlier = Store::open_prefix(store, whole(options), others.len())?;
+        let earlier = read!(
+            Store::open_prefix(store, whole(options), others.len()),
+            Step::Again
+        );
         if !read_parts(&earlier, others) {
-            return Ok(Step::Again); // the parts changed under the read
+            return Ok(Step::Again(None)); // the parts changed under the read
         }
         Some(earlier)
     };
     let content = match &earlier {
         None => snapshot(&s),
-        Some(earlier) => match live_after_any_prefix(store, options, others, earlier)? {
+        Some(earlier) => match read!(
+            live_after_any_prefix(store, options, others, earlier),
+            Step::Again
+        ) {
             Some(deleted) => restating_snapshot(&s, &deleted),
-            None => return Ok(Step::Again), // the parts changed under the read
+            None => return Ok(Step::Again(None)), // the parts changed under the read
         },
     };
     // A one-part scrub with no room for the copy (it is how a full disk gets room back)
@@ -680,7 +719,7 @@ fn attempt(
     }
     if !unchanged(others, &before) {
         drop_copy();
-        return Ok(Step::Again); // another process changed a part being compacted
+        return Ok(Step::Again(None)); // another process changed a part being compacted
     }
     // Narrowed only now that the rows are about to go in, and put back if they do not.
     let narrowed = if multi {
@@ -711,7 +750,7 @@ fn attempt(
     }
     let written = written?;
     let Some(written) = written else {
-        return Ok(Step::Again); // another writer committed after the read
+        return Ok(Step::Again(None)); // another writer committed after the read
     };
     if multi {
         // A part whose damage was recovered is never deleted: rename instead (§19.5).
@@ -773,9 +812,12 @@ fn snapshot_part(
     let content = if s.markers().rotate == "keep" {
         snapshot(s)
     } else {
-        match live_after_any_prefix(store, options, prefix, s)? {
+        match read!(
+            live_after_any_prefix(store, options, prefix, s),
+            Snapshotted::Again
+        ) {
             Some(deleted) => restating_snapshot(s, &deleted),
-            None => return Ok(Snapshotted::Again),
+            None => return Ok(Snapshotted::Again(None)),
         }
     };
     let bytes = match last.codec {
@@ -807,7 +849,7 @@ fn snapshot_part(
     let suffix = parts::codec_suffix(&last.path);
     let target = parts::numbered_path(store, ordinal, suffix.as_deref())?;
     let tmp = snapshot_temp(store, &target, suffix.as_deref());
-    let metas = metas(prefix)?;
+    let metas = read!(metas(prefix), Snapshotted::Again);
     // Its owner is judged while it is empty: one who could not read every part gets no row.
     let (file, owner) = new_snapshot(&tmp, &metas[metas.len() - 1])?;
     #[cfg(test)]
@@ -827,7 +869,7 @@ fn snapshot_part(
     let same_parts = all.as_ref().is_ok_and(|a| read_parts(a, prefix));
     if !same_parts || !unchanged(prefix, before) {
         let _ = std::fs::remove_file(&tmp);
-        return Ok(Snapshotted::Again);
+        return Ok(Snapshotted::Again(None));
     }
     if !(reads_as(&tmp, s) && all.is_ok_and(|a| reads_as_after(a, &tmp, s))) {
         let _ = std::fs::remove_file(&tmp);
@@ -841,7 +883,11 @@ fn snapshot_part(
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(Snapshotted::Again),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(Snapshotted::Again(None)),
+        // The temporary file was removed meanwhile: write it again.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Snapshotted::Again(Some(Error::io(&tmp, e))));
+        }
         Err(e) => {
             return Ok(Snapshotted::InPlace(format!(
                 "a new part cannot be linked in here ({e})"
@@ -858,7 +904,7 @@ fn snapshot_part(
 /// given.
 enum Snapshotted {
     Done(Outcome),
-    Again,
+    Again(Option<Error>),
     Refused(String),
     InPlace(String),
 }
@@ -954,11 +1000,14 @@ fn stem_and_ext(store: &Path) -> (String, String) {
 }
 
 /// Write the new content of `part` to a recovery copy beside it, private and synced, before the
-/// part is rewritten in place (§19.8 is not crash-atomic): `<part>.scrub-<time>-<pid>.<ext>`, a
-/// plain store of its own (no part of this store) that a crash would leave behind.
+/// part is rewritten in place (§19.8 is not crash-atomic): `<part>.scrub-<time>-<pid>-<n>.<ext>`
+/// (`n` counts this process's copies), a plain store of its own (no part of this store) that a
+/// crash would leave behind.
 fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, Error> {
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = PathBuf::from(format!(
-        "{}.scrub-{}-{}.{}",
+        "{}.scrub-{}-{}-{n}.{}",
         part.display(),
         local_timestamp(),
         std::process::id(),
@@ -1242,10 +1291,7 @@ fn owners_checked(tmp: &Path) {
 /// that its owner keeps reading and writing it. The mode before, when it changed.
 fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Error> {
     use std::os::unix::fs::MetadataExt;
-    let metas: Vec<std::fs::Metadata> = prefix
-        .iter()
-        .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
-        .collect::<Result<_, _>>()?;
+    let metas = metas(prefix)?;
     let own = std::fs::metadata(target).map_err(|e| Error::io(target, e))?;
     let old = own.mode() & 0o7777;
     let mode = closed_mode(old, &metas, own.gid());
@@ -1788,6 +1834,45 @@ mod tests {
         assert!(starts_with_file(&new, &old));
         fs::write(&new, "c\t3\n").unwrap(); // rewritten in place, not appended to
         assert!(!starts_with_file(&new, &old));
+    }
+
+    #[test]
+    fn a_part_that_stays_missing_is_reported_by_name() {
+        // A numbered part that is a dangling link: every attempt finds it missing, and the
+        // scrub says so, naming it, rather than that the store kept changing.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("s.tsvz.1"))
+            .unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "b\t2\n").unwrap();
+        let err = scrub(&p, &opts()).unwrap_err().to_string();
+        assert!(
+            err.contains("s.tsvz.1") && !err.contains("kept changing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn two_recovery_copies_of_one_part_never_share_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let a = write_recovery(&p, &p, b"a\t1\n").unwrap();
+        let b = write_recovery(&p, &p, b"a\t1\n").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_rewrite_that_left_a_part_damaged_is_never_taken_for_a_missing_file() {
+        let e = Error::io(
+            Path::new("s.tsvz"),
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                Damaged("the part is damaged".into()),
+            ),
+        );
+        assert!(damaged(&e) && !gone(&e));
     }
 
     #[test]
