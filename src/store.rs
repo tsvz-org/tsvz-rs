@@ -465,14 +465,14 @@ impl Store {
         let file = Handle::open(&part.path, OpenOptions::new().read(true))
             .map_err(|e| Error::io(&part.path, e))?;
         let mut reader: &File = &file;
-        let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
+        let meta = file.opened();
         if meta.is_dir() {
             return Err(Error::io(
                 &part.path,
                 std::io::Error::from(std::io::ErrorKind::IsADirectory),
             ));
         }
-        self.follow.stamps.push(Some(Stamp::of(&meta)));
+        self.follow.stamps.push(Some(Stamp::of(meta)));
         if part.codec.is_some_and(|c| !c.supported()) {
             return Err(unsupported(part));
         }

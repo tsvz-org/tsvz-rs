@@ -168,6 +168,18 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
     Ok(())
 }
 
+/// The key of marker record `r`, lowercased, and the markers it leaves (§12), when its value is
+/// valid; None for other records and invalid values, which change nothing (§12.5).
+pub(crate) fn marker_effect(r: &Record) -> Option<(String, crate::Markers)> {
+    let Record::Marker { key, values } = r else {
+        return None;
+    };
+    let key = key.to_ascii_lowercase();
+    let mut m = crate::Markers::default();
+    let value = values.first().map_or("", String::as_str);
+    crate::replay::apply_marker(&mut m, &key, value).then_some((key, m))
+}
+
 /// `records` encoded for `format` as runs, each with the member size in force where it starts
 /// (§16.7): `member_size`, then from the record after each valid `#_member_size_#` marker on,
 /// the size it sets, as a reader replays them (a loose file has no markers).
@@ -180,14 +192,8 @@ pub(crate) fn runs(
     for r in records {
         let at = runs.len() - 1;
         encode_record(r, format, &mut runs[at].0)?;
-        if let (true, Record::Marker { key, values }) = (format.strict, r) {
-            let mut m = crate::Markers::default();
-            let key = key.to_ascii_lowercase();
-            let value = values.first().map_or("", String::as_str);
-            if key == "#_member_size_#"
-                && crate::replay::apply_marker(&mut m, &key, value)
-                && m.member_size != runs[at].1
-            {
+        if let (true, Some((key, m))) = (format.strict, marker_effect(r)) {
+            if key == "#_member_size_#" && m.member_size != runs[at].1 {
                 runs.push((String::new(), m.member_size));
             }
         }
@@ -327,7 +333,12 @@ impl Writer {
                     let start = file.metadata().map_err(io)?.len();
                     let payload: Cow<[u8]> = match runs {
                         [(run, _)] => (*run).into(),
-                        _ => runs.iter().flat_map(|(r, _)| r.iter().copied()).collect(),
+                        _ => runs
+                            .iter()
+                            .map(|(r, _)| *r)
+                            .collect::<Vec<_>>()
+                            .concat()
+                            .into(),
                     };
                     self.write_batch(&file, path, &payload, start)?;
                     (before, stamp(&file).map_err(io)?)

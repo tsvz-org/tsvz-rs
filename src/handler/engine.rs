@@ -527,7 +527,7 @@ impl Engine {
         // a request arrived, another request's or a follow, already shows every write
         // committed before it came.
         let start = Instant::now();
-        if !(st.store.is_some() && st.checked.is_some_and(|c| c >= arrived)) {
+        if !(st.store.is_some() && st.checked.is_some_and(|c| c > arrived)) {
             let others = self.batcher.others_wrote(st.foreign)
                 || !st
                     .store
@@ -550,16 +550,7 @@ impl Engine {
         let durable = sync || ack == Some("disk");
         let waited = durable || written;
         let seq = self.batcher.submit(runs, durable, waited);
-        for r in records {
-            let Record::Marker { key, values } = r else {
-                continue;
-            };
-            let key = key.to_ascii_lowercase();
-            let value = values.first().map_or("", String::as_str);
-            let mut m = crate::Markers::default();
-            if !crate::replay::apply_marker(&mut m, &key, value) {
-                continue; // an invalid value changes nothing (§12.5)
-            }
+        for (key, m) in records.iter().filter_map(crate::write::marker_effect) {
             match key.as_str() {
                 "#_write_ack_#" => st.queued_ack = Some((seq, m.write_ack)),
                 "#_member_size_#" => st.queued_member_size = Some((seq, m.member_size)),
@@ -1172,6 +1163,14 @@ mod tests {
         assert!(
             waited(Instant::now()),
             "a request arriving after the marker sees it"
+        );
+        // A request whose arrival cannot be told from the start of the last check (a coarse
+        // clock) is not taken to have come before it.
+        let at = lock(&e.state).checked.unwrap();
+        append(&p, b"#_write_ack_#\tmemory\n");
+        assert!(
+            !waited(at),
+            "the check that began as it arrived is not shared"
         );
     }
 

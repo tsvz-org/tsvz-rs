@@ -58,6 +58,7 @@ fn table() -> (MutexGuard<'static, Table>, &'static Condvar) {
 pub struct Handle {
     file: Option<File>,
     id: (u64, u64),
+    opened: std::fs::Metadata,
 }
 
 impl Handle {
@@ -68,6 +69,7 @@ impl Handle {
             Ok(meta) => Ok(Handle {
                 id: (meta.dev(), meta.ino()),
                 file: Some(file),
+                opened: meta,
             }),
             Err(e) => {
                 // Which file it is cannot be told: it waits while any lock is classic.
@@ -80,6 +82,13 @@ impl Handle {
                 Err(e)
             }
         }
+    }
+}
+
+impl Handle {
+    /// The file's metadata when it was opened.
+    pub(crate) fn opened(&self) -> &std::fs::Metadata {
+        &self.opened
     }
 }
 
