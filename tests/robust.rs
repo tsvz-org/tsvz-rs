@@ -87,6 +87,7 @@ fn random_compressed_parts_never_panic() {
     }
 }
 
+#[cfg(feature = "cli")]
 #[test]
 fn random_arguments_never_panic() {
     let mut rng = Rng(7);

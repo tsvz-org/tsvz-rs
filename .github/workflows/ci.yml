@@ -26,6 +26,9 @@ jobs:
           python-version: "3.14"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The library alone, without the command line and C libraries (README).
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+        if: runner.os == 'Linux'
       - run: cargo test --no-fail-fast
         env:
           TSVZ_PY: ${{ github.workspace }}/TSVZ/TSVZ.py
