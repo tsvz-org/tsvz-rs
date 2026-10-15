@@ -950,17 +950,17 @@ fn live_after_any_prefix(
         scope: Scope::KeysOnly,
         ..whole(options)
     };
-    for count in 1..others.len() {
-        let first = Store::open_prefix(store, keys_only.clone(), count)?;
-        if first
-            .parts()
-            .iter()
-            .map(|p| &p.path)
-            .ne(others[..count].iter().map(|p| &p.path))
-        {
+    // One read, extended a part at a time: the keys live at each part boundary.
+    if others.len() > 1 {
+        let mut first = Store::open_prefix(store, keys_only, 1)?;
+        if first.parts().first().map(|p| &p.path) != Some(&others[0].path) {
             return Ok(None);
         }
         add(&first);
+        for part in &others[1..others.len() - 1] {
+            first = first.read_after(&part.path)?;
+            add(&first);
+        }
     }
     add(earlier);
     Ok(Some(keys))
@@ -1865,6 +1865,37 @@ mod tests {
         assert!(!overwrites_in_place(Path::new("/no/such/dir")), "unknown");
     }
 
+    #[test]
+    fn a_key_live_only_after_a_middle_part_is_undone_too() {
+        // p1 adds b, p2 deletes it: a rotation cut short after p1 would show b, unless the
+        // snapshot part deletes it; the keys of every prefix count, not only the first and all.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        let earlier = [
+            ("s.tsvz", "#_rotate_#\tdelete\na\t1\n"),
+            ("s.tsvz.1", "b\t2\n"),
+            ("s.tsvz.2", "b\n"),
+        ];
+        for (name, text) in earlier {
+            fs::write(dir.path().join(name), text).unwrap();
+        }
+        fs::write(dir.path().join("s.tsvz.8"), "z\t9\n").unwrap();
+        let before = rows(&p);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        assert_eq!(files(dir.path()), ["s.tsvz.5", "s.tsvz.8"]);
+        for kept in 0..=3 {
+            let state = tempfile::tempdir().unwrap();
+            for (name, text) in &earlier[..kept] {
+                fs::write(state.path().join(name), text).unwrap();
+            }
+            for name in ["s.tsvz.5", "s.tsvz.8"] {
+                fs::copy(dir.path().join(name), state.path().join(name)).unwrap();
+            }
+            assert_eq!(rows(&state.path().join("s.tsvz")), before, "{kept} kept");
+        }
+    }
+
+    #[test]
     #[test]
     fn scrubbing_again_adds_no_copy() {
         // A snapshot part already holding the whole prefix, no larger than a new one would be:
