@@ -540,6 +540,13 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 name(&active.path)
             ),
         };
+        if multi {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(&target.path).map_err(|e| Error::io(&target.path, e))?;
+            if let Some((part, uid)) = unreadable_to(meta.uid(), others)? {
+                return refused(&kept_from(meta.uid(), &part, uid));
+            }
+        }
         if let (true, false, Some(w)) = (multi, told, &options.warnings) {
             told = true;
             w(&Warning {
@@ -719,9 +726,22 @@ fn snapshot_part(
     let suffix = parts::codec_suffix(&last.path);
     let target = parts::numbered_path(store, ordinal, suffix.as_deref())?;
     let tmp = snapshot_temp(store, &target, suffix.as_deref());
-    if let Err(e) = write_snapshot(&tmp, &bytes, prefix) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let kept = write_snapshot(&tmp, &bytes, prefix).and_then(|owner| {
+        Ok(unreadable_to(owner, prefix)?.map(|(p, uid)| kept_from(owner, &p, uid)))
+    });
+    match kept {
+        Ok(None) => {}
+        Ok(Some(why)) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Refused(format!(
+                "{}: scrub skipped: {why}; nothing was written",
+                store.display()
+            )));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     // A guard before it is in the store: alone, and after every part before it, it reads as
     // those parts did.
@@ -794,9 +814,10 @@ fn closed_mode(mode: u32, metas: &[std::fs::Metadata], gid: u32) -> u32 {
     (mode & 0o600) | shared
 }
 
-/// Write `bytes` to the new file `path`, synced, with the owner of the last of `prefix` and a
-/// mode no more open than any of them (its owner reads and writes it).
-fn write_snapshot(path: &Path, bytes: &[u8], prefix: &[parts::Part]) -> Result<(), Error> {
+/// Write `bytes` to the new file `path`, synced, with the owner of the last of `prefix` (when
+/// this process may give it away) and a mode no more open than any of them (its owner reads
+/// and writes it). Its owner.
+fn write_snapshot(path: &Path, bytes: &[u8], prefix: &[parts::Part]) -> Result<u32, Error> {
     use std::os::unix::fs::MetadataExt;
     let io = |e: io::Error| Error::io(path, e);
     let metas: Vec<std::fs::Metadata> = prefix
@@ -813,11 +834,12 @@ fn write_snapshot(path: &Path, bytes: &[u8], prefix: &[parts::Part]) -> Result<(
     if let Some(like) = metas.last() {
         match_owner(&file, like).map_err(io)?;
     }
-    let gid = file.metadata().map_err(io)?.gid();
-    let mode = closed_mode(0o666, &metas, gid);
+    let made = file.metadata().map_err(io)?;
+    let mode = closed_mode(0o666, &metas, made.gid());
     file.set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(io)?;
-    file.sync_all().map_err(io)
+    file.sync_all().map_err(io)?;
+    Ok(made.uid())
 }
 
 /// The variant extension of a store path as it is spelled (`tsvz`, `CSV`, …).
@@ -1004,6 +1026,100 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
         _ => false,
     }
+}
+
+/// Whether user `uid` may read a file with `meta`, by its mode: its owner (who can always
+/// change the mode) and root may; a member of its group by the group bits; anyone else by the
+/// others bits.
+fn may_read(uid: u32, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if uid == 0 || uid == meta.uid() {
+        return true;
+    }
+    let bit = if in_group(uid, meta.gid()) {
+        0o040
+    } else {
+        0o004
+    };
+    meta.mode() & bit != 0
+}
+
+/// Whether user `uid` belongs to group `gid`, as its primary group or another one; false for
+/// a user the system does not know.
+fn in_group(uid: u32, gid: u32) -> bool {
+    // SAFETY: an all-zero passwd is valid; getpwuid_r fills it with pointers into `buf`.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 1 << 14];
+    let mut found = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the sizes given.
+    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) };
+    if r != 0 || found.is_null() {
+        return false;
+    }
+    if pw.pw_gid == gid {
+        return true;
+    }
+    let mut room: libc::c_int = 64;
+    while room <= 1 << 16 {
+        let mut n = room;
+        #[cfg(target_vendor = "apple")]
+        let (got, groups) = {
+            let mut groups = vec![0 as libc::c_int; room as usize];
+            // SAFETY: `groups` has room for `n` entries; pw_name points into `buf`.
+            let got = unsafe {
+                libc::getgrouplist(
+                    pw.pw_name,
+                    pw.pw_gid as libc::c_int,
+                    groups.as_mut_ptr(),
+                    &mut n,
+                )
+            };
+            (
+                got,
+                groups.into_iter().map(|g| g as u32).collect::<Vec<u32>>(),
+            )
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let (got, groups) = {
+            let mut groups = vec![0 as libc::gid_t; room as usize];
+            // SAFETY: as above.
+            let got =
+                unsafe { libc::getgrouplist(pw.pw_name, pw.pw_gid, groups.as_mut_ptr(), &mut n) };
+            (got, groups)
+        };
+        if got >= 0 {
+            let n = usize::try_from(n).unwrap_or(0).min(groups.len());
+            return groups[..n].contains(&gid);
+        }
+        room = room.saturating_mul(2).max(n.saturating_add(1)); // too small: n may say how many
+    }
+    false
+}
+
+/// The first of `parts` that user `owner` could not read, by its mode, and that part's owner:
+/// rows a scrub must not compact into a part of `owner`'s, who would then read them. None when
+/// `owner` is the user scrubbing, who has just read them all.
+fn unreadable_to(owner: u32, parts: &[parts::Part]) -> Result<Option<(PathBuf, u32)>, Error> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid only reads the process's user id.
+    if owner == unsafe { libc::geteuid() } {
+        return Ok(None);
+    }
+    for p in parts {
+        let meta = std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e))?;
+        if !may_read(owner, &meta) {
+            return Ok(Some((p.path.clone(), meta.uid())));
+        }
+    }
+    Ok(None)
+}
+
+/// Why rows of `part` (owned by `uid`) stay out of a part of `owner`'s.
+fn kept_from(owner: u32, part: &Path, uid: u32) -> String {
+    format!(
+        "the rows of {} (uid {uid}) would go into a part of uid {owner}, who cannot read them now; give the parts one owner, or let uid {owner} read them, first",
+        part.display()
+    )
 }
 
 /// Make `target` no more open than any of `prefix`, whose rows it is about to hold: the
@@ -1402,6 +1518,118 @@ mod tests {
         };
         let meta = fs::metadata(&copy).unwrap();
         assert_eq!((meta.uid(), meta.gid()), (65534, 65534));
+    }
+
+    /// Every file of `dir`: name, bytes, mode and owner.
+    fn files_of(dir: &Path) -> Vec<(String, Vec<u8>, u32, u32)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut all: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let m = e.metadata().unwrap();
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name, fs::read(e.path()).unwrap(), m.mode(), m.uid())
+            })
+            .collect();
+        all.sort();
+        all
+    }
+
+    fn give(p: &Path, uid: u32, gid: u32, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::chown(p, Some(uid), Some(gid)).unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_scrub_never_moves_rows_into_a_part_whose_owner_could_not_read_them() {
+        // SAFETY: geteuid only reads the process's user id.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: only root can give files to other owners");
+            return;
+        }
+        // Consecutive ordinals compact in place into .1; sparse ones write a new part .5. Both
+        // would belong to uid 12345, who cannot read the private part of uid 65534.
+        for (middle, active) in [("s.tsvz.1", "s.tsvz.2"), ("s.tsvz.3", "s.tsvz.8")] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, "secret\tB-only\n").unwrap();
+            give(&p, 65534, 65534, 0o600);
+            let m = dir.path().join(middle);
+            fs::write(&m, "x\t1\n").unwrap();
+            give(&m, 12345, 12345, 0o644);
+            fs::write(dir.path().join(active), "y\t2\n").unwrap();
+            let before = files_of(dir.path());
+            let err = scrub(&p, &opts()).unwrap_err().to_string();
+            assert!(
+                err.contains("12345") && err.contains("nothing was written"),
+                "{err}"
+            );
+            assert_eq!(files_of(dir.path()), before, "{middle}");
+        }
+    }
+
+    #[test]
+    fn group_membership_counts_the_primary_group_and_the_others() {
+        assert!(in_group(0, 0), "root's primary group");
+        assert!(!in_group(0, 4_000_000_000));
+        assert!(
+            !in_group(4_000_000_000, 0),
+            "a user the system does not know"
+        );
+        // A member listed in /etc/group whose primary group is another one, if any.
+        let users: std::collections::HashMap<String, (u32, u32)> =
+            fs::read_to_string("/etc/passwd")
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split(':').collect();
+                    Some((
+                        f.first()?.to_string(),
+                        (f.get(2)?.parse().ok()?, f.get(3)?.parse().ok()?),
+                    ))
+                })
+                .collect();
+        let other = fs::read_to_string("/etc/group")
+            .unwrap_or_default()
+            .lines()
+            .find_map(|l| {
+                let f: Vec<&str> = l.split(':').collect();
+                let gid: u32 = f.get(2)?.parse().ok()?;
+                f.get(3)?.split(',').find_map(|m| {
+                    let &(uid, primary) = users.get(m)?;
+                    (primary != gid).then_some((uid, gid))
+                })
+            });
+        if let Some((uid, gid)) = other {
+            assert!(in_group(uid, gid), "uid {uid}, group {gid}");
+        }
+    }
+
+    #[test]
+    fn a_scrub_moves_rows_into_a_part_whose_owner_could_read_them() {
+        // SAFETY: geteuid only reads the process's user id.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: only root can give files to other owners");
+            return;
+        }
+        // Part 0 belongs to uid 12345 but its group, nobody's own, may read it: nobody, who
+        // owns the part the rows go to, could read them before.
+        for (middle, active) in [("s.tsvz.1", "s.tsvz.2"), ("s.tsvz.3", "s.tsvz.8")] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, "shared\tby group\n").unwrap();
+            give(&p, 12345, 65534, 0o640);
+            let m = dir.path().join(middle);
+            fs::write(&m, "x\t1\n").unwrap();
+            give(&m, 65534, 65534, 0o644);
+            fs::write(dir.path().join(active), "y\t2\n").unwrap();
+            assert!(
+                matches!(scrub(&p, &opts()), Ok(Outcome::Written)),
+                "{middle}"
+            );
+        }
     }
 
     #[test]
