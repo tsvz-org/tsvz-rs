@@ -894,3 +894,51 @@ fn a_scrub_on_a_disk_too_full_for_its_recovery_copy_still_compacts() {
         .collect();
     assert_eq!(left, ["s.tsvz"], "no recovery file left behind");
 }
+
+#[test]
+fn a_store_on_a_file_system_without_hard_links_is_still_scrubbed() {
+    // A new snapshot part is linked in under its name; where links do not exist (FAT, some
+    // network and FUSE mounts), the parts are compacted in place instead, with a word why.
+    struct Mounted(std::path::PathBuf);
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg(&self.0).status();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("fat.img");
+    fs::write(&image, vec![0u8; 8 << 20]).unwrap();
+    let mnt = dir.path().join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    let made = Command::new("mkfs.vfat").arg(&image).output();
+    let mounted = made.is_ok_and(|o| o.status.success())
+        && Command::new("mount")
+            .args(["-o", "loop,quiet"])
+            .arg(&image)
+            .arg(&mnt)
+            .output()
+            .is_ok_and(|o| o.status.success());
+    if !mounted {
+        eprintln!("cannot make and mount a FAT image here: skipped");
+        return;
+    }
+    let _mounted = Mounted(mnt.clone());
+    fs::write(mnt.join("s.tsvz"), "a\t1\na\t2\n").unwrap();
+    fs::write(mnt.join("s.tsvz.2"), "b\t2\n").unwrap();
+    fs::write(mnt.join("s.tsvz.8"), "c\t3\n").unwrap();
+    let (code, _, err) = run_in(&mnt, &["scrub", "s.tsvz"], b"");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("in place"), "{err}");
+    let (_, out, _) = records(&mnt, &["read", "s.tsvz"]);
+    assert_eq!(out, "a\t2\nb\t2\nc\t3\n");
+    let mut left: Vec<_> = fs::read_dir(&mnt)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["s.tsvz", "s.tsvz.2", "s.tsvz.8"],
+        "no temporary file left"
+    );
+}

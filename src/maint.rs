@@ -534,25 +534,31 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             .ordinal
             .as_deref()
             .and_then(|a| parts::snapshot_ordinal(target.ordinal.as_deref(), a));
-        if let (true, Some(ordinal)) = (multi, slot) {
-            match snapshot_part(store, options, prefix, &ordinal, &s, &before)? {
-                Some(outcome) => return Ok(outcome),
-                None => continue, // the parts changed under the read
+        let name = |p: &Path| {
+            p.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        };
+        let why = match (multi, slot) {
+            (true, Some(ordinal)) => {
+                match snapshot_part(store, options, prefix, &ordinal, &s, &before)? {
+                    Snapshotted::Done(outcome) => return Ok(outcome),
+                    Snapshotted::Again => continue, // the parts changed under the read
+                    Snapshotted::InPlace(why) => why,
+                }
             }
-        }
+            _ => format!(
+                "no ordinal is free between {} and the active part {}; sparse ordinals, such as UUIDv7 (§17.6), let a scrub write a new part instead",
+                name(&target.path),
+                name(&active.path)
+            ),
+        };
         if let (true, false, Some(w)) = (multi, told, &options.warnings) {
             told = true;
-            let name = |p: &Path| {
-                p.file_name()
-                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-            };
             w(&Warning {
                 part: target.path.clone(),
                 offset: None,
                 message: format!(
-                    "no ordinal is free between {} and the active part {}: the parts before it are compacted into {} in place (§19.8), where readers that take no lock may see it rewritten; sparse ordinals, such as UUIDv7 (§17.6), let a scrub write a new part instead",
-                    name(&target.path),
-                    name(&active.path),
+                    "{why}: the parts before the active one are compacted into {} in place (§19.8), where readers that take no lock may see it rewritten",
                     name(&target.path)
                 ),
             });
@@ -687,7 +693,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
 /// part is rewritten, and the new one appears whole under its name or not at all, so readers,
 /// who take no lock, see the parts before or after the snapshot. Its content is the plain
 /// snapshot when every part of `prefix` stays (`keep`); the restating one when a rotation cut
-/// short may leave only the first of them. None when the parts changed under the reads.
+/// short may leave only the first of them.
 fn snapshot_part(
     store: &Path,
     options: &Options,
@@ -695,14 +701,14 @@ fn snapshot_part(
     ordinal: &str,
     s: &Store,
     before: &[Stamp],
-) -> Result<Option<Outcome>, Error> {
+) -> Result<Snapshotted, Error> {
     let last = &prefix[prefix.len() - 1];
     let content = if s.markers().rotate == "keep" {
         snapshot(s)
     } else {
         match live_after_any_prefix(store, options, prefix, s)? {
             Some(deleted) => restating_snapshot(s, &deleted),
-            None => return Ok(None),
+            None => return Ok(Snapshotted::Again),
         }
     };
     let bytes = match last.codec {
@@ -737,7 +743,7 @@ fn snapshot_part(
         .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b));
     if !same_parts || !unchanged {
         let _ = std::fs::remove_file(&tmp);
-        return Ok(None);
+        return Ok(Snapshotted::Again);
     }
     if !(reads_as(&tmp, s) && all.is_ok_and(|a| reads_as_after(a, &tmp, s))) {
         let _ = std::fs::remove_file(&tmp);
@@ -746,13 +752,18 @@ fn snapshot_part(
             store.display()
         )));
     }
-    // A link never replaces a file: a name taken meanwhile (another scrub) means try again.
+    // A link never replaces a file: a name taken meanwhile (another scrub) means try again;
+    // a file system without links (FAT, some network and FUSE mounts) means in place.
     let linked = std::fs::hard_link(&tmp, &target);
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
-        Err(e) => return Err(Error::io(&target, e)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(Snapshotted::Again),
+        Err(e) => {
+            return Ok(Snapshotted::InPlace(format!(
+                "a new part cannot be linked in here ({e})"
+            )));
+        }
     }
     sync_dir(&target);
     // A part whose damage was recovered is never deleted: rename instead (§19.5).
@@ -761,7 +772,15 @@ fn snapshot_part(
         action => action,
     };
     rotate(prefix, action)?;
-    Ok(Some(Outcome::Written))
+    Ok(Snapshotted::Done(Outcome::Written))
+}
+
+/// What `snapshot_part` did: the scrub is done; the parts changed under the reads, so try
+/// again; or the parts are to be compacted in place instead, for the reason given.
+enum Snapshotted {
+    Done(Outcome),
+    Again,
+    InPlace(String),
 }
 
 /// Where a snapshot part is written before it is linked under its name: a store of its own,
