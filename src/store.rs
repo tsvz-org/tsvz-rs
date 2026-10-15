@@ -246,6 +246,9 @@ pub(crate) struct Follow {
     pub check: Vec<u8>,
 }
 
+/// How many times a store is read when an earlier part changes under the read.
+const READS: usize = 3;
+
 /// What `Store::refresh` did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -303,6 +306,9 @@ pub struct Store {
     /// Read only the first this many parts (a prefix to snapshot, §19.2).
     limit: Option<usize>,
     pub(crate) follow: Follow,
+    /// An earlier part kept changing while the store was read (an in-place rewrite, §19.8):
+    /// the read may be torn.
+    torn: bool,
 }
 
 impl Store {
@@ -334,7 +340,42 @@ impl Store {
         Ok(self)
     }
 
+    /// Readers take no lock, and an earlier part may be rewritten in place while it is read (a
+    /// scrub, §19.8): a read that finds one changed afterwards reads the store again, up to
+    /// [`READS`] times, then is taken as torn ([`Store::incomplete`]).
     fn open_limited(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
+        let mut store = Store::open_once(path, options.clone(), limit)?;
+        for _ in 1..READS {
+            if store.earlier_parts_kept() {
+                return Ok(store);
+            }
+            store = Store::open_once(path, options.clone(), limit)?;
+        }
+        if !store.earlier_parts_kept() {
+            store.torn = true;
+            if let Some(w) = &store.options.warnings {
+                w(&Warning {
+                    part: store.path.clone(),
+                    offset: None,
+                    message: format!(
+                        "the parts before the last kept changing while they were read ({READS} reads); the read may be torn"
+                    ),
+                });
+            }
+        }
+        Ok(store)
+    }
+
+    /// Whether every part but the last is as it was when it was opened.
+    fn earlier_parts_kept(&self) -> bool {
+        let earlier = self.parts.len().saturating_sub(1);
+        self.parts[..earlier].iter().enumerate().all(|(i, p)| {
+            let now = std::fs::metadata(&p.path).ok().map(|m| Stamp::of(&m));
+            now.is_some() && now == self.follow.stamps.get(i).copied().flatten()
+        })
+    }
+
+    fn open_once(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
         let path = path.to_path_buf();
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
@@ -350,6 +391,7 @@ impl Store {
             unreadable: Vec::new(),
             limit,
             follow: Follow::default(),
+            torn: false,
         };
         store.load()?;
         Ok(store)
@@ -626,7 +668,7 @@ impl Store {
     /// Whether the read missed something: a part was skipped, or a `stop` policy ended it
     /// (§4.10). Such a read has failed, and nothing should be changed on its strength.
     pub fn incomplete(&self) -> bool {
-        self.replay.stopped.is_some() || !self.unreadable.is_empty()
+        self.replay.stopped.is_some() || !self.unreadable.is_empty() || self.torn
     }
 
     pub fn damaged(&self) -> bool {
@@ -758,6 +800,29 @@ mod tests {
 
     fn v(cells: &[&str]) -> Vec<String> {
         cells.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn a_part_rewritten_while_the_store_is_read_is_read_again() {
+        // A multi-part scrub rewrites an earlier part in place, and readers take no lock: a
+        // read that saw it change reads the store again rather than answer from torn bytes.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n#_version_#\tx\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "z\t9\n").unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut options = Options::default();
+        let (part, count) = (p.clone(), fired.clone());
+        options.warnings = Some(Arc::new(move |_: &Warning| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::write(&part, "c\t3\n").unwrap(); // the compaction lands mid-read
+            }
+        }));
+        let s = Store::open(&p, options).unwrap();
+        let keys: Vec<&str> = s.iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["c", "z"]);
+        assert!(!s.incomplete());
     }
 
     #[test]
