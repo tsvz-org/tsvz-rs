@@ -57,6 +57,8 @@ struct Queue {
     /// Each part a batch was appended to without an fsync since, by path and inode, with the
     /// file it was appended through.
     unsynced: Vec<(PathBuf, u64, File)>,
+    /// A sync of a part left behind that failed, until a flush reports it.
+    sync_error: Option<String>,
     closing: bool,
 }
 
@@ -134,6 +136,9 @@ impl Batcher {
     fn flush(&self) -> Result<(), String> {
         self.barrier();
         let mut q = lock(&self.queue);
+        if let Some(e) = q.sync_error.take() {
+            return Err(e);
+        }
         sync(&q.unsynced).map_err(|e| e.to_string())?;
         q.unsynced.clear();
         Ok(())
@@ -224,9 +229,10 @@ impl Batcher {
                     q.failing = Some(message);
                 }
             }
-            self.changed.notify_all();
-            drop(q);
+            // Synced before the queue is let go: a flush (stop) never finds them neither listed
+            // nor synced. A failure is kept for the next flush to answer.
             if let Err(e) = sync(&left_behind) {
+                q.sync_error.get_or_insert_with(|| e.to_string());
                 if let Some(errors) = &self.errors {
                     errors(&Warning {
                         part: self.store.clone(),
@@ -235,6 +241,7 @@ impl Batcher {
                     });
                 }
             }
+            self.changed.notify_all();
         }
         let unsynced = std::mem::take(&mut lock(&self.queue).unsynced);
         if let Err(e) = sync(&unsynced) {
