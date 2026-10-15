@@ -311,6 +311,10 @@ pub struct Store {
     /// An earlier part kept changing while the store was read (an in-place rewrite, §19.8):
     /// the read may be torn.
     torn: bool,
+    /// The last part (plain), kept open to follow what is appended to it: a follow opens no
+    /// file, so none waits to be closed while this process holds a classic lock on it
+    /// ([`Handle`]).
+    last: Option<Handle>,
 }
 
 impl Store {
@@ -401,6 +405,7 @@ impl Store {
             limit,
             follow: Follow::default(),
             torn: false,
+            last: None,
         };
         store.load()?;
         Ok(store)
@@ -525,6 +530,7 @@ impl Store {
             self.follow.line = framer.number();
             self.follow.tail = framer.tail().to_vec();
             self.follow.check = read_check(&file, framer.committed());
+            self.last = Some(file);
         }
         Ok(())
     }
@@ -753,7 +759,14 @@ impl Store {
             return Ok(false); // an append only ever grows the same file
         }
         let io = |e: std::io::Error| Error::io(&path, e);
-        let file = Handle::open(&path, OpenOptions::new().read(true)).map_err(io)?;
+        if self
+            .last
+            .as_ref()
+            .is_none_or(|h| h.opened().ino() != stamp.ino)
+        {
+            self.last = Some(Handle::open(&path, OpenOptions::new().read(true)).map_err(io)?);
+        }
+        let file = self.last.as_ref().expect("opened above");
         let mut check = vec![0u8; want];
         if file
             .read_exact_at(&mut check, offset - want as u64)
@@ -763,8 +776,9 @@ impl Store {
             return Ok(false); // rewritten in place (§19.8)
         }
         let mut data = Vec::new();
-        (&*file).seek(SeekFrom::Start(offset)).map_err(io)?;
-        (&*file).read_to_end(&mut data).map_err(io)?;
+        let mut reader: &File = file;
+        reader.seek(SeekFrom::Start(offset)).map_err(io)?;
+        reader.read_to_end(&mut data).map_err(io)?;
         let mut framer = Framer::resume(offset, self.follow.line);
         let (replay, table) = (&mut self.replay, &mut self.table);
         replay.begin_part(&path, last == 0 && offset == 0);
@@ -796,6 +810,7 @@ impl Store {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     fn write(dir: &Path, name: &str, data: &[u8]) -> PathBuf {
         let p = dir.join(name);
@@ -814,6 +829,27 @@ mod tests {
         cells.iter().map(|c| c.to_string()).collect()
     }
 
+    #[test]
+    fn following_appends_opens_no_file_to_close_under_a_lock() {
+        // A handler follows the files while its writer holds the lock: on macOS (classic
+        // locks) every descriptor it closed meanwhile would wait for the lock's release.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        let file = Handle::open(&p, OpenOptions::new().append(true)).unwrap();
+        let guard = crate::lock::lock_classic(&file, &p).unwrap();
+        for i in 0..3 {
+            (&*file).write_all(format!("k{i}\tv\n").as_bytes()).unwrap();
+            assert_eq!(store.refresh().unwrap(), Refreshed::Followed);
+        }
+        assert_eq!(
+            crate::lock::waiting_on(&p),
+            Some(0),
+            "descriptors waiting for the lock"
+        );
+        drop(guard);
+        assert_eq!(store.len(), 4);
+    }
     #[test]
     fn a_loose_delimiter_must_be_one_ascii_character_other_than_a_line_break() {
         // A byte past ASCII cuts characters in two (a panic); a line break splits rows.

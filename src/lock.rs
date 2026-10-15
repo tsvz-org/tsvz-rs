@@ -146,6 +146,15 @@ pub(crate) fn lock_classic<'f>(file: &'f File, _path: &Path) -> io::Result<Guard
     lock_as(file, true)
 }
 
+/// How many descriptors of `path` wait for its lock to be released; None when no thread locks
+/// it: for tests.
+#[cfg(test)]
+pub(crate) fn waiting_on(path: &Path) -> Option<usize> {
+    let meta = std::fs::metadata(path).unwrap();
+    let id = (meta.dev(), meta.ino());
+    table().0.inodes.get(&id).map(|i| i.waiting.len())
+}
+
 /// Whether another process would find `path` locked now (a child process tries to lock it).
 #[cfg(test)]
 pub(crate) fn locked_elsewhere(path: &Path) -> bool {
@@ -296,9 +305,7 @@ mod tests {
     }
 
     fn waiting(path: &Path) -> Option<usize> {
-        let meta = std::fs::metadata(path).unwrap();
-        let id = (meta.dev(), meta.ino());
-        table().0.inodes.get(&id).map(|i| i.waiting.len())
+        waiting_on(path)
     }
 
     #[test]
@@ -356,33 +363,47 @@ mod tests {
 
     #[test]
     fn a_classic_lock_is_never_lost_to_handles_closed_by_other_threads() {
-        // Threads open and drop handles of the file while it is locked and unlocked again: a
-        // drop that decided "no lock" just before the lock was taken must not close after it.
+        // Threads drop handles of the file as it is locked: a drop that decided "no lock" just
+        // before the lock was taken must not close after it. A burst a round, so that what
+        // waits for each lock stays far below macOS's 256 open files.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.tsvz");
         std::fs::write(&path, "").unwrap();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let droppers: Vec<_> = (0..32)
+        let (stop, round) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let droppers: Vec<_> = (0..16)
             .map(|_| {
-                let (path, stop) = (path.clone(), stop.clone());
+                let (path, stop, round) = (path.clone(), stop.clone(), round.clone());
                 std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        drop(Handle::open(&path, OpenOptions::new().read(true)).unwrap());
+                    let mut seen = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let now = round.load(Ordering::Acquire);
+                        if now == seen {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        seen = now;
+                        for _ in 0..4 {
+                            drop(Handle::open(&path, OpenOptions::new().read(true)).unwrap());
+                        }
                     }
                 })
             })
             .collect();
         let file = Handle::open(&path, OpenOptions::new().append(true)).unwrap();
         let mut lost = 0;
-        for _ in 0..300 {
+        for i in 1..=1000 {
+            round.store(i, Ordering::Release);
             let guard = lock_classic(&file, &path).unwrap();
-            std::thread::yield_now();
             lost += usize::from(!locked_elsewhere(&path));
             drop(guard);
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
         droppers.into_iter().for_each(|t| t.join().unwrap());
-        assert_eq!(lost, 0, "locks lost in 300");
+        assert_eq!(lost, 0, "locks lost in 1000");
     }
 
     #[test]
