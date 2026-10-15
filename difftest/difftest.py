@@ -171,25 +171,27 @@ def ask_tty(command, store, op, columns=72):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, columns, 0, 0))
     proc = subprocess.Popen(command + ['-q', op[0], store] + op[1:], stdin=subprocess.DEVNULL, stdout=slave,
                             stderr=subprocess.DEVNULL)
-    os.close(slave)
+    # The slave stays open here until the child has exited and its output is read: on macOS the
+    # last close of the slave can discard output the master has not read yet.
     chunks = []
+    deadline = time.monotonic() + 60
+    code = None
     while True:
-        ready, _, _ = select.select([master], [], [], 60)
-        if not ready:
-            break
-        try:
-            chunk = os.read(master, 65536)
-        except OSError:
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
+        ready, _, _ = select.select([master], [], [], 0.05)
+        if ready:
+            chunks.append(os.read(master, 65536))
+        elif code is not None:
+            break  # exited, and everything it wrote is read
+        elif time.monotonic() > deadline:
+            proc.kill()
+            proc.wait()
+            os.close(slave)
+            os.close(master)
+            return ('timeout', b'')
+        else:
+            code = proc.poll()  # once it has exited, read until nothing is left
+    os.close(slave)
     os.close(master)
-    try:
-        code = proc.wait(timeout=60)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return ('timeout', b'')
     return (code, b''.join(chunks).replace(b'\r\n', b'\n'))
 
 
