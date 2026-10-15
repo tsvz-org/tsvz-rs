@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
@@ -23,33 +23,99 @@ struct Inode {
     /// record locks do not exclude two descriptors of one process.
     locked: bool,
     /// That lock is, or may become, a classic POSIX lock, which closing any descriptor of the
-    /// file releases: the descriptors this process drops meanwhile wait in `waiting`.
+    /// file releases: the descriptors this process drops meanwhile wait in `waiting` (with
+    /// whether they were opened for reading only, to be used again).
     classic: bool,
-    waiting: Vec<File>,
+    waiting: Vec<(File, bool)>,
+    /// Descriptors of the file being closed, outside the table's mutex: a classic lock is
+    /// taken only once they are closed.
+    closing: usize,
+    /// Threads waiting for its gate, or for its closes.
+    waiters: usize,
+}
+
+impl Inode {
+    fn idle(&self) -> bool {
+        !self.locked && self.closing == 0 && self.waiters == 0 && self.waiting.is_empty()
+    }
 }
 
 #[derive(Default)]
 struct Table {
-    /// The files a thread locks or is locking, listed only meanwhile.
+    /// The files a thread locks or is locking, or that descriptors are closing or waiting for.
     inodes: HashMap<(u64, u64), Inode>,
-    /// Descriptors of no known file (their fstat failed), kept while any lock is classic.
+    /// Descriptors of no known file (their fstat failed), kept while any lock is classic, and
+    /// how many are being closed (a classic lock waits for them too).
     orphans: Vec<File>,
+    orphans_closing: usize,
 }
 
 impl Table {
     fn any_classic(&self) -> bool {
         self.inodes.values().any(|i| i.classic)
     }
+
+    fn tidy(&mut self, id: (u64, u64)) {
+        if self.inodes.get(&id).is_some_and(Inode::idle) {
+            self.inodes.remove(&id);
+        }
+    }
 }
 
-/// The table, and the condition its gates are waited on with. The descriptors of a store's
-/// files that this process closes are closed under the table's mutex, and a classic lock is
-/// taken only once its file is marked so under the same mutex: a close comes first, or sees
-/// the mark and waits for the lock to be released.
-fn table() -> (MutexGuard<'static, Table>, &'static Condvar) {
+type Locked = MutexGuard<'static, Table>;
+
+/// The table, and the condition its gates and closes are waited on with. A descriptor of a
+/// store's file is closed only once it is counted as closing, or set aside to wait, under the
+/// table's mutex; a classic lock is taken only once its file is marked classic and none of its
+/// descriptors is still closing: so no close of this process releases a classic lock it holds.
+fn table() -> (Locked, &'static Condvar) {
     static TABLE: OnceLock<(Mutex<Table>, Condvar)> = OnceLock::new();
     let (table, cv) = TABLE.get_or_init(Default::default);
     (table.lock().unwrap_or_else(|e| e.into_inner()), cv)
+}
+
+/// Wait on `cv` as one of the waiters of file `id`.
+fn wait(mut table: Locked, cv: &Condvar, id: (u64, u64)) -> Locked {
+    table.inodes.entry(id).or_default().waiters += 1;
+    table = cv.wait(table).unwrap_or_else(|e| e.into_inner());
+    if let Some(inode) = table.inodes.get_mut(&id) {
+        inode.waiters -= 1;
+    }
+    table
+}
+
+/// Close `files` of file `id` (None for orphans), counted as closing meanwhile, outside the
+/// table's mutex: a slow close (a network file system) holds up only a classic lock of that
+/// file.
+fn close(mut table: Locked, cv: &Condvar, id: Option<(u64, u64)>, files: Vec<File>) {
+    let n = files.len();
+    if n == 0 {
+        return;
+    }
+    match id {
+        Some(id) => table.inodes.entry(id).or_default().closing += n,
+        None => table.orphans_closing += n,
+    }
+    drop(table);
+    for file in files {
+        #[cfg(test)]
+        if let Some(id) = id {
+            slow_close(id);
+        }
+        drop(file);
+    }
+    let (mut table, _) = self::table();
+    match id {
+        Some(id) => {
+            let inode = table.inodes.get_mut(&id).expect("counted above");
+            inode.closing -= n;
+            table.tidy(id);
+        }
+        None => table.orphans_closing -= n,
+    }
+    if table.inodes.values().any(|i| i.waiters > 0) {
+        cv.notify_all();
+    }
 }
 
 /// A file of a store, open in this process. Closing it while the process holds a classic POSIX
@@ -59,33 +125,66 @@ pub struct Handle {
     file: Option<File>,
     id: (u64, u64),
     opened: std::fs::Metadata,
+    /// Opened for reading only: may be used again for another reading handle.
+    read_only: bool,
 }
 
 impl Handle {
     /// Open `path` with `options`.
     pub fn open(path: &Path, options: &OpenOptions) -> io::Result<Handle> {
+        Handle::with(path, options, false)
+    }
+
+    /// Open `path` for reading. While this process holds a classic lock on it, a descriptor
+    /// of it that waits to be closed is used again, read from the start: reads meanwhile do
+    /// not pile descriptors up.
+    pub fn open_read(path: &Path) -> io::Result<Handle> {
+        let classic = table().0.any_classic();
+        if let (true, Ok(meta)) = (classic, std::fs::metadata(path)) {
+            let id = (meta.dev(), meta.ino());
+            let (mut table, _) = table();
+            let reused = table.inodes.get_mut(&id).and_then(|inode| {
+                let at = inode.waiting.iter().rposition(|f| f.1)?;
+                Some(inode.waiting.swap_remove(at).0)
+            });
+            drop(table);
+            if let Some(file) = reused {
+                let mut reader: &File = &file;
+                reader.seek(SeekFrom::Start(0))?;
+                let opened = file.metadata()?;
+                return Ok(Handle {
+                    file: Some(file),
+                    id,
+                    opened,
+                    read_only: true,
+                });
+            }
+        }
+        Handle::with(path, OpenOptions::new().read(true), true)
+    }
+
+    fn with(path: &Path, options: &OpenOptions, read_only: bool) -> io::Result<Handle> {
         let file = options.open(path)?;
         match file.metadata() {
             Ok(meta) => Ok(Handle {
                 id: (meta.dev(), meta.ino()),
                 file: Some(file),
                 opened: meta,
+                read_only,
             }),
             Err(e) => {
                 // Which file it is cannot be told: it waits while any lock is classic.
-                let (mut table, _) = table();
+                let (mut table, cv) = table();
                 if table.any_classic() {
                     table.orphans.push(file);
                 } else {
-                    drop(file);
+                    close(table, cv, None, vec![file]);
                 }
                 Err(e)
             }
         }
     }
-}
 
-impl Handle {
     /// The file's metadata when it was opened.
     pub(crate) fn opened(&self) -> &std::fs::Metadata {
         &self.opened
@@ -106,10 +205,10 @@ impl Drop for Handle {
         let Some(file) = self.file.take() else {
             return;
         };
-        let (mut table, _) = table();
+        let (mut table, cv) = table();
         match table.inodes.get_mut(&self.id) {
-            Some(inode) if inode.classic => inode.waiting.push(file),
-            _ => drop(file), // under the mutex: no classic lock is taken meanwhile
+            Some(inode) if inode.classic => inode.waiting.push((file, self.read_only)),
+            _ => close(table, cv, Some(self.id), vec![file]),
         }
     }
 }
@@ -152,7 +251,32 @@ pub(crate) fn lock_classic<'f>(file: &'f File, _path: &Path) -> io::Result<Guard
 pub(crate) fn waiting_on(path: &Path) -> Option<usize> {
     let meta = std::fs::metadata(path).unwrap();
     let id = (meta.dev(), meta.ino());
-    table().0.inodes.get(&id).map(|i| i.waiting.len())
+    table()
+        .0
+        .inodes
+        .get(&id)
+        .filter(|i| i.locked)
+        .map(|i| i.waiting.len())
+}
+
+/// A close of file `.0` waits here until `.1` is set: for tests.
+#[cfg(test)]
+type SlowClose = ((u64, u64), std::sync::Arc<(Mutex<(bool, bool)>, Condvar)>);
+#[cfg(test)]
+static SLOW_CLOSE: Mutex<Option<SlowClose>> = Mutex::new(None);
+
+#[cfg(test)]
+fn slow_close(id: (u64, u64)) {
+    let slow = SLOW_CLOSE.lock().unwrap().clone();
+    if let Some((_, gate)) = slow.filter(|(slow, _)| *slow == id) {
+        let (state, cv) = &*gate;
+        let mut state = state.lock().unwrap();
+        state.0 = true; // entered
+        cv.notify_all();
+        while !state.1 {
+            state = cv.wait(state).unwrap();
+        }
+    }
 }
 
 /// Whether another process would find `path` locked now (a child process tries to lock it).
@@ -187,20 +311,30 @@ fn lock_as(file: &File, classic: bool) -> io::Result<Guard<'_>> {
     let meta = file.metadata()?;
     let id = (meta.dev(), meta.ino());
     let classic = classic || cfg!(not(target_os = "linux"));
-    {
-        let (mut table, cv) = table();
-        while table.inodes.get(&id).is_some_and(|i| i.locked) {
-            table = cv.wait(table).unwrap_or_else(|e| e.into_inner());
-        }
-        let inode = table.inodes.entry(id).or_default();
-        inode.locked = true;
-        inode.classic = classic;
+    let (mut table, cv) = table();
+    while table.inodes.get(&id).is_some_and(|i| i.locked) {
+        table = wait(table, cv, id);
     }
+    let inode = table.inodes.entry(id).or_default();
+    inode.locked = true;
+    inode.classic = classic;
+    if classic {
+        table = settled(table, cv, id);
+    }
+    drop(table);
     let taken = take(file, id, classic);
     if taken.is_err() {
         unlocked(id);
     }
     taken.map(|ofd| Guard { file, ofd, id })
+}
+
+/// Wait until no descriptor of file `id` (marked classic), nor any orphan, is being closed.
+fn settled(mut table: Locked, cv: &Condvar, id: (u64, u64)) -> Locked {
+    while table.orphans_closing > 0 || table.inodes.get(&id).is_some_and(|i| i.closing > 0) {
+        table = wait(table, cv, id);
+    }
+    table
 }
 
 /// Lock `file`, whose entry in the table says `classic`; whether by an open file description
@@ -216,9 +350,11 @@ fn take(file: &File, id: (u64, u64), classic: bool) -> io::Result<bool> {
             Ok(()) => return Ok(true),
             // A kernel or file system without them: a classic lock, marked so first.
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                if let Some(inode) = table().0.inodes.get_mut(&id) {
+                let (mut table, cv) = table();
+                if let Some(inode) = table.inodes.get_mut(&id) {
                     inode.classic = true;
                 }
+                drop(settled(table, cv, id));
             }
             Err(e) => return Err(e),
         }
@@ -227,17 +363,35 @@ fn take(file: &File, id: (u64, u64), classic: bool) -> io::Result<bool> {
     fcntl(file.as_raw_fd(), libc::F_SETLKW, &fl).map(|()| false)
 }
 
-/// The lock on file `id` is released, or was never taken: close what waited for it, under the
-/// table's mutex so before another thread can lock the file, and open its gate.
+/// The lock on file `id` is released, or was never taken: open its gate, and close what waited
+/// for it (counted as closing, so that a classic lock taken next waits for them).
 fn unlocked(id: (u64, u64)) {
     let (mut table, cv) = table();
-    if let Some(inode) = table.inodes.remove(&id) {
-        drop(inode.waiting);
+    let (waiting, waiters) = match table.inodes.get_mut(&id) {
+        Some(inode) => {
+            inode.locked = false;
+            inode.classic = false;
+            let waiting = std::mem::take(&mut inode.waiting);
+            (waiting.into_iter().map(|(f, _)| f).collect(), inode.waiters)
+        }
+        None => (Vec::new(), 0),
+    };
+    let orphans = if table.any_classic() {
+        Vec::new()
+    } else {
+        std::mem::take(&mut table.orphans)
+    };
+    table.tidy(id);
+    if waiters > 0 {
+        cv.notify_all();
     }
-    if !table.any_classic() {
-        drop(std::mem::take(&mut table.orphans));
+    if orphans.is_empty() {
+        close(table, cv, Some(id), waiting);
+    } else {
+        close(table, cv, None, orphans);
+        let (table, cv) = self::table();
+        close(table, cv, Some(id), waiting);
     }
-    cv.notify_all();
 }
 
 impl Drop for Guard<'_> {
@@ -450,7 +604,14 @@ mod tests {
             let file = Handle::open(&p, OpenOptions::new().append(true)).unwrap();
             drop(lock(&file, &p).unwrap());
         });
-        std::thread::sleep(Duration::from_millis(100)); // the waiter is in F_OFD_SETLKW
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while waiting(&path).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never came"
+            );
+            std::thread::sleep(Duration::from_millis(1)); // until the waiter is at the lock
+        }
         drop(Handle::open(&path, OpenOptions::new().read(true)).unwrap());
         assert_eq!(
             waiting(&path),
@@ -460,6 +621,81 @@ mod tests {
         fl.l_type = libc::F_UNLCK as _;
         fcntl(holder.as_raw_fd(), F_OFD_SETLK, &fl).unwrap();
         waiter.join().unwrap();
+    }
+
+    fn id_of(path: &Path) -> (u64, u64) {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    #[test]
+    fn a_slow_close_holds_up_only_a_classic_lock_of_its_own_file() {
+        use std::sync::mpsc::channel;
+        let dir = tempfile::tempdir().unwrap();
+        let (slow, other) = (dir.path().join("s.tsvz"), dir.path().join("t.tsvz"));
+        std::fs::write(&slow, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        *SLOW_CLOSE.lock().unwrap() = Some((id_of(&slow), gate.clone()));
+        let p = slow.clone();
+        let closer = std::thread::spawn(move || drop(Handle::open_read(&p).unwrap()));
+        {
+            let (state, cv) = &*gate;
+            let mut state = state.lock().unwrap();
+            while !state.0 {
+                state = cv.wait(state).unwrap(); // the close of `slow` has begun
+            }
+        }
+        // Another file is locked, unlocked and closed meanwhile.
+        let (done, finished) = channel();
+        let o = other.clone();
+        std::thread::spawn(move || {
+            let file = Handle::open(&o, OpenOptions::new().append(true)).unwrap();
+            drop(lock_classic(&file, &o).unwrap());
+            drop(Handle::open_read(&o).unwrap());
+            let _ = done.send(());
+        });
+        let free = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+        // A classic lock of the slow file waits for its close.
+        let (got, locked) = channel();
+        let p = slow.clone();
+        std::thread::spawn(move || {
+            let file = Handle::open(&p, OpenOptions::new().append(true)).unwrap();
+            let _guard = lock_classic(&file, &p).unwrap();
+            let _ = got.send(());
+        });
+        let early = locked.recv_timeout(Duration::from_millis(200)).is_ok();
+        {
+            let (state, cv) = &*gate;
+            state.lock().unwrap().1 = true;
+            cv.notify_all();
+        }
+        closer.join().unwrap();
+        let late = locked.recv_timeout(Duration::from_secs(5)).is_ok();
+        *SLOW_CLOSE.lock().unwrap() = None;
+        assert!(free, "a slow close held up another file");
+        assert!(
+            !early && late,
+            "a classic lock did not wait for its file's close"
+        );
+    }
+
+    #[test]
+    fn reads_under_a_classic_lock_reuse_what_waits_for_it() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.tsvz");
+        std::fs::write(&path, "a\t1\n").unwrap();
+        let file = Handle::open(&path, OpenOptions::new().append(true)).unwrap();
+        let guard = lock_classic(&file, &path).unwrap();
+        for _ in 0..3 {
+            let read = Handle::open_read(&path).unwrap();
+            let mut text = String::new();
+            (&*read).read_to_string(&mut text).unwrap();
+            assert_eq!(text, "a\t1\n", "read from the start");
+        }
+        assert_eq!(waiting(&path), Some(1), "one descriptor, reused");
+        drop(guard);
     }
 
     #[test]

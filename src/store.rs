@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -296,7 +296,9 @@ fn read_check(file: &File, offset: u64) -> Vec<u8> {
     }
 }
 
-/// A store read from its files.
+/// A store read from its files. It keeps its last part open, to follow what is appended to it
+/// ([`Store::refresh`]): one descriptor, and that file's space if it is deleted meanwhile, until
+/// the store is dropped or reads another last part.
 pub struct Store {
     path: PathBuf,
     format: Format,
@@ -467,8 +469,7 @@ impl Store {
 
     /// Replay one part; `last` marks the store's last part, whose end the follow state records.
     fn read_part(&mut self, part: &parts::Part, last: bool) -> Result<(), Error> {
-        let file = Handle::open(&part.path, OpenOptions::new().read(true))
-            .map_err(|e| Error::io(&part.path, e))?;
+        let file = Handle::open_read(&part.path).map_err(|e| Error::io(&part.path, e))?;
         let mut reader: &File = &file;
         let meta = file.opened();
         if meta.is_dir() {
@@ -764,7 +765,7 @@ impl Store {
             .as_ref()
             .is_none_or(|h| h.opened().ino() != stamp.ino)
         {
-            self.last = Some(Handle::open(&path, OpenOptions::new().read(true)).map_err(io)?);
+            self.last = Some(Handle::open_read(&path).map_err(io)?);
         }
         let file = self.last.as_ref().expect("opened above");
         let mut check = vec![0u8; want];
@@ -836,7 +837,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
         let mut store = Store::open(&p, Options::default()).unwrap();
-        let file = Handle::open(&p, OpenOptions::new().append(true)).unwrap();
+        let file = Handle::open(&p, fs::OpenOptions::new().append(true)).unwrap();
         let guard = crate::lock::lock_classic(&file, &p).unwrap();
         for i in 0..3 {
             (&*file).write_all(format!("k{i}\tv\n").as_bytes()).unwrap();
