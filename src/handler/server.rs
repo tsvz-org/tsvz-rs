@@ -406,18 +406,13 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>, info: InfoFn) {
     let tick = (idle / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
     while !shared.stopping.load(Ordering::SeqCst) {
         std::thread::sleep(tick);
-        let idle_now = {
-            // Decided under the lock that counts new connections: one counted before is served
-            // to its end, one after is refused (start_connection).
-            let activity = lock(&shared.activity);
-            let idle_now = activity.0 == 0 && activity.1.elapsed() >= idle;
-            if idle_now {
-                shared.stop();
-            }
-            idle_now
-        };
-        if idle_now {
+        // Decided under the lock that counts new connections: one counted before is served to
+        // its end, one after is refused (start_connection). Said before the stop, which ends
+        // the process as soon as the connections are done, this thread with it.
+        let activity = lock(&shared.activity);
+        if activity.0 == 0 && activity.1.elapsed() >= idle {
             info(&format!("idle for {} s; stopping", idle.as_secs_f64()));
+            shared.stop();
         }
     }
 }
