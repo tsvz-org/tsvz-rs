@@ -297,10 +297,17 @@ impl Writer {
     /// other writers'.
     #[doc(hidden)]
     pub fn append_runs_at(&mut self, runs: &[(&[u8], u64)]) -> Result<Appended, Error> {
-        // The part is locked as it was opened; when its name is another file's by then (it was
-        // rotated away, or a part replaced it), the store's active part is looked up again.
+        // The part is locked as it was opened; when by then it is no longer the store's active
+        // part (a part was started meanwhile, §17.7), or its name is another file's (it was
+        // rotated away), the active part is looked up again. Only a store with no part yet is
+        // created: a part's name is never made anew once it has gone.
         for _ in 0..3 {
-            let part = parts::active(&self.store)?;
+            let listed = parts::list(&self.store)?;
+            let create = listed.is_empty();
+            let part = match listed.into_iter().last() {
+                Some(part) => part,
+                None => parts::active(&self.store)?,
+            };
             let path = part.path.as_path();
             let io = |e: io::Error| Error::io(path, e);
             let bytes: Cow<[u8]> = match part.codec {
@@ -328,10 +335,18 @@ impl Writer {
                 },
             };
             let mut options = OpenOptions::new();
-            options.append(true).create(true).read(part.codec.is_none());
-            let file = lock::Handle::open(path, &options).map_err(io)?;
+            options
+                .append(true)
+                .create(create)
+                .read(part.codec.is_none());
+            let file = match lock::Handle::open(path, &options) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound && !create => continue,
+                Err(e) => return Err(io(e)),
+            };
             let guard = lock::lock(&file, path).map_err(io)?;
-            if !names(path, &file) {
+            let active = parts::active(&self.store).is_ok_and(|a| a.path == part.path);
+            if !active || !names(path, &file) {
                 continue;
             }
             let before = stamp(&file).map_err(io)?;
@@ -717,10 +732,19 @@ mod tests {
         assert_eq!(members, [3, 1, 1]);
     }
 
+    /// Wait until a thread waits at the lock of `path`.
+    fn until_waiting(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lock::waiters_on(path) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no writer came");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn a_write_that_waited_for_the_lock_goes_to_the_part_the_store_names_then() {
-        // While a writer waits for the lock on part 0, part 0 is rotated away (renamed
-        // `.0.rotated`) and a new part started: the write must not land in the rotated file.
+        // While a writer waits for the lock on part 0, a new part is started and part 0
+        // rotated away (renamed `.0.rotated`): the write must not land in the rotated file.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();
@@ -732,10 +756,10 @@ mod tests {
                 .unwrap()
                 .append(&[Record::from_args("b", &["2".into()])])
         });
-        std::thread::sleep(std::time::Duration::from_millis(100)); // the writer waits
+        until_waiting(&p);
+        fs::write(dir.path().join("s.tsvz.1"), "c\t3\n").unwrap();
         let rotated = dir.path().join("s.tsvz.0.rotated");
         fs::rename(&p, &rotated).unwrap();
-        fs::write(dir.path().join("s.tsvz.1"), "c\t3\n").unwrap();
         drop(guard);
         writer.join().unwrap().unwrap();
         assert_eq!(
@@ -746,6 +770,34 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
             "c\t3\nb\t2\n"
+        );
+    }
+
+    #[test]
+    fn a_write_that_waited_for_the_lock_goes_to_the_part_started_meanwhile() {
+        // Another writer starts a new part while this one waits for the lock on the active
+        // part: the write goes to the new last part, not to the one now before it (§17.7).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let one = dir.path().join("s.tsvz.1");
+        fs::write(&one, "b\t2\n").unwrap();
+        let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
+        let guard = lock::lock(&held, &one).unwrap();
+        let store = p.clone();
+        let writer = std::thread::spawn(move || {
+            Writer::open(&store)
+                .unwrap()
+                .append(&[Record::from_args("c", &["3".into()])])
+        });
+        until_waiting(&one);
+        fs::write(dir.path().join("s.tsvz.2"), "").unwrap();
+        drop(guard);
+        writer.join().unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&one).unwrap(), "b\t2\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.2")).unwrap(),
+            "c\t3\n"
         );
     }
 

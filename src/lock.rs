@@ -48,6 +48,8 @@ struct Table {
     /// how many are being closed (a classic lock waits for them too).
     orphans: Vec<File>,
     orphans_closing: usize,
+    /// Threads waiting on the condition, for any file.
+    waiters: usize,
 }
 
 impl Table {
@@ -77,7 +79,9 @@ fn table() -> (Locked, &'static Condvar) {
 /// Wait on `cv` as one of the waiters of file `id`.
 fn wait(mut table: Locked, cv: &Condvar, id: (u64, u64)) -> Locked {
     table.inodes.entry(id).or_default().waiters += 1;
+    table.waiters += 1;
     table = cv.wait(table).unwrap_or_else(|e| e.into_inner());
+    table.waiters -= 1;
     if let Some(inode) = table.inodes.get_mut(&id) {
         inode.waiters -= 1;
     }
@@ -113,7 +117,7 @@ fn close(mut table: Locked, cv: &Condvar, id: Option<(u64, u64)>, files: Vec<Fil
         }
         None => table.orphans_closing -= n,
     }
-    if table.inodes.values().any(|i| i.waiters > 0) {
+    if table.waiters > 0 {
         cv.notify_all();
     }
 }
@@ -139,25 +143,26 @@ impl Handle {
     /// of it that waits to be closed is used again, read from the start: reads meanwhile do
     /// not pile descriptors up.
     pub fn open_read(path: &Path) -> io::Result<Handle> {
-        let classic = table().0.any_classic();
-        if let (true, Ok(meta)) = (classic, std::fs::metadata(path)) {
-            let id = (meta.dev(), meta.ino());
-            let (mut table, _) = table();
-            let reused = table.inodes.get_mut(&id).and_then(|inode| {
-                let at = inode.waiting.iter().rposition(|f| f.1)?;
-                Some(inode.waiting.swap_remove(at).0)
-            });
-            drop(table);
-            if let Some(file) = reused {
-                let mut reader: &File = &file;
-                reader.seek(SeekFrom::Start(0))?;
-                let opened = file.metadata()?;
-                return Ok(Handle {
-                    file: Some(file),
-                    id,
-                    opened,
-                    read_only: true,
+        if table().0.any_classic() {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let id = (meta.dev(), meta.ino());
+                let reused = table().0.inodes.get_mut(&id).and_then(|inode| {
+                    let at = inode.waiting.iter().rposition(|f| f.1)?;
+                    Some(inode.waiting.swap_remove(at).0)
                 });
+                if let Some(file) = reused {
+                    // A handle at once: whatever fails below, dropping it parks the descriptor.
+                    let mut handle = Handle {
+                        file: Some(file),
+                        id,
+                        opened: meta,
+                        read_only: true,
+                    };
+                    let mut reader: &File = &handle;
+                    reader.seek(SeekFrom::Start(0))?;
+                    handle.opened = handle.metadata()?;
+                    return Ok(handle);
+                }
             }
         }
         Handle::with(path, OpenOptions::new().read(true), true)
@@ -257,6 +262,14 @@ pub(crate) fn waiting_on(path: &Path) -> Option<usize> {
         .get(&id)
         .filter(|i| i.locked)
         .map(|i| i.waiting.len())
+}
+
+/// How many threads wait at the gate of `path` (or for its closes): for tests.
+#[cfg(test)]
+pub(crate) fn waiters_on(path: &Path) -> usize {
+    let meta = std::fs::metadata(path).unwrap();
+    let id = (meta.dev(), meta.ino());
+    table().0.inodes.get(&id).map_or(0, |i| i.waiters)
 }
 
 /// A close of file `.0` waits here until `.1` is set: for tests.
@@ -364,33 +377,49 @@ fn take(file: &File, id: (u64, u64), classic: bool) -> io::Result<bool> {
 }
 
 /// The lock on file `id` is released, or was never taken: open its gate, and close what waited
-/// for it (counted as closing, so that a classic lock taken next waits for them).
+/// for it, and the orphans when no lock is classic any more; all counted as closing first, in
+/// the same hold of the mutex, so that a classic lock taken next waits for them.
 fn unlocked(id: (u64, u64)) {
     let (mut table, cv) = table();
-    let (waiting, waiters) = match table.inodes.get_mut(&id) {
+    let waiting: Vec<File> = match table.inodes.get_mut(&id) {
         Some(inode) => {
             inode.locked = false;
             inode.classic = false;
-            let waiting = std::mem::take(&mut inode.waiting);
-            (waiting.into_iter().map(|(f, _)| f).collect(), inode.waiters)
+            let waiting: Vec<File> = inode.waiting.drain(..).map(|(f, _)| f).collect();
+            inode.closing += waiting.len();
+            waiting
         }
-        None => (Vec::new(), 0),
+        None => Vec::new(),
     };
     let orphans = if table.any_classic() {
         Vec::new()
     } else {
         std::mem::take(&mut table.orphans)
     };
+    table.orphans_closing += orphans.len();
     table.tidy(id);
-    if waiters > 0 {
+    if table.waiters > 0 {
         cv.notify_all();
     }
-    if orphans.is_empty() {
-        close(table, cv, Some(id), waiting);
-    } else {
-        close(table, cv, None, orphans);
-        let (table, cv) = self::table();
-        close(table, cv, Some(id), waiting);
+    if waiting.is_empty() && orphans.is_empty() {
+        return;
+    }
+    drop(table);
+    let (n, m) = (waiting.len(), orphans.len());
+    for file in waiting {
+        #[cfg(test)]
+        slow_close(id);
+        drop(file);
+    }
+    drop(orphans);
+    let (mut table, cv) = self::table();
+    if let Some(inode) = table.inodes.get_mut(&id) {
+        inode.closing -= n;
+    }
+    table.orphans_closing -= m;
+    table.tidy(id);
+    if table.waiters > 0 {
+        cv.notify_all();
     }
 }
 
