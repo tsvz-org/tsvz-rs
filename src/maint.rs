@@ -499,11 +499,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
         } else {
             Store::open(store, whole(options))?
         };
-        if s.parts()
-            .iter()
-            .map(|p| &p.path)
-            .ne(prefix.iter().map(|p| &p.path))
-        {
+        if !read_parts(&s, prefix) {
             continue; // the parts changed under the read
         }
         if let Some(version) = newer_version(&s) {
@@ -579,12 +575,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             None
         } else {
             let earlier = Store::open_prefix(store, whole(options), others.len())?;
-            if earlier
-                .parts()
-                .iter()
-                .map(|p| &p.path)
-                .ne(others.iter().map(|p| &p.path))
-            {
+            if !read_parts(&earlier, others) {
                 continue; // the parts changed under the read
             }
             Some(earlier)
@@ -627,11 +618,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 );
             }
         }
-        let unchanged = others
-            .iter()
-            .zip(&before)
-            .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b));
-        if !unchanged {
+        if !unchanged(others, &before) {
             drop_copy();
             continue; // another process changed a part being compacted
         }
@@ -747,17 +734,8 @@ fn snapshot_part(
     // A guard before it is in the store: alone, and after every part before it, it reads as
     // those parts did.
     let all = Store::open_prefix(store, whole(options), prefix.len());
-    let same_parts = all.as_ref().is_ok_and(|a| {
-        a.parts()
-            .iter()
-            .map(|p| &p.path)
-            .eq(prefix.iter().map(|p| &p.path))
-    });
-    let unchanged = prefix
-        .iter()
-        .zip(before)
-        .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b));
-    if !same_parts || !unchanged {
+    let same_parts = all.as_ref().is_ok_and(|a| read_parts(a, prefix));
+    if !same_parts || !unchanged(prefix, before) {
         let _ = std::fs::remove_file(&tmp);
         return Ok(Snapshotted::Again);
     }
@@ -797,12 +775,7 @@ enum Snapshotted {
 /// Where a snapshot part is written before it is linked under its name: a store of its own,
 /// `<stem>.snapshot-<time>-<pid>.<ext>[.<codec>]`, beside the parts but none of them.
 fn snapshot_temp(store: &Path, target: &Path, suffix: Option<&str>) -> PathBuf {
-    let name = store
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let base = crate::name::split_codec(&name).0;
-    let (stem, ext) = base.rsplit_once('.').unwrap_or((base, "tsvz"));
+    let (stem, ext) = stem_and_ext(store);
     let mut temp = format!(
         "{stem}.snapshot-{}-{}.{ext}",
         local_timestamp(),
@@ -813,6 +786,20 @@ fn snapshot_temp(store: &Path, target: &Path, suffix: Option<&str>) -> PathBuf {
         temp.push_str(s);
     }
     target.with_file_name(temp)
+}
+
+/// `mode` narrowed for a file of group `gid` that holds the rows of parts with `metas`: every
+/// bit but its owner's read and write (they let the owner rewrite it, and scrub again, even
+/// when old parts were made read-only) is no more than in every part; group bits go when the
+/// parts are not all of its group. Group and others can neither read nor write the rows more
+/// than in every part they come from.
+fn closed_mode(mode: u32, metas: &[std::fs::Metadata], gid: u32) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    let mut shared = metas.iter().fold(mode & 0o7177, |m, meta| m & meta.mode());
+    if metas.iter().any(|m| m.gid() != gid) {
+        shared &= !0o070;
+    }
+    (mode & 0o600) | shared
 }
 
 /// Write `bytes` to the new file `path`, synced, with the owner of the last of `prefix` and a
@@ -835,24 +822,27 @@ fn write_snapshot(path: &Path, bytes: &[u8], prefix: &[parts::Part]) -> Result<(
         match_owner(&file, like).map_err(io)?;
     }
     let gid = file.metadata().map_err(io)?.gid();
-    let mut shared = metas.iter().fold(0o066, |m, meta| m & meta.mode());
-    if metas.iter().any(|m| m.gid() != gid) {
-        shared &= !0o070;
-    }
-    file.set_permissions(std::fs::Permissions::from_mode(0o600 | shared))
+    let mode = closed_mode(0o666, &metas, gid);
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(io)?;
     file.sync_all().map_err(io)
 }
 
 /// The variant extension of a store path as it is spelled (`tsvz`, `CSV`, …).
 fn variant_ext(store: &Path) -> String {
+    stem_and_ext(store).1
+}
+
+/// A store path's name without its codec suffix, split at its variant extension: `s.tsvz.gz`
+/// → (`s`, `tsvz`).
+fn stem_and_ext(store: &Path) -> (String, String) {
     let name = store
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let base = crate::name::split_codec(&name).0;
-    base.rsplit_once('.')
-        .map_or_else(|| "tsvz".to_string(), |(_, ext)| ext.to_string())
+    let (stem, ext) = base.rsplit_once('.').unwrap_or((base, "tsvz"));
+    (stem.to_string(), ext.to_string())
 }
 
 /// Write the new content of `part` to a recovery copy beside it, private and synced, before the
@@ -999,6 +989,22 @@ fn no_room(e: &Error) -> bool {
         if matches!(source.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)))
 }
 
+/// Whether `s` read exactly `parts`: else the parts changed under the read.
+fn read_parts(s: &Store, parts: &[parts::Part]) -> bool {
+    s.parts()
+        .iter()
+        .map(|p| &p.path)
+        .eq(parts.iter().map(|p| &p.path))
+}
+
+/// Whether each of `parts` still has its stamp in `before` (as many as `parts`, or more).
+fn unchanged(parts: &[parts::Part], before: &[Stamp]) -> bool {
+    parts
+        .iter()
+        .zip(before)
+        .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b))
+}
+
 /// Whether two paths name the same file.
 fn same_file(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -1019,14 +1025,7 @@ fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Err
         .collect::<Result<_, _>>()?;
     let own = std::fs::metadata(target).map_err(|e| Error::io(target, e))?;
     let old = own.mode() & 0o7777;
-    // Every bit is narrowed but its owner's read and write: they let the owner rewrite the
-    // part, and scrub again, even when old parts were made read-only; group and others can
-    // neither read nor write the rows more than in every part they come from.
-    let mut shared = metas.iter().fold(old & 0o7177, |m, meta| m & meta.mode());
-    if metas.iter().any(|m| m.gid() != own.gid()) {
-        shared &= !0o070;
-    }
-    let mode = (old & 0o600) | shared;
+    let mode = closed_mode(old, &metas, own.gid());
     if mode == old {
         return Ok(None);
     }
@@ -1895,7 +1894,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn scrubbing_again_adds_no_copy() {
         // A snapshot part already holding the whole prefix, no larger than a new one would be:
