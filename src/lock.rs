@@ -13,52 +13,43 @@ use std::io;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::path::Path;
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
-type Gate = Arc<(Mutex<bool>, Condvar)>;
-
-/// The in-process gate for a file: POSIX record locks do not exclude two handles of one process.
-fn gate(path: &Path) -> Gate {
-    static GATES: OnceLock<Mutex<HashMap<PathBuf, Gate>>> = OnceLock::new();
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut gates = GATES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    gates.entry(key).or_default().clone()
-}
-
-/// What this process holds on one file, by device and inode: its classic POSIX locks (and the
-/// locks being taken, which may turn out classic), and the descriptors whose closing waits for
-/// them. A file is listed only while it has a lock.
+/// What this process does with one file, by device and inode.
 #[derive(Default)]
-struct Held {
-    locks: usize,
+struct Inode {
+    /// A thread holds the file's write lock, or is taking it: the in-process gate, since POSIX
+    /// record locks do not exclude two descriptors of one process.
+    locked: bool,
+    /// That lock is, or may become, a classic POSIX lock, which closing any descriptor of the
+    /// file releases: the descriptors this process drops meanwhile wait in `waiting`.
+    classic: bool,
     waiting: Vec<File>,
 }
 
-fn held() -> MutexGuard<'static, HashMap<(u64, u64), Held>> {
-    static HELD: OnceLock<Mutex<HashMap<(u64, u64), Held>>> = OnceLock::new();
-    HELD.get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+#[derive(Default)]
+struct Table {
+    /// The files a thread locks or is locking, listed only meanwhile.
+    inodes: HashMap<(u64, u64), Inode>,
+    /// Descriptors of no known file (their fstat failed), kept while any lock is classic.
+    orphans: Vec<File>,
 }
 
-/// One lock of this process on file `id` is gone: once none is left, close what waited for it.
-fn settle(id: (u64, u64)) {
-    let waiting = {
-        let mut held = held();
-        let Some(h) = held.get_mut(&id) else {
-            return;
-        };
-        h.locks -= 1;
-        if h.locks > 0 {
-            return;
-        }
-        held.remove(&id).map(|h| h.waiting).unwrap_or_default()
-    };
-    drop(waiting); // closed outside the table's mutex
+impl Table {
+    fn any_classic(&self) -> bool {
+        self.inodes.values().any(|i| i.classic)
+    }
+}
+
+/// The table, and the condition its gates are waited on with. The descriptors of a store's
+/// files that this process closes are closed under the table's mutex, and a classic lock is
+/// taken only once its file is marked so under the same mutex: a close comes first, or sees
+/// the mark and waits for the lock to be released.
+fn table() -> (MutexGuard<'static, Table>, &'static Condvar) {
+    static TABLE: OnceLock<(Mutex<Table>, Condvar)> = OnceLock::new();
+    let (table, cv) = TABLE.get_or_init(Default::default);
+    (table.lock().unwrap_or_else(|e| e.into_inner()), cv)
 }
 
 /// A file of a store, open in this process. Closing it while the process holds a classic POSIX
@@ -73,11 +64,22 @@ impl Handle {
     /// Open `path` with `options`.
     pub fn open(path: &Path, options: &OpenOptions) -> io::Result<Handle> {
         let file = options.open(path)?;
-        let meta = file.metadata()?;
-        Ok(Handle {
-            id: (meta.dev(), meta.ino()),
-            file: Some(file),
-        })
+        match file.metadata() {
+            Ok(meta) => Ok(Handle {
+                id: (meta.dev(), meta.ino()),
+                file: Some(file),
+            }),
+            Err(e) => {
+                // Which file it is cannot be told: it waits while any lock is classic.
+                let (mut table, _) = table();
+                if table.any_classic() {
+                    table.orphans.push(file);
+                } else {
+                    drop(file);
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -95,39 +97,30 @@ impl Drop for Handle {
         let Some(file) = self.file.take() else {
             return;
         };
-        let mut held = held();
-        match held.get_mut(&self.id) {
-            Some(h) => h.waiting.push(file),
-            None => {
-                drop(held);
-                drop(file);
-            }
+        let (mut table, _) = table();
+        match table.inodes.get_mut(&self.id) {
+            Some(inode) if inode.classic => inode.waiting.push(file),
+            _ => drop(file), // under the mutex: no classic lock is taken meanwhile
         }
     }
-}
-
-fn release(gate: &Gate) {
-    let (held, cv) = &**gate;
-    *held.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    cv.notify_one();
 }
 
 /// The write lock on one file, held until dropped.
 pub struct Guard<'f> {
     file: &'f File,
-    gate: Gate,
     ofd: bool,
     id: (u64, u64),
 }
 
 /// Take the write lock on `file` (open for writing), whose path is `path`; waits as long as
-/// another handle holds it.
+/// another descriptor holds it, in this process or another.
 pub fn lock<'f>(file: &'f File, path: &Path) -> io::Result<Guard<'f>> {
     #[cfg(test)]
     if classic_everywhere() {
         return lock_classic(file, path);
     }
-    lock_as(file, path, None)
+    let _ = path; // the file is told by its device and inode
+    lock_as(file, false)
 }
 
 /// Whether the tests take classic POSIX locks everywhere, as on macOS
@@ -140,8 +133,8 @@ fn classic_everywhere() -> bool {
 
 /// [`lock`] with a classic POSIX lock, as macOS takes: for tests.
 #[cfg(test)]
-pub(crate) fn lock_classic<'f>(file: &'f File, path: &Path) -> io::Result<Guard<'f>> {
-    lock_as(file, path, Some(false))
+pub(crate) fn lock_classic<'f>(file: &'f File, _path: &Path) -> io::Result<Guard<'f>> {
+    lock_as(file, true)
 }
 
 /// Whether another process would find `path` locked now (a child process tries to lock it).
@@ -170,54 +163,69 @@ pub(crate) fn locked_elsewhere(path: &Path) -> bool {
     libc::WEXITSTATUS(status) == 1
 }
 
-/// [`lock`]; `ofd` Some(false) takes a classic POSIX lock.
-fn lock_as<'f>(file: &'f File, path: &Path, ofd: Option<bool>) -> io::Result<Guard<'f>> {
-    let gate = gate(path);
+/// [`lock`]: an open file description lock on Linux unless `classic` (or the kernel refuses
+/// it), else a classic POSIX lock.
+fn lock_as(file: &File, classic: bool) -> io::Result<Guard<'_>> {
+    let meta = file.metadata()?;
+    let id = (meta.dev(), meta.ino());
+    let classic = classic || cfg!(not(target_os = "linux"));
     {
-        let (held, cv) = &*gate;
-        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
-        while *held {
-            held = cv.wait(held).unwrap_or_else(|e| e.into_inner());
+        let (mut table, cv) = table();
+        while table.inodes.get(&id).is_some_and(|i| i.locked) {
+            table = cv.wait(table).unwrap_or_else(|e| e.into_inner());
         }
-        *held = true;
+        let inode = table.inodes.entry(id).or_default();
+        inode.locked = true;
+        inode.classic = classic;
     }
-    let id = match file.metadata() {
-        Ok(meta) => (meta.dev(), meta.ino()),
-        Err(e) => {
-            release(&gate);
-            return Err(e);
-        }
-    };
-    // Until the lock turns out an open file description lock, or is released, the handles of
-    // the file that this process drops are closed only after it.
-    held().entry(id).or_default().locks += 1;
-    match file_lock(file, true, ofd) {
-        Ok(ofd) => {
-            if ofd {
-                settle(id);
+    let taken = take(file, id, classic);
+    if taken.is_err() {
+        unlocked(id);
+    }
+    taken.map(|ofd| Guard { file, ofd, id })
+}
+
+/// Lock `file`, whose entry in the table says `classic`; whether by an open file description
+/// lock.
+fn take(file: &File, id: (u64, u64), classic: bool) -> io::Result<bool> {
+    // SAFETY: an all-zero `flock` is valid; the fields set below describe the whole file.
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = libc::F_WRLCK as _;
+    fl.l_whence = libc::SEEK_SET as _;
+    #[cfg(target_os = "linux")]
+    if !classic {
+        match fcntl(file.as_raw_fd(), F_OFD_SETLKW, &fl) {
+            Ok(()) => return Ok(true),
+            // A kernel or file system without them: a classic lock, marked so first.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                if let Some(inode) = table().0.inodes.get_mut(&id) {
+                    inode.classic = true;
+                }
             }
-            Ok(Guard {
-                file,
-                gate,
-                ofd,
-                id,
-            })
-        }
-        Err(e) => {
-            settle(id);
-            release(&gate);
-            Err(e)
+            Err(e) => return Err(e),
         }
     }
+    let _ = (id, classic);
+    fcntl(file.as_raw_fd(), libc::F_SETLKW, &fl).map(|()| false)
+}
+
+/// The lock on file `id` is released, or was never taken: close what waited for it, under the
+/// table's mutex so before another thread can lock the file, and open its gate.
+fn unlocked(id: (u64, u64)) {
+    let (mut table, cv) = table();
+    if let Some(inode) = table.inodes.remove(&id) {
+        drop(inode.waiting);
+    }
+    if !table.any_classic() {
+        drop(std::mem::take(&mut table.orphans));
+    }
+    cv.notify_all();
 }
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        let _ = file_lock(self.file, false, Some(self.ofd));
-        if !self.ofd {
-            settle(self.id);
-        }
-        release(&self.gate);
+        let _ = unlock(self.file, self.ofd);
+        unlocked(self.id);
     }
 }
 
@@ -226,25 +234,18 @@ const F_OFD_SETLK: libc::c_int = 37;
 #[cfg(target_os = "linux")]
 const F_OFD_SETLKW: libc::c_int = 38;
 
-/// Lock (`on`) or unlock the whole file. `ofd` says which kind an unlock releases; the result
-/// says whether an open file description lock was used.
-fn file_lock(file: &File, on: bool, ofd: Option<bool>) -> io::Result<bool> {
+/// Release the lock on `file`, an open file description lock when `ofd`.
+fn unlock(file: &File, ofd: bool) -> io::Result<()> {
     // SAFETY: an all-zero `flock` is valid; the fields set below describe the whole file.
     let mut fl: libc::flock = unsafe { std::mem::zeroed() };
-    fl.l_type = (if on { libc::F_WRLCK } else { libc::F_UNLCK }) as _;
+    fl.l_type = libc::F_UNLCK as _;
     fl.l_whence = libc::SEEK_SET as _;
-    let fd = file.as_raw_fd();
     #[cfg(target_os = "linux")]
-    if ofd != Some(false) {
-        match fcntl(fd, if on { F_OFD_SETLKW } else { F_OFD_SETLK }, &fl) {
-            Ok(()) => return Ok(true),
-            Err(e) if on && e.raw_os_error() == Some(libc::EINVAL) => {} // a kernel or file system without them
-            Err(e) => return Err(e),
-        }
+    if ofd {
+        return fcntl(file.as_raw_fd(), F_OFD_SETLK, &fl);
     }
-    #[cfg(not(target_os = "linux"))]
     let _ = ofd;
-    fcntl(fd, if on { libc::F_SETLKW } else { libc::F_SETLK }, &fl).map(|()| false)
+    fcntl(file.as_raw_fd(), libc::F_SETLK, &fl)
 }
 
 fn fcntl(fd: libc::c_int, cmd: libc::c_int, fl: &libc::flock) -> io::Result<()> {
@@ -287,9 +288,8 @@ mod tests {
 
     fn waiting(path: &Path) -> Option<usize> {
         let meta = std::fs::metadata(path).unwrap();
-        held()
-            .get(&(meta.dev(), meta.ino()))
-            .map(|h| h.waiting.len())
+        let id = (meta.dev(), meta.ino());
+        table().0.inodes.get(&id).map(|i| i.waiting.len())
     }
 
     #[test]
@@ -340,9 +340,96 @@ mod tests {
         let file = Handle::open(&path, OpenOptions::new().append(true)).unwrap();
         let guard = lock(&file, &path).unwrap();
         drop(Handle::open(&path, OpenOptions::new().read(true)).unwrap());
-        assert_eq!(waiting(&path), None);
+        assert_eq!(waiting(&path), Some(0));
         assert!(locked_elsewhere(&path));
         drop(guard);
+    }
+
+    #[test]
+    fn a_classic_lock_is_never_lost_to_handles_closed_by_other_threads() {
+        // Threads open and drop handles of the file while it is locked and unlocked again: a
+        // drop that decided "no lock" just before the lock was taken must not close after it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.tsvz");
+        std::fs::write(&path, "").unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let droppers: Vec<_> = (0..32)
+            .map(|_| {
+                let (path, stop) = (path.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        drop(Handle::open(&path, OpenOptions::new().read(true)).unwrap());
+                    }
+                })
+            })
+            .collect();
+        let file = Handle::open(&path, OpenOptions::new().append(true)).unwrap();
+        let mut lost = 0;
+        for _ in 0..300 {
+            let guard = lock_classic(&file, &path).unwrap();
+            std::thread::yield_now();
+            lost += usize::from(!locked_elsewhere(&path));
+            drop(guard);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        droppers.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(lost, 0, "locks lost in 300");
+    }
+
+    #[test]
+    fn two_names_of_one_file_exclude_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.tsvz.1");
+        let other = dir.path().join("s.tsvz.1.rotated"); // a rotation's link, before the unlink
+        std::fs::write(&path, "").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first = Handle::open(&path, OpenOptions::new().append(true)).unwrap();
+        let guard = lock_classic(&first, &path).unwrap();
+        let (o2, order2) = (other.clone(), order.clone());
+        let t = std::thread::spawn(move || {
+            let second = Handle::open(&o2, OpenOptions::new().append(true)).unwrap();
+            let _g = lock_classic(&second, &o2).unwrap();
+            order2.lock().unwrap().push("second");
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        order.lock().unwrap().push("first");
+        drop(guard);
+        t.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn handles_close_at_once_while_an_open_file_description_lock_is_waited_for() {
+        if classic_everywhere() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.tsvz");
+        std::fs::write(&path, "").unwrap();
+        // Another open file description holds the lock (as another process would).
+        let holder = OpenOptions::new().append(true).open(&path).unwrap();
+        // SAFETY: an all-zero `flock` is valid; the fields set below describe the whole file.
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = libc::F_WRLCK as _;
+        fl.l_whence = libc::SEEK_SET as _;
+        fcntl(holder.as_raw_fd(), F_OFD_SETLKW, &fl).unwrap();
+        let p = path.clone();
+        let waiter = std::thread::spawn(move || {
+            let file = Handle::open(&p, OpenOptions::new().append(true)).unwrap();
+            drop(lock(&file, &p).unwrap());
+        });
+        std::thread::sleep(Duration::from_millis(100)); // the waiter is in F_OFD_SETLKW
+        drop(Handle::open(&path, OpenOptions::new().read(true)).unwrap());
+        assert_eq!(
+            waiting(&path),
+            Some(0),
+            "no descriptor waits for a lock that cannot be lost"
+        );
+        fl.l_type = libc::F_UNLCK as _;
+        fcntl(holder.as_raw_fd(), F_OFD_SETLK, &fl).unwrap();
+        waiter.join().unwrap();
     }
 
     #[test]
