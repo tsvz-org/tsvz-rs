@@ -331,10 +331,11 @@ impl Store {
     /// This read continued with the plain file `path` as one more part: what a reader would see
     /// were it the next part. For a check that is then thrown away; the store is not refreshed.
     pub(crate) fn read_after(mut self, path: &Path) -> Result<Store, Error> {
+        let codec = path.to_str().and_then(|p| name::split_codec(p).1);
         let part = parts::Part {
             path: path.to_path_buf(),
             ordinal: None,
-            codec: None,
+            codec,
         };
         self.replay.begin_part(path, false);
         self.read_part(&part, true)?;

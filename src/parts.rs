@@ -145,6 +145,52 @@ pub fn codec_suffix(part: &Path) -> Option<String> {
     }
 }
 
+/// An ordinal's value (§17.3: hexadecimal, leading zeros insignificant); None past 128 bits.
+fn ordinal_value(ordinal: &str) -> Option<u128> {
+    let digits = ordinal.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    if digits.len() > 32 {
+        return None;
+    }
+    u128::from_str_radix(digits, 16).ok()
+}
+
+/// An ordinal strictly between the last part of a prefix (None: the unnumbered part 0) and the
+/// active part, for a snapshot part (§19.2.3): the midpoint, spelled with the active ordinal's
+/// width and letter case; None when none is free. After part 0 alone, 0 is never taken: §17.1
+/// names a rotated part 0 `<store>.0.rotated`, the name a rotated part `.0` would take too.
+pub fn snapshot_ordinal(prefix_last: Option<&str>, active: &str) -> Option<String> {
+    let low = match prefix_last {
+        Some(last) => ordinal_value(last)?.checked_add(1)?,
+        None => 1,
+    };
+    let high = ordinal_value(active)?.checked_sub(1)?;
+    if low > high {
+        return None;
+    }
+    let value = low + (high - low) / 2;
+    let width = active.len();
+    Some(if active.bytes().any(|b| b.is_ascii_uppercase()) {
+        format!("{value:0width$X}")
+    } else {
+        format!("{value:0width$x}")
+    })
+}
+
+/// The path of the part `ordinal` of `store`, with the codec `suffix` (§17.2).
+pub fn numbered_path(store: &Path, ordinal: &str, suffix: Option<&str>) -> Result<PathBuf, Error> {
+    let text = store
+        .to_str()
+        .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
+    let base = name::split_codec(text).0;
+    Ok(PathBuf::from(match suffix {
+        Some(s) => format!("{base}.{ordinal}.{s}"),
+        None => format!("{base}.{ordinal}"),
+    }))
+}
+
 /// The path a part takes when it is rotated (§19.5): `.rotated` before its codec suffix, and
 /// `.0.rotated` for part 0 (§17.1: `s.tsvz` → `s.tsvz.0.rotated`). Neither is a part of the store.
 pub fn rotated_path(part: &Path, part0: bool) -> PathBuf {
@@ -173,6 +219,64 @@ mod tests {
             .iter()
             .map(|p| p.path.file_name().unwrap().to_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn a_snapshot_ordinal_lies_between_the_prefix_and_the_active_part() {
+        // After the unnumbered part 0 alone, 0 is never taken: §17.1 names a rotated part 0
+        // s.tsvz.0.rotated, the name a rotated part .0 would take too.
+        assert_eq!(snapshot_ordinal(None, "1"), None);
+        assert_eq!(snapshot_ordinal(None, "2").as_deref(), Some("1"));
+        assert_eq!(snapshot_ordinal(None, "10").as_deref(), Some("08"));
+        assert_eq!(snapshot_ordinal(Some("1"), "5").as_deref(), Some("3"));
+        assert_eq!(
+            snapshot_ordinal(Some("0"), "10").as_deref(),
+            Some("08"),
+            "the active width"
+        );
+        assert_eq!(
+            snapshot_ordinal(Some("9"), "B").as_deref(),
+            Some("A"),
+            "its letter case"
+        );
+        assert_eq!(snapshot_ordinal(Some("a"), "c").as_deref(), Some("b"));
+        for (prefix, active) in [
+            (Some("0f"), "10"),
+            (Some("1"), "2"),
+            (None, "0"),
+            (Some("5"), "3"),
+        ] {
+            assert_eq!(
+                snapshot_ordinal(prefix, active),
+                None,
+                "{prefix:?} {active}"
+            );
+        }
+        // UUIDv7 ordinals: 32 hex digits, 128 bits (§17.6).
+        let a = "0192f3c0000070008000000000000000";
+        let b = "0192f3c0000070008000000000000004";
+        assert_eq!(
+            snapshot_ordinal(Some(a), b).as_deref(),
+            Some("0192f3c0000070008000000000000002")
+        );
+        assert_eq!(
+            snapshot_ordinal(Some("1"), &format!("1{}", "0".repeat(32))),
+            None,
+            "33 digits"
+        );
+        assert_eq!(
+            snapshot_ordinal(Some("00000000000000000000000000000000001"), "0003").as_deref(),
+            Some("0002")
+        );
+        let store = std::path::Path::new("d/s.tsvz");
+        assert_eq!(
+            numbered_path(store, "5", None).unwrap(),
+            std::path::Path::new("d/s.tsvz.5")
+        );
+        assert_eq!(
+            numbered_path(std::path::Path::new("d/s.tsvz.gz"), "5", Some("gz")).unwrap(),
+            std::path::Path::new("d/s.tsvz.5.gz")
+        );
     }
 
     #[test]

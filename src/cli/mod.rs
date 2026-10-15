@@ -41,8 +41,9 @@ operations:
   append ...                   same as set
   delete STORE KEY [KEY ...]   delete KEYs; '-' reads keys from stdin
   clear STORE                  empty the store, keeping its header and markers
-  scrub STORE                  compact the store in place: a one-part store, or the older parts
-                               of a multi-part store into the last of them (§19.8)
+  scrub STORE                  compact the store: a one-part store in place; the older parts of
+                               a multi-part store into a new part before the active one (§19.2),
+                               or into the last of them when no ordinal is free there
   verify STORE                 check #_checksum_<algo>_# segments (exit 4 on a mismatch)
   parts STORE                  list the parts of the store
   has STORE KEY                exit 0 if KEY is live, 3 if not
