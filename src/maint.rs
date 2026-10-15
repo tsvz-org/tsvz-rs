@@ -461,241 +461,298 @@ fn whole(options: &Options) -> Options {
 /// which compacting them would break for the active part.
 pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     refuse_a_part("scrub", store)?;
-    // A refusal after an earlier attempt backed up a damaged part says so.
-    let refused = |why: &str, copy: Option<&(Stamp, PathBuf)>| {
-        let written = match copy {
-            Some((_, copy)) => format!(
-                "nothing was written but {}, a copy of the damaged part",
-                copy.display()
-            ),
-            None => "nothing was written".to_string(),
-        };
-        Err(Error::Refused(format!(
-            "{}: scrub skipped: {why}; {written}",
-            store.display()
-        )))
-    };
     let mut backed_up: Option<(Stamp, PathBuf)> = None;
     let mut told = false;
+    let mut why = "the store kept changing while it was being compacted".to_string();
     for _ in 0..ATTEMPTS {
-        let list = parts::list(store)?;
-        if list.is_empty() {
-            return Err(Error::Missing(store.to_path_buf()));
-        }
-        let multi = list.len() > 1;
-        let prefix = if multi {
-            &list[..list.len() - 1]
-        } else {
-            &list[..]
-        };
-        let (others, target) = prefix.split_at(prefix.len() - 1);
-        let target = &target[0];
-        let before: Vec<Stamp> = prefix
-            .iter()
-            .map(|p| stamp(&p.path))
-            .collect::<Result<_, _>>()?;
-        let s = if multi {
-            Store::open_prefix(store, whole(options), prefix.len())?
-        } else {
-            Store::open(store, whole(options))?
-        };
-        if !read_parts(&s, prefix) {
-            continue; // the parts changed under the read
-        }
-        if let Some(version) = newer_version(&s) {
-            return refused(
-                &format!(
-                    "{} declare{} {version} (#_version_#), newer than this tsvz implements, which reads {} as version {SPEC_VERSION} only (§6.3)",
-                    if multi {
-                        "the parts before the active one"
-                    } else {
-                        "it"
-                    },
-                    if multi { "" } else { "s" },
-                    if multi { "them" } else { "it" },
-                ),
-                backed_up.as_ref(),
-            );
-        }
-        if multi && s.incomplete() {
-            return refused(
-                "the parts before the active one could not be read whole (§4.10)",
-                backed_up.as_ref(),
-            );
-        }
-        if multi && s.has_checksums() {
-            return refused(
-                "the parts before the active one hold checksum segments (§15), which compacting them would break for the active part",
-                backed_up.as_ref(),
-            );
-        }
-        // An ordinal free between the parts before the active one and it: the snapshot goes
-        // there as a new part, atomically (§19.2); else they are compacted into the last of
-        // them, in place (§19.8).
-        let active = &list[list.len() - 1];
-        let slot = active
-            .ordinal
-            .as_deref()
-            .and_then(|a| parts::snapshot_ordinal(target.ordinal.as_deref(), a));
-        let name = |p: &Path| {
-            p.file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-        };
-        let why = match (multi, slot) {
-            (true, Some(ordinal)) => {
-                match snapshot_part(store, options, prefix, &ordinal, &s, &before)? {
-                    Snapshotted::Done(outcome) => return Ok(outcome),
-                    Snapshotted::Again => continue, // the parts changed under the read
-                    Snapshotted::InPlace(why) => why,
-                }
-            }
-            _ => format!(
-                "no ordinal is free between {} and the active part {}; sparse ordinals, such as UUIDv7 (§17.6), let a scrub write a new part instead",
-                name(&target.path),
-                name(&active.path)
-            ),
-        };
-        if multi {
-            use std::os::unix::fs::MetadataExt;
-            let owner = match std::fs::metadata(&target.path) {
-                Ok(meta) => meta.uid(),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // the parts changed
-                Err(e) => return Err(Error::io(&target.path, e)),
-            };
-            match unreadable_to(owner, others)? {
-                Owners::Readable => {}
-                Owners::Changed => continue,
-                Owners::Hidden(part, uid) => {
-                    return refused(&kept_from(owner, &part, uid), backed_up.as_ref());
-                }
-            }
-        }
-        if let (true, false, Some(w)) = (multi, told, &options.warnings) {
-            told = true;
-            w(&Warning {
-                part: target.path.clone(),
-                offset: None,
-                message: format!(
-                    "{why}: the parts before the active one are compacted into {} in place (§19.8), where readers that take no lock may see it rewritten",
-                    name(&target.path)
-                ),
-            });
-        }
-        let mut copy = None;
-        if s.damaged() || s.stopped().is_some() {
-            copy = match &backed_up {
-                Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
-                _ => {
-                    let path = backup(&target.path, options)?;
-                    backed_up = Some((before[before.len() - 1], path.clone()));
-                    Some(path)
-                }
-            };
-        }
-        // The parts left before the one compacted into, read whole: what it must undo.
-        let earlier = if others.is_empty() {
-            None
-        } else {
-            let earlier = Store::open_prefix(store, whole(options), others.len())?;
-            if !read_parts(&earlier, others) {
-                continue; // the parts changed under the read
-            }
-            Some(earlier)
-        };
-        let content = match &earlier {
-            None => snapshot(&s),
-            Some(earlier) => match live_after_any_prefix(store, options, others, earlier)? {
-                Some(deleted) => restating_snapshot(&s, &deleted),
-                None => continue, // the parts changed under the read
-            },
-        };
-        // A one-part scrub with no room for the copy (it is how a full disk gets room back)
-        // rewrites in place without one, as TSVZ.py does, where the file system overwrites in
-        // place: the rewrite reserves its length first, so it still changes nothing when even
-        // that does not fit. A copy-on-write one gives no such promise: refused there.
-        let recovery = match write_recovery(store, &target.path, content.as_bytes()) {
-            Ok(path) => Some(path),
-            Err(e) if !multi && no_room(&e) && overwrites_in_place(&target.path) => {
-                if let Some(w) = &options.warnings {
-                    w(&Warning {
-                        part: target.path.clone(),
-                        offset: None,
-                        message: "no room for a recovery copy of the new content; rewriting the part in place without one (§19.8)".into(),
-                    });
-                }
-                None
+        match attempt(store, options, &mut backed_up, &mut told) {
+            Ok(Step::Done(outcome)) => return Ok(outcome),
+            Ok(Step::Again) => {}
+            // A file gone under the scrub: the parts changed, as for every other change.
+            Err(e) if gone(&e) => {}
+            Ok(Step::Refused(reason)) => {
+                why = reason;
+                break;
             }
             Err(e) => return Err(e),
-        };
-        let drop_copy = || {
-            if let Some(copy) = &recovery {
-                let _ = std::fs::remove_file(copy);
-            }
-        };
-        if let (true, Some(copy)) = (multi, &recovery) {
-            if !(reads_as(copy, &s) && earlier.is_none_or(|e| reads_as_after(e, copy, &s))) {
-                drop_copy();
-                return refused(
-                    "the compacted content did not read back as the parts it replaces (please report this)",
-                    backed_up.as_ref(),
-                );
-            }
         }
-        if !unchanged(others, &before) {
-            drop_copy();
-            continue; // another process changed a part being compacted
-        }
-        // Narrowed only now that the rows are about to go in, and put back if they do not.
-        let narrowed = if multi {
-            match narrow_mode(&target.path, prefix) {
-                Ok(old) => old,
-                Err(e) => {
-                    drop_copy();
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        let written = rewrite(
-            &target.path,
-            content.as_bytes(),
-            before[before.len() - 1],
-            target.codec,
-            s.markers().member_size,
-            recovery.as_deref(),
-        );
-        if let (Some(old), true) = (narrowed, put_mode_back(&written)) {
-            let _ = std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(old));
-        }
-        // The recovery copy goes, unless the part was left damaged: then it is all there is.
-        if !written.as_ref().is_err_and(damaged) {
-            drop_copy();
-        }
-        let written = written?;
-        let Some(written) = written else {
-            continue; // another writer committed after the read
-        };
-        if multi {
-            // A part whose damage was recovered is never deleted: rename instead (§19.5).
-            let action = match s.markers().rotate {
-                "delete" if s.damaged() => "rename",
-                action => action,
-            };
-            rotate(others, action)?;
-        }
-        return Ok(if s.stopped().is_some() {
-            Outcome::Partial { backup: copy }
-        } else if written {
-            Outcome::Written
-        } else {
-            Outcome::Unchanged
-        });
     }
+    // A refusal after an attempt backed up a damaged part says so.
+    let written = match &backed_up {
+        Some((_, copy)) => format!(
+            "nothing was written but {}, a copy of the damaged part",
+            copy.display()
+        ),
+        None => "nothing was written".to_string(),
+    };
     Err(Error::Refused(format!(
-        "{}: scrub skipped: the store kept changing while it was being compacted; nothing was written",
+        "{}: scrub skipped: {why}; {written}",
         store.display()
     )))
+}
+
+/// What one attempt of a scrub came to.
+enum Step {
+    Done(Outcome),
+    /// The parts changed under the reads: try again.
+    Again,
+    /// Refused, for this reason.
+    Refused(String),
+}
+
+/// Whether `e` says a file is not there (any more).
+fn gone(e: &Error) -> bool {
+    matches!(e, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
+}
+
+/// The metadata of each of `parts`.
+fn metas(parts: &[parts::Part]) -> Result<Vec<std::fs::Metadata>, Error> {
+    parts
+        .iter()
+        .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
+        .collect()
+}
+
+/// One attempt of [`scrub`]; `backed_up` is the copy of a damaged part made by an attempt,
+/// and `told` whether the in-place warning was given.
+fn attempt(
+    store: &Path,
+    options: &Options,
+    backed_up: &mut Option<(Stamp, PathBuf)>,
+    told: &mut bool,
+) -> Result<Step, Error> {
+    let list = parts::list(store)?;
+    if list.is_empty() {
+        return Err(Error::Missing(store.to_path_buf()));
+    }
+    let multi = list.len() > 1;
+    let prefix = if multi {
+        &list[..list.len() - 1]
+    } else {
+        &list[..]
+    };
+    let (others, target) = prefix.split_at(prefix.len() - 1);
+    let target = &target[0];
+    let before: Vec<Stamp> = prefix
+        .iter()
+        .map(|p| stamp(&p.path))
+        .collect::<Result<_, _>>()?;
+    let s = if multi {
+        Store::open_prefix(store, whole(options), prefix.len())?
+    } else {
+        Store::open(store, whole(options))?
+    };
+    if !read_parts(&s, prefix) {
+        return Ok(Step::Again); // the parts changed under the read
+    }
+    if let Some(version) = newer_version(&s) {
+        return Ok(Step::Refused(format!(
+            "{} declare{} {version} (#_version_#), newer than this tsvz implements, which reads {} as version {SPEC_VERSION} only (§6.3)",
+            if multi {
+                "the parts before the active one"
+            } else {
+                "it"
+            },
+            if multi { "" } else { "s" },
+            if multi { "them" } else { "it" },
+        )));
+    }
+    if multi && s.incomplete() {
+        return Ok(Step::Refused(
+            "the parts before the active one could not be read whole (§4.10)".into(),
+        ));
+    }
+    if multi && s.has_checksums() {
+        return Ok(Step::Refused(
+            "the parts before the active one hold checksum segments (§15), which compacting them would break for the active part".into(),
+        ));
+    }
+    // An ordinal free between the parts before the active one and it: the snapshot goes
+    // there as a new part, atomically (§19.2); else they are compacted into the last of
+    // them, in place (§19.8).
+    let active = &list[list.len() - 1];
+    let slot = active
+        .ordinal
+        .as_deref()
+        .and_then(|a| parts::snapshot_ordinal(target.ordinal.as_deref(), a));
+    let name = |p: &Path| {
+        p.file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    };
+    let why = match (multi, slot) {
+        (true, Some(ordinal)) => {
+            match snapshot_part(store, options, prefix, &ordinal, &s, &before)? {
+                Snapshotted::Done(outcome) => return Ok(Step::Done(outcome)),
+                Snapshotted::Again => return Ok(Step::Again),
+                Snapshotted::Refused(why) => return Ok(Step::Refused(why)),
+                Snapshotted::InPlace(why) => why,
+            }
+        }
+        _ => format!(
+            "no ordinal is free between {} and the active part {}; sparse ordinals, such as UUIDv7 (§17.6), let a scrub write a new part instead",
+            name(&target.path),
+            name(&active.path)
+        ),
+    };
+    if multi {
+        use std::os::unix::fs::MetadataExt;
+        let owner = stamp_meta(&target.path)?.uid();
+        let others_metas = metas(others)?;
+        if let Some((part, uid)) = unreadable_to(owner, others, &others_metas) {
+            return Ok(Step::Refused(kept_from(owner, &part, uid)));
+        }
+    }
+    if let (true, false, Some(w)) = (multi, *told, &options.warnings) {
+        *told = true;
+        w(&Warning {
+            part: target.path.clone(),
+            offset: None,
+            message: format!(
+                "{why}: the parts before the active one are compacted into {} in place (§19.8), where readers that take no lock may see it rewritten",
+                name(&target.path)
+            ),
+        });
+    }
+    let mut copy = None;
+    if s.damaged() || s.stopped().is_some() {
+        copy = match &*backed_up {
+            Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
+            old => {
+                let path = backup(&target.path, options)?;
+                // A copy of the part as it was before (appends since) holds nothing more.
+                if let Some((_, old)) = old {
+                    if starts_with_file(&path, old) {
+                        let _ = std::fs::remove_file(old);
+                    }
+                }
+                *backed_up = Some((before[before.len() - 1], path.clone()));
+                Some(path)
+            }
+        };
+    }
+    // The parts left before the one compacted into, read whole: what it must undo.
+    let earlier = if others.is_empty() {
+        None
+    } else {
+        let earlier = Store::open_prefix(store, whole(options), others.len())?;
+        if !read_parts(&earlier, others) {
+            return Ok(Step::Again); // the parts changed under the read
+        }
+        Some(earlier)
+    };
+    let content = match &earlier {
+        None => snapshot(&s),
+        Some(earlier) => match live_after_any_prefix(store, options, others, earlier)? {
+            Some(deleted) => restating_snapshot(&s, &deleted),
+            None => return Ok(Step::Again), // the parts changed under the read
+        },
+    };
+    // A one-part scrub with no room for the copy (it is how a full disk gets room back)
+    // rewrites in place without one, as TSVZ.py does, where the file system overwrites in
+    // place: the rewrite reserves its length first, so it still changes nothing when even
+    // that does not fit. A copy-on-write one gives no such promise: refused there.
+    let recovery = match write_recovery(store, &target.path, content.as_bytes()) {
+        Ok(path) => Some(path),
+        Err(e) if !multi && no_room(&e) && overwrites_in_place(&target.path) => {
+            if let Some(w) = &options.warnings {
+                w(&Warning {
+                    part: target.path.clone(),
+                    offset: None,
+                    message: "no room for a recovery copy of the new content; rewriting the part in place without one (§19.8)".into(),
+                });
+            }
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let drop_copy = || {
+        if let Some(copy) = &recovery {
+            let _ = std::fs::remove_file(copy);
+        }
+    };
+    if let (true, Some(copy)) = (multi, &recovery) {
+        if !(reads_as(copy, &s) && earlier.is_none_or(|e| reads_as_after(e, copy, &s))) {
+            drop_copy();
+            return Ok(Step::Refused(
+                "the compacted content did not read back as the parts it replaces (please report this)".into(),
+            ));
+        }
+    }
+    if !unchanged(others, &before) {
+        drop_copy();
+        return Ok(Step::Again); // another process changed a part being compacted
+    }
+    // Narrowed only now that the rows are about to go in, and put back if they do not.
+    let narrowed = if multi {
+        match narrow_mode(&target.path, prefix) {
+            Ok(old) => old,
+            Err(e) => {
+                drop_copy();
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+    let written = rewrite(
+        &target.path,
+        content.as_bytes(),
+        before[before.len() - 1],
+        target.codec,
+        s.markers().member_size,
+        recovery.as_deref(),
+    );
+    if let (Some(old), true) = (narrowed, put_mode_back(&written)) {
+        let _ = std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(old));
+    }
+    // The recovery copy goes, unless the part was left damaged: then it is all there is.
+    if !written.as_ref().is_err_and(damaged) {
+        drop_copy();
+    }
+    let written = written?;
+    let Some(written) = written else {
+        return Ok(Step::Again); // another writer committed after the read
+    };
+    if multi {
+        // A part whose damage was recovered is never deleted: rename instead (§19.5).
+        let action = match s.markers().rotate {
+            "delete" if s.damaged() => "rename",
+            action => action,
+        };
+        rotate(others, action)?;
+    }
+    Ok(Step::Done(if s.stopped().is_some() {
+        Outcome::Partial { backup: copy }
+    } else if written {
+        Outcome::Written
+    } else {
+        Outcome::Unchanged
+    }))
+}
+
+/// The metadata of `path`.
+fn stamp_meta(path: &Path) -> Result<std::fs::Metadata, Error> {
+    std::fs::metadata(path).map_err(|e| Error::io(path, e))
+}
+
+/// Whether the file `whole` begins with the bytes of the file `start` (an older copy of a part
+/// that was only appended to since).
+fn starts_with_file(whole: &Path, start: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(mut a), Ok(mut b)) = (File::open(whole), File::open(start)) else {
+        return false;
+    };
+    let (mut x, mut y) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let n = match b.read(&mut y) {
+            Ok(0) => return true,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if a.read_exact(&mut x[..n]).is_err() || x[..n] != y[..n] {
+            return false;
+        }
+    }
 }
 
 /// Write the snapshot of `prefix` (read whole as `s`) as the new part `ordinal`, between it and
@@ -750,32 +807,19 @@ fn snapshot_part(
     let suffix = parts::codec_suffix(&last.path);
     let target = parts::numbered_path(store, ordinal, suffix.as_deref())?;
     let tmp = snapshot_temp(store, &target, suffix.as_deref());
+    let metas = metas(prefix)?;
     // Its owner is judged while it is empty: one who could not read every part gets no row.
-    let filled = new_snapshot(&tmp, prefix).and_then(|(file, owner)| {
-        #[cfg(test)]
-        owners_checked(&tmp);
-        match unreadable_to(owner, prefix)? {
-            Owners::Readable => fill_snapshot(file, &tmp, &bytes, prefix).map(|()| None),
-            Owners::Changed => Ok(Some(None)),
-            Owners::Hidden(part, uid) => Ok(Some(Some(kept_from(owner, &part, uid)))),
-        }
-    });
-    match filled {
-        Ok(None) => {}
-        Ok(Some(why)) => {
-            let _ = std::fs::remove_file(&tmp);
-            return match why {
-                None => Ok(Snapshotted::Again), // the parts changed
-                Some(why) => Err(Error::Refused(format!(
-                    "{}: scrub skipped: {why}; nothing was written",
-                    store.display()
-                ))),
-            };
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
+    let (file, owner) = new_snapshot(&tmp, &metas[metas.len() - 1])?;
+    #[cfg(test)]
+    owners_checked(&tmp);
+    if let Some((part, uid)) = unreadable_to(owner, prefix, &metas) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(Snapshotted::Refused(kept_from(owner, &part, uid)));
+    }
+    if let Err(e) = fill_snapshot(file, &tmp, &bytes, &metas) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     // A guard before it is in the store: alone, and after every part before it, it reads as
     // those parts did.
@@ -787,10 +831,9 @@ fn snapshot_part(
     }
     if !(reads_as(&tmp, s) && all.is_ok_and(|a| reads_as_after(a, &tmp, s))) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Error::Refused(format!(
-            "{}: scrub skipped: the snapshot did not read back as the parts it replaces (please report this); nothing was written",
-            store.display()
-        )));
+        return Ok(Snapshotted::Refused(
+            "the snapshot did not read back as the parts it replaces (please report this)".into(),
+        ));
     }
     // A link never replaces a file: a name taken meanwhile (another scrub) means try again;
     // a file system without links (FAT, some network and FUSE mounts) means in place.
@@ -811,19 +854,24 @@ fn snapshot_part(
 }
 
 /// What `snapshot_part` did: the scrub is done; the parts changed under the reads, so try
-/// again; or the parts are to be compacted in place instead, for the reason given.
+/// again; it is refused; or the parts are to be compacted in place instead, for the reason
+/// given.
 enum Snapshotted {
     Done(Outcome),
     Again,
+    Refused(String),
     InPlace(String),
 }
 
 /// Where a snapshot part is written before it is linked under its name: a store of its own,
-/// `<stem>.snapshot-<time>-<pid>.<ext>[.<codec>]`, beside the parts but none of them.
+/// `<stem>.snapshot-<time>-<pid>-<n>.<ext>[.<codec>]` (`n` counts this process's snapshots),
+/// beside the parts but none of them.
 fn snapshot_temp(store: &Path, target: &Path, suffix: Option<&str>) -> PathBuf {
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (stem, ext) = stem_and_ext(store);
     let mut temp = format!(
-        "{stem}.snapshot-{}-{}.{ext}",
+        "{stem}.snapshot-{}-{}-{n}.{ext}",
         local_timestamp(),
         std::process::id()
     );
@@ -848,9 +896,9 @@ fn closed_mode(mode: u32, metas: &[std::fs::Metadata], gid: u32) -> u32 {
     (mode & 0o600) | shared
 }
 
-/// Make the new, empty file `path` (0600), owned like the last of `prefix` when this process
-/// may give it away: the file and its owner.
-fn new_snapshot(path: &Path, prefix: &[parts::Part]) -> Result<(File, u32), Error> {
+/// Make the new, empty file `path` (0600), owned like the part with `like` when this process
+/// may give it away: the file and its owner. A file it made is removed if it fails after.
+fn new_snapshot(path: &Path, like: &std::fs::Metadata) -> Result<(File, u32), Error> {
     use std::os::unix::fs::MetadataExt;
     let io = |e: io::Error| Error::io(path, e);
     let file = OpenOptions::new()
@@ -859,32 +907,30 @@ fn new_snapshot(path: &Path, prefix: &[parts::Part]) -> Result<(File, u32), Erro
         .mode(0o600)
         .open(path)
         .map_err(io)?;
-    if let Some(last) = prefix.last() {
-        let like = std::fs::metadata(&last.path).map_err(|e| Error::io(&last.path, e))?;
-        match_owner(&file, &like).map_err(io)?;
+    match match_owner(&file, like).and_then(|()| file.metadata()) {
+        Ok(meta) => Ok((file, meta.uid())),
+        Err(e) => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            Err(io(e))
+        }
     }
-    let owner = file.metadata().map_err(io)?.uid();
-    Ok((file, owner))
 }
 
 /// Write `bytes` to the new snapshot `file` (at `path`), give it a mode no more open than any
-/// of `prefix` (its owner reads and writes it), and sync it.
+/// of the parts with `metas` (its owner reads and writes it), and sync it.
 fn fill_snapshot(
     mut file: File,
     path: &Path,
     bytes: &[u8],
-    prefix: &[parts::Part],
+    metas: &[std::fs::Metadata],
 ) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
     let io = |e: io::Error| Error::io(path, e);
-    let metas: Vec<std::fs::Metadata> = prefix
-        .iter()
-        .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
-        .collect::<Result<_, _>>()?;
     file.write_all(bytes).map_err(io)?;
     let gid = file.metadata().map_err(io)?.gid();
     file.set_permissions(std::fs::Permissions::from_mode(closed_mode(
-        0o666, &metas, gid,
+        0o666, metas, gid,
     )))
     .map_err(io)?;
     file.sync_all().map_err(io)
@@ -1150,37 +1196,24 @@ fn groups_of(uid: u32, room: usize) -> Option<Vec<u32>> {
     Some(groups)
 }
 
-/// Whether the owner of the part a scrub puts rows in could read every part they come from.
-enum Owners {
-    Readable,
-    /// It could not read this part, owned by that user.
-    Hidden(PathBuf, u32),
-    /// A part is gone: the parts changed under the scrub.
-    Changed,
-}
-
-/// Whether user `owner` could read every one of `parts` by its mode: rows a scrub must not
-/// compact into a part of `owner`'s, who would then read them. Readable when `owner` is the
-/// user scrubbing, who has just read them all.
-fn unreadable_to(owner: u32, parts: &[parts::Part]) -> Result<Owners, Error> {
+/// The first of `parts` (with `metas`) that user `owner` could not read, by its mode, and that
+/// part's owner: rows a scrub must not compact into a part of `owner`'s, who would then read
+/// them. None when `owner` is the user scrubbing, who has just read them all.
+fn unreadable_to(
+    owner: u32,
+    parts: &[parts::Part],
+    metas: &[std::fs::Metadata],
+) -> Option<(PathBuf, u32)> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid only reads the process's user id.
     if owner == unsafe { libc::geteuid() } {
-        return Ok(Owners::Readable);
+        return None;
     }
     let mut groups = None;
-    for p in parts {
-        let meta = match std::fs::metadata(&p.path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Owners::Changed),
-            Err(e) => return Err(Error::io(&p.path, e)),
-        };
+    parts.iter().zip(metas).find_map(|(p, meta)| {
         let groups = groups.get_or_insert_with(|| groups_of(owner, 1 << 14).unwrap_or_default());
-        if !may_read(owner, groups, &meta) {
-            return Ok(Owners::Hidden(p.path.clone(), meta.uid()));
-        }
-    }
-    Ok(Owners::Readable)
+        (!may_read(owner, groups, meta)).then(|| (p.path.clone(), meta.uid()))
+    })
 }
 
 /// Why rows of `part` (owned by `uid`) stay out of a part of `owner`'s.
@@ -1727,16 +1760,47 @@ mod tests {
     }
 
     #[test]
-    fn a_part_gone_while_owners_are_checked_means_the_parts_changed() {
+    fn two_snapshots_of_one_process_never_share_a_temporary_name() {
+        let store = Path::new("/d/s.tsvz");
+        let target = Path::new("/d/s.tsvz.5.gz");
+        let a = snapshot_temp(store, target, Some("gz"));
+        let b = snapshot_temp(store, target, Some("gz"));
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().ends_with(".tsvz.gz"), "{}", a.display());
+    }
+
+    #[test]
+    fn a_snapshot_never_removes_a_file_it_did_not_make() {
         let dir = tempfile::tempdir().unwrap();
-        let gone = parts::Part {
+        let theirs = dir.path().join("s.snapshot-x.tsvz");
+        fs::write(&theirs, "another scrub's\n").unwrap();
+        let like = fs::metadata(&theirs).unwrap();
+        assert!(new_snapshot(&theirs, &like).is_err());
+        assert_eq!(fs::read(&theirs).unwrap(), b"another scrub's\n");
+    }
+
+    #[test]
+    fn a_copy_of_a_part_appended_to_since_holds_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (dir.path().join("old"), dir.path().join("new"));
+        fs::write(&old, "a\t1\n\0\0").unwrap();
+        fs::write(&new, "a\t1\n\0\0b\t2\n").unwrap();
+        assert!(starts_with_file(&new, &old));
+        fs::write(&new, "c\t3\n").unwrap(); // rewritten in place, not appended to
+        assert!(!starts_with_file(&new, &old));
+    }
+
+    #[test]
+    fn a_part_gone_under_a_scrub_means_the_parts_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone_part = parts::Part {
             path: dir.path().join("s.tsvz.1"),
             ordinal: Some("1".into()),
             codec: None,
         };
-        // SAFETY: geteuid only reads the process's user id.
-        let other = unsafe { libc::geteuid() } + 1;
-        assert!(matches!(unreadable_to(other, &[gone]), Ok(Owners::Changed)));
+        let err = metas(&[gone_part]).unwrap_err();
+        assert!(gone(&err), "{err}");
+        assert!(!gone(&Error::Refused("no".into())));
     }
 
     #[test]
