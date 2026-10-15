@@ -125,7 +125,14 @@ impl Client {
     /// the defaults row of a missing key, or the rows a read returned with status 1.
     pub fn request(&mut self, fields: &[&str], bulk: Option<&[Record]>) -> Result<Response, Error> {
         let line: Vec<String> = fields.iter().map(|f| field(f, false)).collect();
-        let records: Option<Vec<String>> = bulk.map(|b| b.iter().map(protocol_record).collect());
+        let records = match bulk {
+            Some(b) => Some(
+                b.iter()
+                    .map(protocol_record)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
         self.send(&line.join("\t"), records.as_deref())
     }
 
@@ -210,11 +217,14 @@ impl Client {
         match records {
             [] => Ok(()),
             [one] => {
-                let line = self.write(&format!("set\t{}", protocol_record(one)));
+                let line = self.write(&format!("set\t{}", protocol_record(one)?));
                 self.call(&line, None).map(drop)
             }
             many => {
-                let lines: Vec<String> = many.iter().map(protocol_record).collect();
+                let lines = many
+                    .iter()
+                    .map(protocol_record)
+                    .collect::<Result<Vec<_>, _>>()?;
                 let line = self.write("set\t-");
                 self.call(&line, Some(&lines)).map(drop)
             }

@@ -257,6 +257,26 @@ fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
 }
 
 #[test]
+fn a_client_cannot_send_a_request_inside_a_marker_key() {
+    // A marker key with a line break would end the request line, and what follows it would
+    // run as a request of its own.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let _served = Served::start(&s, &[]);
+    let mut client = tsvz::handler::Client::connect(&s).unwrap();
+    for key in ["#_x_#\nclear", "#_y_#\nstop", "a"] {
+        let marker = tsvz::Record::Marker {
+            key: key.into(),
+            values: vec![],
+        };
+        let e = client.set(&[marker]).unwrap_err();
+        assert!(e.to_string().contains("not a marker key"), "{key:?}: {e}");
+    }
+    assert_eq!(client.len().unwrap(), 1, "nothing ran");
+    assert_eq!(ask(&s, "get\ta").lines, ["a\t1"]);
+}
+
+#[test]
 fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
     use std::os::fd::{FromRawFd, OwnedFd};
     let dir = tempfile::tempdir().unwrap();

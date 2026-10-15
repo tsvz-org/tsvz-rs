@@ -384,12 +384,13 @@ const PROTOCOL: Format = Format {
 
 /// A record as a line of the handler protocol, without its `\n` (§21.4): a marker key as
 /// written, a data key with `<#>` for a leading `#`, values §13-encoded with TAB.
-pub fn protocol_record(record: &Record) -> String {
+/// A record as a protocol line; refused as `encode_record` refuses it (a marker record whose
+/// key is not a marker key), since it could not be sent as one line.
+pub fn protocol_record(record: &Record) -> Result<String, Error> {
     let mut line = String::new();
-    // A strict variant encodes every field, so this cannot be refused.
-    let _ = encode_record(record, PROTOCOL, &mut line);
+    encode_record(record, PROTOCOL, &mut line)?;
     line.pop();
-    line
+    Ok(line)
 }
 
 /// Append one row as a record line to `buf`: the key (`<#>` for a leading `#`), then its cells,
@@ -721,12 +722,15 @@ mod tests {
             key: "#k".into(),
             values: strings(&["a\tb", "c\nd", ""]),
         };
-        assert_eq!(protocol_record(&data), "<#>k\ta<sep>b\tc<LF>d\t");
+        assert_eq!(protocol_record(&data).unwrap(), "<#>k\ta<sep>b\tc<LF>d\t");
         let marker = Record::Marker {
             key: "#_defaults_#".into(),
             values: strings(&["x,y"]),
         };
-        assert_eq!(protocol_record(&marker), "#_defaults_#\tx,y");
-        assert_eq!(protocol_record(&Record::Tombstone { key: "k".into() }), "k");
+        assert_eq!(protocol_record(&marker).unwrap(), "#_defaults_#\tx,y");
+        assert_eq!(
+            protocol_record(&Record::Tombstone { key: "k".into() }).unwrap(),
+            "k"
+        );
     }
 }

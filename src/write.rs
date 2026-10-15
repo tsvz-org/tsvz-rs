@@ -18,7 +18,8 @@ pub enum Record {
     Data { key: String, values: Vec<String> },
     /// A lone data key: deletes it (§9).
     Tombstone { key: String },
-    /// A marker line: the key as written, then its values; no values resets it (§12.1).
+    /// A marker line: the key as written, then its values; no values resets it (§12.1). The key
+    /// must match the reserved pattern `#_name_#` (§12.2): a write of any other is refused.
     Marker { key: String, values: Vec<String> },
 }
 
@@ -127,6 +128,12 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
         Record::Tombstone { key } => (key, &[][..], false),
         Record::Marker { key, values } => (key, &values[..], true),
     };
+    if marker && !is_marker_key(key) {
+        // Else it would be a data row or a tombstone, or, with a line break, lines of its own.
+        return Err(Error::Refused(format!(
+            "{key:?} is not a marker key (#_name_#, §12.2); nothing was written"
+        )));
+    }
     if !format.strict {
         for field in std::iter::once(key).chain(values) {
             if field.bytes().any(|b| b == d || b == b'\n' || b == b'\r') {
@@ -380,6 +387,32 @@ mod tests {
     fn enc(r: Record, f: Format) -> Result<String, Error> {
         let mut s = String::new();
         encode_record(&r, f, &mut s).map(|()| s)
+    }
+
+    #[test]
+    fn a_marker_record_must_have_a_marker_key() {
+        // Else it writes a data row or a tombstone, or, with a line break, lines of its own.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        std::fs::write(&p, "a\t1\n").unwrap();
+        for key in ["a", "defaults", "#_x_#\nevil", "#_x_", "#__#"] {
+            let marker = Record::Marker {
+                key: key.into(),
+                values: vec!["v".into()],
+            };
+            let e = Writer::open(&p).unwrap().append(&[marker]).unwrap_err();
+            assert!(e.to_string().contains("not a marker key"), "{key:?}: {e}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a\t1\n",
+            "nothing written"
+        );
+        let marker = Record::Marker {
+            key: "#_X-y_#".into(),
+            values: vec!["v".into()],
+        };
+        Writer::open(&p).unwrap().append(&[marker]).unwrap();
     }
 
     #[test]

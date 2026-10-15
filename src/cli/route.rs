@@ -88,7 +88,14 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
     }
     let records = if writes && ctx.args.args == ["-"] {
         match bulk(ctx, op == "delete") {
-            Ok(records) => Some(records.iter().map(protocol_record).collect::<Vec<_>>()),
+            Ok(records) => match records
+                .iter()
+                .map(protocol_record)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(lines) => Some(lines),
+                Err(e) => return Some(Err(e)),
+            },
             Err(e) => return Some(Err(e)),
         }
     } else {
