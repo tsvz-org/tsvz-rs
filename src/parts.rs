@@ -145,21 +145,22 @@ pub fn codec_suffix(part: &Path) -> Option<String> {
     }
 }
 
-/// The path a part takes when it is rotated (§19.5): `.rotated` before its codec suffix. A
-/// rotated part 0 (`s.tsvz.rotated`) is no part of the store either.
-pub fn rotated_path(part: &Path) -> PathBuf {
+/// The path a part takes when it is rotated (§19.5): `.rotated` before its codec suffix, and
+/// `.0.rotated` for part 0 (§17.1: `s.tsvz` → `s.tsvz.0.rotated`). Neither is a part of the store.
+pub fn rotated_path(part: &Path, part0: bool) -> PathBuf {
     let name = part
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let rotated = match codec_suffix(part) {
+    let rotated = if part0 { "0.rotated" } else { "rotated" };
+    let renamed = match codec_suffix(part) {
         Some(suffix) => format!(
-            "{}.rotated.{suffix}",
+            "{}.{rotated}.{suffix}",
             &name[..name.len() - suffix.len() - 1]
         ),
-        None => format!("{name}.rotated"),
+        None => format!("{name}.{rotated}"),
     };
-    part.with_file_name(rotated)
+    part.with_file_name(renamed)
 }
 
 #[cfg(test)]
@@ -296,14 +297,24 @@ mod tests {
     #[test]
     fn rotated_part_names() {
         let p = |s: &str| std::path::PathBuf::from(s);
-        assert_eq!(rotated_path(&p("d/s.tsvz.1")), p("d/s.tsvz.1.rotated"));
         assert_eq!(
-            rotated_path(&p("d/s.tsvz.1.gz")),
+            rotated_path(&p("d/s.tsvz.1"), false),
+            p("d/s.tsvz.1.rotated")
+        );
+        assert_eq!(
+            rotated_path(&p("d/s.tsvz.1.gz"), false),
             p("d/s.tsvz.1.rotated.gz")
         );
-        assert_eq!(rotated_path(&p("s.tsvz.1.GZ")), p("s.tsvz.1.rotated.GZ"));
-        assert_eq!(rotated_path(&p("s.tsvz")), p("s.tsvz.rotated"));
-        assert_eq!(rotated_path(&p("s.tsvz.zst")), p("s.tsvz.rotated.zst"));
+        assert_eq!(
+            rotated_path(&p("s.tsvz.1.GZ"), false),
+            p("s.tsvz.1.rotated.GZ")
+        );
+        // Part 0 as §17.1 names it: <store>.0.rotated[.<compression>].
+        assert_eq!(rotated_path(&p("s.tsvz"), true), p("s.tsvz.0.rotated"));
+        assert_eq!(
+            rotated_path(&p("s.tsvz.zst"), true),
+            p("s.tsvz.0.rotated.zst")
+        );
         assert_eq!(codec_suffix(&p("d/s.tsvz.1.GZ")).as_deref(), Some("GZ"));
         assert_eq!(codec_suffix(&p("d/s.tsvz.1")), None);
         // A rotated part, or a rotated part 0, is no part of the store (§19.5).
@@ -313,13 +324,13 @@ mod tests {
         let part = dir.path().join("s.tsvz.0.gz");
         fs::write(&part, "").unwrap();
         assert_eq!(list(&store).unwrap()[1].path, part);
-        fs::rename(&part, rotated_path(&part)).unwrap();
+        fs::rename(&part, rotated_path(&part, false)).unwrap();
         assert_eq!(
             list(&store).unwrap().len(),
             1,
             "a rotated part is not loaded"
         );
-        fs::rename(&store, rotated_path(&store)).unwrap();
+        fs::rename(&store, rotated_path(&store, true)).unwrap();
         assert!(list(&store).unwrap().is_empty(), "nor is a rotated part 0");
     }
 }

@@ -706,6 +706,15 @@ fn put_mode_back(written: &Result<Option<bool>, Error>) -> bool {
     }
 }
 
+/// Whether two paths name the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
 /// Make `target` no more open than any of `prefix`, whose rows it is about to hold: the
 /// intersection of their modes, without group access unless they all share its group, except
 /// that its owner keeps reading and writing it. The mode before, when it changed.
@@ -764,7 +773,15 @@ fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
         let io = |e: io::Error| Error::io(&part.path, e);
         match action {
             "rename" => {
-                std::fs::hard_link(&part.path, parts::rotated_path(&part.path)).map_err(io)?;
+                let rotated = parts::rotated_path(&part.path, part.ordinal.is_none());
+                match std::fs::hard_link(&part.path, &rotated) {
+                    Ok(()) => {}
+                    // A rotation cut short between the link and the unlink: finish it.
+                    Err(e)
+                        if e.kind() == io::ErrorKind::AlreadyExists
+                            && same_file(&part.path, &rotated) => {}
+                    Err(e) => return Err(io(e)),
+                }
                 std::fs::remove_file(&part.path).map_err(io)?;
             }
             "delete" => std::fs::remove_file(&part.path).map_err(io)?,
@@ -1179,7 +1196,10 @@ mod tests {
     #[test]
     fn the_rotate_marker_renames_deletes_or_keeps_the_other_parts_compacted() {
         let cases = [
-            ("rename", &["s.tsvz.3.gz", "s.tsvz.8", "s.tsvz.rotated"][..]),
+            (
+                "rename",
+                &["s.tsvz.0.rotated", "s.tsvz.3.gz", "s.tsvz.8"][..],
+            ),
             ("delete", &["s.tsvz.3.gz", "s.tsvz.8"][..]),
             ("keep", &["s.tsvz", "s.tsvz.3.gz", "s.tsvz.8"][..]),
         ];
@@ -1310,7 +1330,7 @@ mod tests {
         let before = rows(&p);
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
         let names = files(dir.path());
-        assert!(names.contains(&"s.tsvz.rotated".to_string()), "{names:?}");
+        assert!(names.contains(&"s.tsvz.0.rotated".to_string()), "{names:?}");
         let copy = names
             .iter()
             .find(|n| n.contains(".damaged-"))
@@ -1419,6 +1439,27 @@ mod tests {
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
         fs::write(dir.path().join("s.tsvz.2"), "#_version_#\t2\nc\t3\n").unwrap();
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+    }
+
+    #[test]
+    fn a_rename_rotation_cut_short_is_finished_by_the_next_scrub() {
+        // A crash between the link and the unlink leaves both names: the next scrub finishes it
+        // rather than fail on "File exists" forever.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_rotate_#\trename\na\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "c\t3\n").unwrap();
+        let before = rows(&p);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        fs::hard_link(dir.path().join("s.tsvz.0.rotated"), &p).unwrap();
+        assert_eq!(rows(&p), before, "the cut-short state reads the same");
+        scrub(&p, &opts()).unwrap();
+        assert_eq!(
+            files(dir.path()),
+            ["s.tsvz.0.rotated", "s.tsvz.1", "s.tsvz.2"]
+        );
+        assert_eq!(rows(&p), before);
     }
 
     #[test]
