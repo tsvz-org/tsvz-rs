@@ -246,28 +246,40 @@ def trimmed(output, delimiter):
 
 def check_scrub(rust, python, store, delimiter, directory):
     """(why it was refused or None, problems) of scrubbing a copy of the store: TSVZ.py and
-    tsvz-rs must read the copy as they read the original. A refusal by scrub's own fidelity
-    guard is a problem: the content it built would have read differently."""
+    tsvz-rs must read the copy as they read the original. A scrub that crashes (any exit but 1)
+    is a problem; so is a refusal by scrub's own fidelity guard (the content it built would
+    have read differently), and a refusal that says nothing was written but changed the copy."""
     copy = directory + '-scrubbed'
     shutil.copytree(directory, copy)
     try:
         scrubbed = os.path.join(copy, os.path.basename(store))
         done = subprocess.run(rust + ['-q', 'scrub', scrubbed], stdout=subprocess.DEVNULL,
                               stderr=subprocess.PIPE, timeout=60)
-        if done.returncode != 0:
-            lines = done.stderr.decode(errors='replace').strip().split('\n')
-            why = lines[-1].partition('scrub skipped: ')[2] or lines[-1].replace(copy, '<store>')
-            return why, ['  scrub refused by its fidelity guard: %s' % why] if 'please report' in why else []
-        problems = []
-        for who, command in (('TSVZ.py', python), ('tsvz-rs', rust)):
-            for op in (['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp']):
-                before, after = ask(command, store, op), ask(command, scrubbed, op)
-                if (before[0], trimmed(before[1], delimiter)) != (after[0], trimmed(after[1], delimiter)):
-                    problems.append('  scrub, then %s %s: before %s %r\n%s after %s %r' % (
-                        who, ' '.join(op), before[0], before[1][:300], ' ' * (len(who) + 13), after[0], after[1][:300]))
-        return None, problems
+        if done.returncode == 0:
+            return None, same_reads(rust, python, store, scrubbed, delimiter)
+        text = done.stderr.decode(errors='replace').replace(copy, '<store>').strip()
+        lines = text.split('\n')
+        why = lines[-1].partition('scrub skipped: ')[2] or lines[-1]
+        if done.returncode != 1 or 'panicked' in text:
+            return why, ['  scrub failed (exit %d): %s' % (done.returncode, text[-300:])]
+        problems = ['  scrub refused by its fidelity guard: %s' % why] if 'please report' in why else []
+        if 'nothing was written' in why:
+            problems += same_reads(rust, python, store, scrubbed, delimiter)
+        return why, problems
     finally:
         shutil.rmtree(copy, ignore_errors=True)
+
+
+def same_reads(rust, python, store, scrubbed, delimiter):
+    """Problems where TSVZ.py or tsvz-rs reads the scrubbed copy otherwise than the original."""
+    problems = []
+    for who, command in (('TSVZ.py', python), ('tsvz-rs', rust)):
+        for op in (['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp']):
+            before, after = ask(command, store, op), ask(command, scrubbed, op)
+            if (before[0], trimmed(before[1], delimiter)) != (after[0], trimmed(after[1], delimiter)):
+                problems.append('  scrub, then %s %s: before %s %r\n%s after %s %r' % (
+                    who, ' '.join(op), before[0], before[1][:300], ' ' * (len(who) + 13), after[0], after[1][:300]))
+    return problems
 
 
 # Differences where TSVZ.py, not tsvz-rs, departs from the spec: (reason, test). Remove an entry
