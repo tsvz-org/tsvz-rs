@@ -256,6 +256,43 @@ fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
     assert_eq!(ask(&s, "get\ta").lines, ["a\t1"]);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_spawned_while_a_client_connects_never_inherits_its_connection() {
+    // A connection inherited across exec keeps the handler's connection open (no idle
+    // timeout) for as long as the child lives: close-on-exec is set as the socket is made.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let _served = Served::start(&s, &[]);
+    let done = Arc::new(AtomicBool::new(false));
+    let connector = {
+        let (done, s) = (done.clone(), s.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                drop(tsvz::handler::Client::connect(&s).unwrap());
+            }
+        })
+    };
+    let mut inherited = 0;
+    for _ in 0..600 {
+        let out = Command::new("ls")
+            .args(["-l", "/proc/self/fd"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        inherited += usize::from(text(&out.stdout).contains("socket:"));
+    }
+    done.store(true, Ordering::Relaxed);
+    connector.join().unwrap();
+    assert_eq!(
+        inherited, 0,
+        "{inherited} of 600 children inherited a client socket"
+    );
+}
+
 #[test]
 fn a_client_cannot_send_a_request_inside_a_marker_key() {
     // A marker key with a line break would end the request line, and what follows it would

@@ -235,19 +235,27 @@ fn connect_within(path: &Path, patience: Duration) -> io::Result<UnixStream> {
     {
         addr.sun_len = len as u8;
     }
+    // Close-on-exec as the socket is made, where the system can (a child that another thread
+    // spawns meanwhile would keep the connection open); else right after, checked.
+    #[cfg(not(target_vendor = "apple"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let kind = libc::SOCK_STREAM;
     // SAFETY: socket makes a new descriptor, owned below.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: fd is a new descriptor that nothing else owns.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let raw = fd.as_raw_fd();
-    // SAFETY: fcntl reads and sets the flags of the descriptor `fd` owns.
-    let flags = unsafe {
-        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(raw, libc::F_GETFL)
-    };
+    // SAFETY: fcntl sets the descriptor flags of the descriptor `fd` owns.
+    #[cfg(target_vendor = "apple")]
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl reads the file status flags of the descriptor `fd` owns.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     // SAFETY: as above.
     if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
