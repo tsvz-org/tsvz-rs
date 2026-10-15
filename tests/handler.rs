@@ -294,6 +294,28 @@ fn a_child_spawned_while_a_client_connects_never_inherits_its_connection() {
 }
 
 #[test]
+fn a_zero_timeout_is_the_shortest_wait_not_none() {
+    // std refuses a zero socket timeout; taken as given, a zero limit meant waiting forever.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let served = Served::start(&s, &[]);
+    let client = tsvz::handler::Client::connect(&s).unwrap();
+    let mut client = client.timeout(Some(Duration::ZERO));
+    served.signal(libc::SIGSTOP);
+    let (done, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(client.get("a").is_err());
+    });
+    let failed = answered.recv_timeout(Duration::from_secs(3));
+    served.signal(libc::SIGCONT);
+    assert_eq!(
+        failed,
+        Ok(true),
+        "a zero timeout waited for a stopped handler"
+    );
+}
+
+#[test]
 fn a_client_cannot_send_a_request_inside_a_marker_key() {
     // A marker key with a line break would end the request line, and what follows it would
     // run as a request of its own.

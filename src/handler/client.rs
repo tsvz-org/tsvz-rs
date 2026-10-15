@@ -76,9 +76,12 @@ impl Client {
         self
     }
 
-    /// Wait at most `limit` for each answer (default: no limit); a timeout is
-    /// [`Error::HandlerLost`].
+    /// Wait at most `limit` for each answer (default: no limit; zero is the shortest wait the
+    /// system allows); a timeout is [`Error::HandlerLost`].
     pub fn timeout(self, limit: Option<Duration>) -> Client {
+        // A zero limit is the shortest wait the system allows (std refuses a zero timeout,
+        // which would leave none).
+        let limit = limit.map(|l| l.max(Duration::from_micros(1)));
         let _ = self.writer.set_read_timeout(limit);
         let _ = self.writer.set_write_timeout(limit);
         self
