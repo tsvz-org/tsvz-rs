@@ -212,6 +212,13 @@ pub struct Appended {
     pub file: lock::Handle,
 }
 
+/// Whether `path` still names the file `file` was opened as.
+fn names(path: &Path, file: &lock::Handle) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let opened = file.opened();
+    std::fs::metadata(path).is_ok_and(|m| m.dev() == opened.dev() && m.ino() == opened.ino())
+}
+
 fn stamp(file: &File) -> io::Result<parts::Stamp> {
     file.metadata().map(|m| parts::Stamp::of(&m))
 }
@@ -290,67 +297,65 @@ impl Writer {
     /// other writers'.
     #[doc(hidden)]
     pub fn append_runs_at(&mut self, runs: &[(&[u8], u64)]) -> Result<Appended, Error> {
-        let part = parts::active(&self.store)?;
-        let path = part.path.as_path();
-        let io = |e: io::Error| Error::io(path, e);
-        match part.codec {
-            Some(codec) => {
-                let mut bytes = Vec::new();
-                for (run, member_size) in runs {
-                    let size = usize::try_from(*member_size).unwrap_or(usize::MAX).max(1);
-                    bytes.extend(codec::encode_members(codec, run, size).ok_or_else(|| {
-                        Error::UnsupportedCodec {
-                            path: path.to_path_buf(),
-                            codec: codec.name(),
-                        }
-                    })?);
+        // The part is locked as it was opened; when its name is another file's by then (it was
+        // rotated away, or a part replaced it), the store's active part is looked up again.
+        for _ in 0..3 {
+            let part = parts::active(&self.store)?;
+            let path = part.path.as_path();
+            let io = |e: io::Error| Error::io(path, e);
+            let bytes: Cow<[u8]> = match part.codec {
+                Some(codec) => {
+                    let mut bytes = Vec::new();
+                    for (run, member_size) in runs {
+                        let size = usize::try_from(*member_size).unwrap_or(usize::MAX).max(1);
+                        bytes.extend(codec::encode_members(codec, run, size).ok_or_else(|| {
+                            Error::UnsupportedCodec {
+                                path: path.to_path_buf(),
+                                codec: codec.name(),
+                            }
+                        })?);
+                    }
+                    bytes.into()
                 }
-                let file = lock::Handle::open(path, OpenOptions::new().append(true).create(true))
-                    .map_err(io)?;
-                let (before, after) = {
-                    let _guard = lock::lock(&file, path).map_err(io)?;
-                    let before = stamp(&file).map_err(io)?;
-                    self.write_batch(&file, path, &bytes, before.size)?;
-                    (before, stamp(&file).map_err(io)?)
-                };
-                Ok(Appended {
-                    part: part.path.clone(),
-                    before,
-                    after,
-                    file,
-                })
+                None => match runs {
+                    [(run, _)] => (*run).into(),
+                    _ => runs
+                        .iter()
+                        .map(|(r, _)| *r)
+                        .collect::<Vec<_>>()
+                        .concat()
+                        .into(),
+                },
+            };
+            let mut options = OpenOptions::new();
+            options.append(true).create(true).read(part.codec.is_none());
+            let file = lock::Handle::open(path, &options).map_err(io)?;
+            let guard = lock::lock(&file, path).map_err(io)?;
+            if !names(path, &file) {
+                continue;
             }
-            None => {
-                let file = lock::Handle::open(
-                    path,
-                    OpenOptions::new().read(true).append(true).create(true),
-                )
-                .map_err(io)?;
-                let (before, after) = {
-                    let _guard = lock::lock(&file, path).map_err(io)?;
-                    let before = stamp(&file).map_err(io)?;
+            let before = stamp(&file).map_err(io)?;
+            let start = match part.codec {
+                Some(_) => before.size,
+                None => {
                     self.cut_torn_tail(&file, path).map_err(io)?;
-                    let start = file.metadata().map_err(io)?.len();
-                    let payload: Cow<[u8]> = match runs {
-                        [(run, _)] => (*run).into(),
-                        _ => runs
-                            .iter()
-                            .map(|(r, _)| *r)
-                            .collect::<Vec<_>>()
-                            .concat()
-                            .into(),
-                    };
-                    self.write_batch(&file, path, &payload, start)?;
-                    (before, stamp(&file).map_err(io)?)
-                };
-                Ok(Appended {
-                    part: part.path.clone(),
-                    before,
-                    after,
-                    file,
-                })
-            }
+                    file.metadata().map_err(io)?.len()
+                }
+            };
+            self.write_batch(&file, path, &bytes, start)?;
+            let after = stamp(&file).map_err(io)?;
+            drop(guard);
+            return Ok(Appended {
+                part: part.path.clone(),
+                before,
+                after,
+                file,
+            });
         }
+        Err(Error::Refused(format!(
+            "{}: the active part kept changing while its lock was waited for; nothing was written",
+            self.store.display()
+        )))
     }
 
     /// Write `bytes` at the end of `file` (which ends at `start`), synced when asked, all or
@@ -710,6 +715,38 @@ mod tests {
                 .collect();
         // a, b and the marker in a 1 MiB member; then c and d, 23 bytes each, one per member.
         assert_eq!(members, [3, 1, 1]);
+    }
+
+    #[test]
+    fn a_write_that_waited_for_the_lock_goes_to_the_part_the_store_names_then() {
+        // While a writer waits for the lock on part 0, part 0 is rotated away (renamed
+        // `.0.rotated`) and a new part started: the write must not land in the rotated file.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let held = lock::Handle::open(&p, OpenOptions::new().append(true)).unwrap();
+        let guard = lock::lock(&held, &p).unwrap();
+        let store = p.clone();
+        let writer = std::thread::spawn(move || {
+            Writer::open(&store)
+                .unwrap()
+                .append(&[Record::from_args("b", &["2".into()])])
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100)); // the writer waits
+        let rotated = dir.path().join("s.tsvz.0.rotated");
+        fs::rename(&p, &rotated).unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "c\t3\n").unwrap();
+        drop(guard);
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(&rotated).unwrap(),
+            "a\t1\n",
+            "into the rotated part"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
+            "c\t3\nb\t2\n"
+        );
     }
 
     #[test]
