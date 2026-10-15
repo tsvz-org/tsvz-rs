@@ -1,5 +1,6 @@
-//! In-place maintenance of a one-part store: clear and scrub (§19.8, §19.2.3, §19.4), written
-//! the way TSVZ.py writes them.
+//! Maintenance: clear and scrub (§19.8, §19.2.3, §19.4). A one-part store is rewritten in place
+//! the way TSVZ.py writes it; a multi-part store is cleared with tombstones, and scrubbed by
+//! compacting the parts before the active one into the last of them, in place.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

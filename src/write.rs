@@ -168,10 +168,6 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
     Ok(())
 }
 
-/// Appends batches of records to a store's active part (§17.7).
-///
-/// Each append holds the write lock shared with TSVZ.py (see `lock`): where only a classic
-/// POSIX lock is available, closing another descriptor of the part in this process releases it.
 /// Where [`Writer::append_payload_at`] appended, the part's stamp just before and after, and
 /// the file it appended through (still open: it syncs that file even once renamed).
 #[doc(hidden)]
@@ -186,6 +182,12 @@ fn stamp(file: &File) -> io::Result<parts::Stamp> {
     file.metadata().map(|m| parts::Stamp::of(&m))
 }
 
+/// Appends batches of records to a store's active part (§17.7).
+///
+/// Each append holds the write lock shared with TSVZ.py: where only a classic POSIX lock is
+/// available (macOS, and Linux without open file description locks), closing another
+/// descriptor of the part in this process releases it. A program that appends with a `Writer`
+/// should not open the store's parts by other means meanwhile.
 pub struct Writer {
     store: PathBuf,
     format: Format,
