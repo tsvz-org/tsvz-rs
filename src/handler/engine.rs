@@ -18,7 +18,7 @@ use crate::maint::{self, Outcome};
 use crate::name::{self, Format};
 use crate::ops::{self, Out, Plan};
 use crate::parts::Stamp;
-use crate::write::{Record, Writer, encode_record};
+use crate::write::{Record, Writer};
 use crate::{Error, Options, Scope, Store, WarnFn, Warning, escape, parts};
 
 /// The message of a read operation on a store that does not exist (§20.2.2).
@@ -32,7 +32,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Entry {
     seq: u64,
-    payload: Vec<u8>,
+    /// The request's records, encoded, in runs of one member size each (§16.7).
+    runs: Vec<(String, u64)>,
     durable: bool,
     /// A request waits for its outcome.
     waited: bool,
@@ -41,7 +42,6 @@ struct Entry {
 #[derive(Default)]
 struct Queue {
     entries: Vec<Entry>,
-    member_size: u64,
     submitted: u64,
     written: u64,
     /// The outcome of each waited entry once its batch is written (and fsync'd when durable),
@@ -76,16 +76,15 @@ struct Batcher {
 }
 
 impl Batcher {
-    /// Queue `payload` (records encoded for the store, each ending in `\n`); its sequence number.
-    /// A `waited` entry's outcome is kept for [`Batcher::wait`].
-    fn submit(&self, payload: Vec<u8>, durable: bool, member_size: u64, waited: bool) -> u64 {
+    /// Queue `runs` (records encoded for the store, each ending in `\n`, with their member
+    /// sizes); its sequence number. A `waited` entry's outcome is kept for [`Batcher::wait`].
+    fn submit(&self, runs: Vec<(String, u64)>, durable: bool, waited: bool) -> u64 {
         let mut q = lock(&self.queue);
         q.submitted += 1;
         let seq = q.submitted;
-        q.member_size = member_size;
         q.entries.push(Entry {
             seq,
-            payload,
+            runs,
             durable,
             waited,
         });
@@ -165,7 +164,7 @@ impl Batcher {
 
     fn run(&self) {
         loop {
-            let (batch, member_size) = {
+            let batch = {
                 let mut q = lock(&self.queue);
                 while q.entries.is_empty() && !q.closing {
                     q = self.changed.wait(q).unwrap_or_else(|e| e.into_inner());
@@ -173,19 +172,24 @@ impl Batcher {
                 if q.entries.is_empty() {
                     break;
                 }
-                (std::mem::take(&mut q.entries), q.member_size)
+                std::mem::take(&mut q.entries)
             };
             let durable = batch.iter().any(|e| e.durable);
             let last = batch[batch.len() - 1].seq;
-            let mut payload = Vec::with_capacity(batch.iter().map(|e| e.payload.len()).sum());
-            for e in &batch {
-                payload.extend_from_slice(&e.payload);
+            // Each write keeps the member size in force where it lands; neighbours of one size
+            // share members.
+            let mut runs: Vec<(Vec<u8>, u64)> = Vec::new();
+            for (run, size) in batch.iter().flat_map(|e| &e.runs) {
+                match runs.last_mut() {
+                    Some((bytes, s)) if s == size => bytes.extend_from_slice(run.as_bytes()),
+                    _ => runs.push((run.as_bytes().to_vec(), *size)),
+                }
             }
+            let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (&r[..], *n)).collect();
             let result = Writer::open(&self.store).and_then(|w| {
-                w.member_size(member_size as usize)
-                    .fsync(durable)
+                w.fsync(durable)
                     .warnings(self.log.clone())
-                    .append_payload_at(&payload)
+                    .append_runs_at(&runs)
             });
             let mut q = lock(&self.queue);
             q.written = last;
@@ -503,11 +507,7 @@ impl Engine {
         member_size: Option<u64>,
         written: bool,
     ) -> Result<Option<Queued>, Error> {
-        let mut payload = String::new();
-        for r in records {
-            encode_record(r, self.format, &mut payload)?;
-        }
-        if payload.is_empty() {
+        if records.is_empty() {
             return Ok(None);
         }
         // The store's markers are current unless another writer wrote since it last followed
@@ -528,11 +528,10 @@ impl Engine {
             .or(queued(st.queued_member_size, reflected))
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
+        let runs = crate::write::runs(records, self.format, member_size)?;
         let durable = sync || ack == Some("disk");
         let waited = durable || written;
-        let seq = self
-            .batcher
-            .submit(payload.into_bytes(), durable, member_size, waited);
+        let seq = self.batcher.submit(runs, durable, waited);
         for r in records {
             let Record::Marker { key, values } = r else {
                 continue;
@@ -1019,17 +1018,80 @@ mod tests {
             .unwrap();
         assert!(submit(&data()).waited, "a marker another writer appended");
         // Markers queued but not yet written (the writer waits for the lock) govern what follows.
+        e.batcher.barrier(); // written, so that the writer next takes the entry below alone
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file, &p).unwrap();
         submit(&marker("#_WRITE_ACK_#", "Memory"));
+        while !lock(&e.batcher.queue).entries.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
+        }
         submit(&marker("#_member_size_#", "7"));
         assert!(!submit(&data()).waited, "#_write_ack_# memory, queued");
-        assert_eq!(lock(&e.batcher.queue).member_size, 7);
+        let last_size = || lock(&e.batcher.queue).entries.last().unwrap().runs[0].1;
+        assert_eq!(last_size(), 7);
         submit(&marker("#_member_size_#", "zero")); // invalid: ignored, as a reader ignores it
         submit(&data());
-        assert_eq!(lock(&e.batcher.queue).member_size, 7);
+        assert_eq!(last_size(), 7);
         drop(held);
         assert_eq!(ask(&e, "get\tk").lines, ["k\tv"]);
+    }
+
+    #[test]
+    fn each_write_in_a_batch_keeps_the_member_size_in_force_where_it_lands() {
+        use crate::codec::{Item, encode_members, for_each_item};
+        use crate::name::Codec;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz.gz");
+        let head = encode_members(Codec::Gzip, b"#_member_size_#\t1048576\n", 1 << 20).unwrap();
+        fs::write(&p, &head).unwrap();
+        let e = engine(dir.path(), "s.tsvz.gz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            e.submit(&mut st, records, false, None, false).unwrap();
+        };
+        let row = |k: String| Record::Data {
+            key: k,
+            values: vec!["v".into()],
+        };
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file, &p).unwrap();
+        submit(&[row("blocker".into())]); // the writer takes it, then waits for the lock
+        while !lock(&e.batcher.queue).entries.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // One batch: 200 rows and the marker under 1 MiB, then rows under 64 bytes, the last
+        // two in one request after a marker of its own.
+        submit(
+            &(0..200)
+                .map(|i| row(format!("k{i:03}")))
+                .collect::<Vec<_>>(),
+        );
+        submit(&[Record::Marker {
+            key: "#_member_size_#".into(),
+            values: vec!["64".into()],
+        }]);
+        submit(&[
+            row("x".repeat(40)),
+            Record::Marker {
+                key: "#_member_size_#".into(),
+                values: vec![String::new()], // back to 1 MiB
+            },
+            row("y".repeat(40)),
+            row("z".repeat(40)),
+        ]);
+        drop(held);
+        assert_eq!(ask(&e, "len").lines, ["204"]);
+        let data = fs::read(&p).unwrap();
+        let mut members = Vec::new();
+        for_each_item(Codec::Gzip, &data[head.len()..], &mut |item| {
+            if let Item::Data(out) = item {
+                members.push(String::from_utf8_lossy(&out).lines().count());
+            }
+            true
+        });
+        // The blocker; the 200 rows and the 64 marker; the x row with the empty marker; then
+        // the y and z rows, together again.
+        assert_eq!(members, [1, 201, 2, 2]);
     }
 
     #[test]

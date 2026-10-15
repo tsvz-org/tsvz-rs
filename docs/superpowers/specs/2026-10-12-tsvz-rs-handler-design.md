@@ -200,10 +200,13 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
 
 ### 4.2 The writer thread
 
-- `submit(payload, durable, member_size) -> seq` queues the bytes of one request,
-  already encoded in the store's variant (`write::encode_record`).
+- `submit(runs, durable, waited) -> seq` queues one request's records, already
+  encoded in the store's variant (`write::runs`): in runs of one member size each,
+  the size changing after each valid `#_member_size_#` record, as a reader
+  replays them.
 - The thread takes everything queued and appends it as one batch with one
-  `Writer::append_payload` call: one active-part lookup (§17.7, §21.8.4), one
+  `Writer::append_runs_at` call, each run in members of its own size (neighbours
+  of one size share members): one active-part lookup (§17.7, §21.8.4), one
   write lock (core section 4.3, shared with TSVZ.py), one `write`. When any
   entry of the batch is durable, the batch is fsync'd; otherwise the part is
   marked unsynced. A new batch starts as soon as the previous one ends, so
@@ -220,9 +223,9 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   left behind is synced and its file closed, so open files never pile up).
 - The thread never takes the engine mutex, so a request holding the mutex can
   wait on it.
-- Whether an entry is durable (`#_write_ack_#`) and the member size used for a
-  compressed active part (`#_member_size_#`) are the markers as they stand where
-  the entry will be appended, as far as can be known when it is submitted: the
+- Whether an entry is durable (`#_write_ack_#`) and the member size its first run
+  uses on a compressed active part (`#_member_size_#`) are the markers as they
+  stand where the entry will be appended, as far as can be known when it is submitted: the
   markers the engine last followed, then the last values of those two markers
   queued since (they govern until the engine follows the files past them). The
   engine follows the files first when another writer may have written since:

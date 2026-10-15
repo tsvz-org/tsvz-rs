@@ -168,7 +168,35 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
     Ok(())
 }
 
-/// Where [`Writer::append_payload_at`] appended, the part's stamp just before and after, and
+/// `records` encoded for `format` as runs, each with the member size in force where it starts
+/// (§16.7): `member_size`, then from the record after each valid `#_member_size_#` marker on,
+/// the size it sets, as a reader replays them (a loose file has no markers).
+pub(crate) fn runs(
+    records: &[Record],
+    format: Format,
+    member_size: u64,
+) -> Result<Vec<(String, u64)>, Error> {
+    let mut runs = vec![(String::new(), member_size)];
+    for r in records {
+        let at = runs.len() - 1;
+        encode_record(r, format, &mut runs[at].0)?;
+        if let (true, Record::Marker { key, values }) = (format.strict, r) {
+            let mut m = crate::Markers::default();
+            let key = key.to_ascii_lowercase();
+            let value = values.first().map_or("", String::as_str);
+            if key == "#_member_size_#"
+                && crate::replay::apply_marker(&mut m, &key, value)
+                && m.member_size != runs[at].1
+            {
+                runs.push((String::new(), m.member_size));
+            }
+        }
+    }
+    runs.retain(|(run, _)| !run.is_empty());
+    Ok(runs)
+}
+
+/// Where [`Writer::append_runs_at`] appended, the part's stamp just before and after, and
 /// the file it appended through (still open: it syncs that file even once renamed).
 #[doc(hidden)]
 pub struct Appended {
@@ -239,35 +267,38 @@ impl Writer {
 
     /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2).
     pub fn append(&mut self, records: &[Record]) -> Result<(), Error> {
-        let mut payload = String::new();
-        for r in records {
-            encode_record(r, self.format, &mut payload)?;
-        }
-        self.append_payload(payload.as_bytes())
+        let runs = runs(records, self.format, self.member_size as u64)?;
+        let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (r.as_bytes(), *n)).collect();
+        self.append_runs_at(&runs).map(|_| ())
     }
 
     /// Append encoded records (each ending in `\n`) as one batch.
     pub fn append_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
-        self.append_payload_at(payload).map(|_| ())
+        self.append_runs_at(&[(payload, self.member_size as u64)])
+            .map(|_| ())
     }
 
-    /// [`Writer::append_payload`], saying where the batch went and how the part looked, under
+    /// Append encoded records as one batch: runs of them, each in members of its own size
+    /// (§16.7) on a compressed part. Says where the batch went and how the part looked, under
     /// the lock, just before and after it: what the handler needs to tell its own appends from
     /// other writers'.
     #[doc(hidden)]
-    pub fn append_payload_at(&mut self, payload: &[u8]) -> Result<Appended, Error> {
+    pub fn append_runs_at(&mut self, runs: &[(&[u8], u64)]) -> Result<Appended, Error> {
         let part = parts::active(&self.store)?;
         let path = part.path.as_path();
         let io = |e: io::Error| Error::io(path, e);
         match part.codec {
             Some(codec) => {
-                let bytes =
-                    codec::encode_members(codec, payload, self.member_size).ok_or_else(|| {
+                let mut bytes = Vec::new();
+                for (run, member_size) in runs {
+                    let size = usize::try_from(*member_size).unwrap_or(usize::MAX).max(1);
+                    bytes.extend(codec::encode_members(codec, run, size).ok_or_else(|| {
                         Error::UnsupportedCodec {
                             path: path.to_path_buf(),
                             codec: codec.name(),
                         }
-                    })?;
+                    })?);
+                }
                 let file = OpenOptions::new()
                     .append(true)
                     .create(true)
@@ -298,7 +329,11 @@ impl Writer {
                     let before = stamp(&file).map_err(io)?;
                     self.cut_torn_tail(&file, path).map_err(io)?;
                     let start = file.metadata().map_err(io)?.len();
-                    self.write_batch(&file, path, payload, start)?;
+                    let payload: Cow<[u8]> = match runs {
+                        [(run, _)] => (*run).into(),
+                        _ => runs.iter().flat_map(|(r, _)| r.iter().copied()).collect(),
+                    };
+                    self.write_batch(&file, path, &payload, start)?;
                     (before, stamp(&file).map_err(io)?)
                 };
                 Ok(Appended {
@@ -644,6 +679,30 @@ mod tests {
             read(&p).into_iter().map(|r| r.0).collect::<Vec<_>>(),
             vec!["a", "bbbbbbbbbbbbbbbbbbbb", "c"]
         );
+    }
+
+    #[test]
+    fn records_after_a_member_size_marker_take_its_size_in_the_same_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz.gz");
+        let row = |k: &str| Record::from_args(k, &["v".repeat(20)]);
+        let marker = Record::Marker {
+            key: "#_MEMBER_SIZE_#".into(),
+            values: vec!["30".into()],
+        };
+        let mut w = Writer::open(&p).unwrap();
+        w.append(&[row("a"), row("b"), marker, row("c"), row("d")])
+            .unwrap();
+        let members: Vec<usize> =
+            crate::codec::items(crate::name::Codec::Gzip, &fs::read(&p).unwrap())
+                .iter()
+                .map(|i| match i {
+                    crate::codec::Item::Data(out) => out.iter().filter(|&&b| b == b'\n').count(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+        // a, b and the marker in a 1 MiB member; then c and d, 23 bytes each, one per member.
+        assert_eq!(members, [3, 1, 1]);
     }
 
     #[test]
