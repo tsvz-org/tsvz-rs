@@ -42,9 +42,11 @@ it decided on the markers as of the last read). The 16-client mix also gets less
 115k.
 
 `scrub multipart 100k` has no ratio: TSVZ.py refuses to scrub a multi-part store. tsvz-rs
-compacts the parts before the active one into the last of them; under the default
-`#_rotate_# keep` the earlier parts stay, so the store grows (7.2 MiB → 13.5 MiB);
-`#_rotate_# rename` or `delete` moves them out of the store.
+writes a new snapshot part when an ordinal is free before the active part; this fixture's last
+two ordinals are consecutive (`…5062`, active `…5063`), so it compacts the parts before the
+active one into the last of them, in place. Under the default `#_rotate_# keep` the earlier
+parts stay, so the store grows (7.2 MiB → 13.5 MiB); `#_rotate_# rename` or `delete` moves them
+out of the store.
 
 The handler loads a 100k-row store in 36 ms against 175-182 ms, holding 37 MiB against 92 MiB.
 
