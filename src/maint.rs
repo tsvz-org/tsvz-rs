@@ -591,11 +591,12 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             },
         };
         // A one-part scrub with no room for the copy (it is how a full disk gets room back)
-        // rewrites in place without one, as TSVZ.py does: the rewrite reserves its length
-        // first, so it still changes nothing when even that does not fit.
+        // rewrites in place without one, as TSVZ.py does, where the file system overwrites in
+        // place: the rewrite reserves its length first, so it still changes nothing when even
+        // that does not fit. A copy-on-write one gives no such promise: refused there.
         let recovery = match write_recovery(store, &target.path, content.as_bytes()) {
             Ok(path) => Some(path),
-            Err(e) if !multi && no_room(&e) => {
+            Err(e) if !multi && no_room(&e) && overwrites_in_place(&target.path) => {
                 if let Some(w) = &options.warnings {
                     w(&Warning {
                         part: target.path.clone(),
@@ -933,6 +934,33 @@ fn live_after_any_prefix(
     }
     add(earlier);
     Ok(Some(keys))
+}
+
+/// Whether the file system holding `path` overwrites a file's blocks in place, so that the
+/// space `reserve` takes for a rewrite is really there (ext2/3/4, XFS, f2fs, tmpfs). Not a
+/// copy-on-write one (btrfs, ZFS, bcachefs, APFS), which needs new blocks to overwrite, and not
+/// one it cannot tell.
+#[cfg(target_os = "linux")]
+fn overwrites_in_place(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    const EXT: i64 = 0xEF53;
+    const XFS: i64 = 0x5846_5342;
+    const F2FS: i64 = 0xF2F5_2010;
+    const TMPFS: i64 = 0x0102_1994;
+    matches!(fs.f_type as i64, EXT | XFS | F2FS | TMPFS)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overwrites_in_place(_path: &Path) -> bool {
+    false
 }
 
 /// Whether `e` is a full disk or quota.
@@ -1786,6 +1814,25 @@ mod tests {
             fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
             "z\t9\n"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rewrite_without_a_copy_is_only_for_file_systems_that_overwrite_in_place() {
+        // A copy-on-write file system (btrfs, ZFS, APFS) needs new blocks even to overwrite:
+        // there a full disk can leave a rewrite half done, so the copy is not skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let tmpfs = std::process::Command::new("stat")
+            .args(["-f", "-c", "%T"])
+            .arg(dir.path())
+            .output();
+        let kind = tmpfs.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        if let Ok(kind) = kind {
+            let expected = matches!(kind.as_str(), "tmpfs" | "ext2/ext3" | "xfs" | "f2fs");
+            assert_eq!(overwrites_in_place(dir.path()), expected, "{kind}");
+        }
+        assert!(!overwrites_in_place(Path::new("/proc")), "procfs");
+        assert!(!overwrites_in_place(Path::new("/no/such/dir")), "unknown");
     }
 
     #[test]
