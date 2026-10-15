@@ -179,6 +179,7 @@ impl Batcher {
             });
             let mut q = lock(&self.queue);
             q.written = last;
+            let mut left_behind = Vec::new();
             let outcome = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
             for e in batch.iter().filter(|e| e.waited) {
                 q.outcomes.insert(e.seq, outcome.clone());
@@ -194,10 +195,18 @@ impl Batcher {
                     }
                     let (part, ino) = (appended.part.clone(), appended.after.ino);
                     let listed = |(p, i, _): &(PathBuf, u64, File)| *p == part && *i == ino;
-                    if durable {
-                        q.unsynced.retain(|u| !listed(u)); // its fdatasync covers the file
-                    } else if !q.unsynced.iter().any(listed) {
-                        q.unsynced.push((part, ino, appended.file));
+                    // Parts other than this one get no more of our batches: they are synced
+                    // and let go below, so that open files do not pile up until stop.
+                    let (this, others): (Vec<_>, Vec<_>) = std::mem::take(&mut q.unsynced)
+                        .into_iter()
+                        .partition(listed);
+                    left_behind = others;
+                    if !durable {
+                        // A durable batch's fdatasync covers the file; else it stays listed.
+                        q.unsynced = this;
+                        if q.unsynced.is_empty() {
+                            q.unsynced.push((part, ino, appended.file));
+                        }
                     }
                     q.own = Some((appended.part, appended.after));
                     q.failing = None;
@@ -216,6 +225,16 @@ impl Batcher {
                 }
             }
             self.changed.notify_all();
+            drop(q);
+            if let Err(e) = sync(&left_behind) {
+                if let Some(errors) = &self.errors {
+                    errors(&Warning {
+                        part: self.store.clone(),
+                        offset: None,
+                        message: format!("fsync failed: {e}"),
+                    });
+                }
+            }
         }
         let unsynced = std::mem::take(&mut lock(&self.queue).unsynced);
         if let Err(e) = sync(&unsynced) {
@@ -1113,18 +1132,37 @@ mod tests {
         let e = engine(dir.path(), "s.tsvz");
         assert_eq!(ask(&e, "--x-written\tset\tk1\tv").status, 0);
         assert_eq!(e.batcher.unsynced(), std::slice::from_ref(&p));
-        // Another writer starts a new part: the next batch goes there.
-        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        // Another writer starts a new part: the next batch goes there, and the part left behind
+        // is synced then (a_part_left_behind_is_synced_and_let_go_when_writes_move_on).
+        let one = dir.path().join("s.tsvz.1");
+        fs::write(&one, "b\t2\n").unwrap();
         assert_eq!(ask(&e, "--x-written\tset\tk2\tv").status, 0);
         assert_eq!(ask(&e, "--x-written\tset\tk3\tv").status, 0);
-        assert_eq!(
-            e.batcher.unsynced(),
-            [p.clone(), dir.path().join("s.tsvz.1")]
-        );
-        // The first part is renamed away (#_rotate_# rename): its data is synced all the same.
-        fs::rename(&p, dir.path().join("s.tsvz.rotated")).unwrap();
+        assert_eq!(e.batcher.unsynced(), std::slice::from_ref(&one));
+        // The part is renamed away (#_rotate_# rename): its data is synced all the same.
+        fs::rename(&one, dir.path().join("s.tsvz.1.rotated")).unwrap();
         e.flush().unwrap();
         assert!(e.batcher.unsynced().is_empty());
+    }
+
+    #[test]
+    fn a_part_left_behind_is_synced_and_let_go_when_writes_move_on() {
+        // One open file per part ever written, until stop, would grow without bound and keep
+        // deleted parts' space: a part is synced and closed once the next batch goes elsewhere.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        for i in 1..=50 {
+            fs::write(dir.path().join(format!("s.tsvz.{i:x}")), "").unwrap(); // another writer's part
+            assert_eq!(ask(&e, &format!("--x-written\tset\tk{i}\tv")).status, 0);
+            assert_eq!(
+                e.batcher.unsynced(),
+                [dir.path().join(format!("s.tsvz.{i:x}"))],
+                "round {i}"
+            );
+        }
+        assert_eq!(ask(&e, "len").lines, ["51"]);
     }
 
     #[test]

@@ -216,7 +216,8 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   everything submitted is written. `flush()` waits, then fsyncs every part a
   batch was appended to without an fsync since the last one, through the file it
   was appended through (still right after a `rename` rotation); the writer thread
-  does the same as it ends.
+  does the same as it ends, and as soon as a batch goes to another part (the part
+  left behind is synced and its file closed, so open files never pile up).
 - The thread never takes the engine mutex, so a request holding the mutex can
   wait on it.
 - Whether an entry is durable (`#_write_ack_#`) and the member size used for a
