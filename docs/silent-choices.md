@@ -48,7 +48,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | `-v` with a handler | A routed command names the handler it used; `serve -v` reports each request's status | — |
 | Strict stores only (departs from TSVZ.py) | `serve` refuses a loose file and the CLI never forwards one: tsvz-rs and TSVZ.py read loose files by different rules, so a forwarded command could print what the other tool's files would not | — |
 | Loose files | Design section 5.6's simple rule; TSVZ.py uses its 3.39 rules instead (§20.2.4 allows both), which also cut a row longer than the first to its width | — |
-| `-V` | `tsvz-rs 0.1.0` | — |
+| `-V` | `tsvz-rs` and the crate version (`tsvz-rs 0.1.1`) | — |
 
 ## Where TSVZ.py departs from the spec
 
