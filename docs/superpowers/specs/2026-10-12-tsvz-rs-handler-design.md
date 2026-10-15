@@ -408,7 +408,11 @@ message is printed for status 1 and 2. The handler deletes the row a `pop` or `p
 takes before answering, whereas on the files the row is printed first: the
 command prints and flushes that row with SIGPIPE ignored, and a row it cannot
 print (a closed pipe, a full disk) is put back with `setdefault` (which keeps a
-row written for its key since), reported on stderr, and the command exits 1.
+row written for its key since), reported on stderr, and the command exits 1. The
+key goes back as a data key (§21.4.3); the row goes back at the end of the
+order, and read as the store now strips (§10). When the store then reads
+otherwise for that key, stderr shows the row taken as `read --format records`
+prints it, ready for `set STORE -`.
 
 If the connection is lost during the request, a read-only operation (`read`,
 `get`, `has`, `len`, `keys`) warns and runs on the files; any other exits 1 with

@@ -257,6 +257,35 @@ fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
 }
 
 #[test]
+fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "<#>_x_#\tkeep me\na\t1\n");
+    let _served = Served::start(&s, &[]);
+    let mut fds = [0; 2];
+    // SAFETY: pipe writes two new descriptors into fds.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors are new and owned here alone.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read);
+    let out = tsvz()
+        .current_dir(dir.path())
+        .args(["popitem", "s.tsvz", "first"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("it was put back"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(ask(&s, "get\t<#>_x_#").lines, ["<#>_x_#\tkeep me"]);
+}
+
+#[test]
 fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     // A pop answered after its tombstone is written must reach its client, or not be made:
     // a stop lets requests already read finish and answer, and refuses the ones after.

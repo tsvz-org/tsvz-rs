@@ -152,18 +152,20 @@ fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i3
     };
     let fields = decode_fields(&response.lines[0]);
     let mut line = String::from("setdefault");
-    for f in &fields {
+    for (i, f) in fields.iter().enumerate() {
         line.push('\t');
-        line.push_str(&field(f, false));
+        line.push_str(&field(f, i == 0)); // the key stays a data key (§21.4.3)
     }
-    let row = fields.join("\t");
+    // As `read --format records` prints it: given to `set STORE -`, it is the same row again.
+    let row = &response.lines[0];
     let store = ctx.store.display();
     match client.send(&line, None) {
-        Ok(r) if r.status == 0 && r.lines.first() == Some(&response.lines[0]) => {
+        Ok(r) if r.status == 0 && r.lines.first() == Some(row) => {
             diag!("tsvz: {store}: the row taken could not be printed; it was put back");
         }
         Ok(r) if r.status == 0 => diag!(
-            "tsvz: {store}: the row taken could not be printed, and its key was written since: {row}"
+            "tsvz: {store}: the row taken could not be printed; put back, its key reads {} (written since, or stripped as the store now strips); the row taken was: {row}",
+            r.lines.first().map_or("", String::as_str)
         ),
         Ok(r) => diag!(
             "tsvz: {store}: the row taken could not be printed nor put back ({}): {row}",
