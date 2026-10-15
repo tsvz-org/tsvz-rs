@@ -677,7 +677,23 @@ fn reads_as_after(earlier: Store, recovery: &Path, s: &Store) -> bool {
 }
 
 fn same_reading(r: &Store, s: &Store) -> bool {
-    !r.incomplete() && r.markers() == s.markers() && trimmed_rows(r) == trimmed_rows(s)
+    !r.incomplete() && same_markers(r.markers(), s.markers()) && trimmed_rows(r) == trimmed_rows(s)
+}
+
+/// Markers equal but for empty trailing defaults, which read as no default at all (§14, and
+/// §3.6 lets a reader pad): a snapshot leaves a #_defaults_# of empty values out, as TSVZ.py does.
+fn same_markers(a: &Markers, b: &Markers) -> bool {
+    let trim = |m: &Markers| {
+        let mut m = m.clone();
+        let kept = m
+            .defaults
+            .iter()
+            .rposition(|d| !d.is_empty())
+            .map_or(0, |i| i + 1);
+        m.defaults = std::sync::Arc::new(m.defaults[..kept].to_vec());
+        m
+    };
+    trim(a) == trim(b)
 }
 
 /// Whether a part narrowed for a rewrite gets its mode back: only when it surely holds its old
@@ -1403,6 +1419,19 @@ mod tests {
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
         fs::write(dir.path().join("s.tsvz.2"), "#_version_#\t2\nc\t3\n").unwrap();
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+    }
+
+    #[test]
+    fn defaults_of_empty_values_only_do_not_refuse_a_two_part_scrub() {
+        // The snapshot leaves out a #_defaults_# of empty values (it reads the same: §3.6, §14),
+        // so the guard must not take that for a difference (difftest seed 610).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#_defaults_#\t\t\na\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        let before = rows(&p);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        assert_eq!(rows(&p), before);
     }
 
     #[test]
