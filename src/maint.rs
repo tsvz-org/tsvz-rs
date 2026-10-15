@@ -550,9 +550,6 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             None => snapshot(&s),
             Some(earlier) => restating_snapshot(&s, earlier),
         };
-        if multi {
-            narrow_mode(&target.path, prefix)?;
-        }
         let recovery = write_recovery(store, &target.path, content.as_bytes())?;
         if multi
             && !(reads_as(&recovery, &s)
@@ -571,6 +568,18 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             let _ = std::fs::remove_file(&recovery);
             continue; // another process changed a part being compacted
         }
+        // Narrowed only now that the rows are about to go in, and put back if they do not.
+        let narrowed = if multi {
+            match narrow_mode(&target.path, prefix) {
+                Ok(old) => old,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&recovery);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         let written = rewrite(
             &target.path,
             content.as_bytes(),
@@ -579,6 +588,9 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             s.markers().member_size,
             Some(&recovery),
         );
+        if let (Some(old), false) = (narrowed, matches!(written, Ok(Some(_)))) {
+            let _ = std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(old));
+        }
         // The recovery copy goes, unless the part was left damaged: then it is all there is.
         if !written.as_ref().is_err_and(damaged) {
             let _ = std::fs::remove_file(&recovery);
@@ -668,25 +680,29 @@ fn same_reading(r: &Store, s: &Store) -> bool {
 }
 
 /// Make `target` no more readable than any of `prefix`, whose rows it is about to hold: the
-/// intersection of their modes, without group access unless they all share its group.
-fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<(), Error> {
+/// intersection of their read bits, without group read unless they all share its group; its
+/// other bits stay. The mode before, when it changed.
+fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Error> {
     use std::os::unix::fs::MetadataExt;
     let metas: Vec<std::fs::Metadata> = prefix
         .iter()
         .map(|p| std::fs::metadata(&p.path).map_err(|e| Error::io(&p.path, e)))
         .collect::<Result<_, _>>()?;
     let own = std::fs::metadata(target).map_err(|e| Error::io(target, e))?;
-    let mut mode = metas
-        .iter()
-        .fold(own.mode() & 0o7777, |m, meta| m & meta.mode());
+    let old = own.mode() & 0o7777;
+    // Read access only: write access to the part stays its owner's (a read-only old part must
+    // not make it read-only, or it could never be rewritten again).
+    let mut read = metas.iter().fold(old & 0o444, |r, meta| r & meta.mode());
     if metas.iter().any(|m| m.gid() != own.gid()) {
-        mode &= !0o070;
+        read &= !0o040;
     }
-    if mode != own.mode() & 0o7777 {
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| Error::io(target, e))?;
+    let mode = (old & !0o444) | read;
+    if mode == old {
+        return Ok(None);
     }
-    Ok(())
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| Error::io(target, e))?;
+    Ok(Some(old))
 }
 
 fn sync_dir(path: &Path) {
@@ -1185,6 +1201,24 @@ mod tests {
         assert!(matches!(scrub(&p, &opts()), Err(Error::Io { .. })));
         assert_eq!(files(dir.path()), ["s.tsvz", "s.tsvz.1", "s.tsvz.4"]);
         assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\n");
+    }
+
+    #[test]
+    fn narrowing_takes_read_access_only_never_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+        // Old parts made read-only to protect them must not make the part compacted into
+        // read-only too: its owner could no longer rewrite it, nor scrub again.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+        let target = dir.path().join("s.tsvz.1");
+        fs::write(&target, "a\t2\nb\t3\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "c\t3\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o664, "mode {mode:o}");
     }
 
     #[test]
