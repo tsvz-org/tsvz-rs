@@ -143,10 +143,11 @@ fn stop_ends_the_connections_still_open() {
     let mut served = Served::start(&s, &[]);
     let mut idle = connect(&s).unwrap();
     idle.write_all(b"len").unwrap(); // a request never finished
+    // Before the stop: macOS refuses to set options on a socket its peer has closed.
+    idle.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
     assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
     assert_eq!(served.wait(), 0);
-    idle.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut byte = [0u8; 1];
     assert_eq!(idle.read(&mut byte).unwrap_or(0), 0, "closed");
 }

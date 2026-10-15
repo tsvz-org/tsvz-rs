@@ -26,7 +26,7 @@ jobs:
           python-version: "3.14"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo test --no-fail-fast
         env:
           TSVZ_PY: ${{ github.workspace }}/TSVZ/TSVZ.py
           TSVZ_REQUIRE_INTEROP: "1"
