@@ -232,7 +232,12 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   the writer thread counts batches that found their part not as the previous
   batch left it, and `submit` checks that the last part appended to is still as
   that batch left it and that the store has the same parts (by name; the
-  directory is listed only while its timestamp cannot show a change).
+  directory is listed only while its timestamp cannot show a change), each as
+  the store last read it (a stat of every part: another long-running writer may
+  append to an earlier part of its own, §17.7). Requests that waited for the
+  engine share that check: one that began after a request arrived (another
+  request's, or a follow) already shows every write committed before it came,
+  so under load one stat of every part serves many writes.
 
 ### 4.3 Acknowledgement (§21.9)
 

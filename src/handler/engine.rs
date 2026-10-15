@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::handler::protocol::{Request, Response};
 use crate::lock::Handle;
@@ -304,6 +305,9 @@ struct State {
     /// writer's count of batches that found other writers' data then.
     reflected: u64,
     foreign: u64,
+    /// When the last follow, or check that found the files as the store last read them, began:
+    /// every write committed before then is in the state.
+    checked: Option<Instant>,
 }
 
 /// Output lines of a response (§21.6.1): rows and keys as `read --format records` prints them
@@ -423,6 +427,7 @@ impl Engine {
                 queued_member_size: None,
                 reflected: 0,
                 foreign: 0,
+                checked: None,
             }),
             batcher,
             thread: Mutex::new(Some(thread)),
@@ -474,11 +479,13 @@ impl Engine {
 
     /// Follow the files as they are now, without waiting for queued writes.
     fn follow(&self, st: &mut State) -> Result<(), Error> {
+        let start = Instant::now();
         let (written, foreign) = self.batcher.progress(); // what the files hold at least
         let reopened = match &mut st.store {
             Some(store) => match store.refresh() {
                 Ok(_) => {
                     (st.reflected, st.foreign) = (written, foreign);
+                    st.checked = Some(start);
                     return Ok(());
                 }
                 Err(Error::Missing(_)) => None,
@@ -492,6 +499,7 @@ impl Engine {
         };
         st.store = reopened;
         (st.reflected, st.foreign) = (written, foreign);
+        st.checked = Some(start);
         Ok(())
     }
 
@@ -502,6 +510,7 @@ impl Engine {
     fn submit(
         &self,
         st: &mut State,
+        arrived: Instant,
         records: &[Record],
         sync: bool,
         member_size: Option<u64>,
@@ -512,14 +521,23 @@ impl Engine {
         }
         // The store's markers are current unless another writer wrote since it last followed
         // the files: then follow them (cheaply, without waiting for queued writes). A file
-        // that cannot be followed leaves the state last read; reads report it.
-        let others = self.batcher.others_wrote(st.foreign)
-            || !st
-                .store
-                .as_mut()
-                .is_some_and(|s| s.same_parts().unwrap_or(false) && s.earlier_parts_kept());
-        if others {
-            let _ = self.follow(st);
+        // that cannot be followed leaves the state last read; reads report it. Checking means
+        // a stat of every part (another writer may append to an earlier part of its own,
+        // §17.7), so requests that waited for the engine share a check: one that began after
+        // a request arrived, another request's or a follow, already shows every write
+        // committed before it came.
+        let start = Instant::now();
+        if !(st.store.is_some() && st.checked.is_some_and(|c| c >= arrived)) {
+            let others = self.batcher.others_wrote(st.foreign)
+                || !st
+                    .store
+                    .as_mut()
+                    .is_some_and(|s| s.same_parts().unwrap_or(false) && s.earlier_parts_kept());
+            if others {
+                let _ = self.follow(st);
+            } else {
+                st.checked = Some(start);
+            }
         }
         let reflected = st.reflected;
         let markers = st.store.as_ref().map(Store::markers);
@@ -554,7 +572,8 @@ impl Engine {
     /// Answer one request (§21.7). Every failure is a status: the handler keeps serving
     /// (§21.10.3).
     pub fn handle(&self, req: &Request, bulk: Option<&[String]>) -> Response {
-        let mut response = self.dispatch(req, bulk);
+        let arrived = Instant::now();
+        let mut response = self.dispatch(req, bulk, arrived);
         if let Some(why) = self.batcher.failing() {
             response.diagnostics.push(format!(
                 "{}: writes are failing ({why}); writes acknowledged before they were written may be lost",
@@ -564,11 +583,11 @@ impl Engine {
         response
     }
 
-    fn dispatch(&self, req: &Request, bulk: Option<&[String]>) -> Response {
+    fn dispatch(&self, req: &Request, bulk: Option<&[String]>, arrived: Instant) -> Response {
         match req.op.as_str() {
             "read" | "get" | "has" | "len" | "keys" => self.read(req),
-            "set" | "append" | "delete" => self.write(req, bulk),
-            "pop" | "popitem" | "setdefault" => self.change(req),
+            "set" | "append" | "delete" => self.write(req, bulk, arrived),
+            "pop" | "popitem" | "setdefault" => self.change(req, arrived),
             "clear" | "scrub" => self.maintain(req.op == "clear"),
             "verify" => self.verify(),
             "parts" => self.parts(),
@@ -608,7 +627,7 @@ impl Engine {
         Engine::answer(result, said)
     }
 
-    fn write(&self, req: &Request, bulk: Option<&[String]>) -> Response {
+    fn write(&self, req: &Request, bulk: Option<&[String]>, arrived: Instant) -> Response {
         let delete = req.op == "delete";
         let records: Vec<Record> = if req.bulk() {
             let mut input = String::new();
@@ -646,9 +665,9 @@ impl Engine {
                     }
                     None => ops::delete_records(&records, d, true, |_| false),
                 };
-                return self.submit(st, &records, req.sync, None, req.written);
+                return self.submit(st, arrived, &records, req.sync, None, req.written);
             }
-            self.submit(st, &records, req.sync, None, req.written)
+            self.submit(st, arrived, &records, req.sync, None, req.written)
         });
         let result = result.and_then(|queued| match queued {
             Some(q) if q.waited => self.batcher.wait(q.seq).map_err(Error::Refused),
@@ -657,7 +676,7 @@ impl Engine {
         Engine::answer(result.map(|()| Response::status(0)), said)
     }
 
-    fn change(&self, req: &Request) -> Response {
+    fn change(&self, req: &Request, arrived: Instant) -> Response {
         let (result, said) = self.locked(|st| {
             self.fresh(st)?;
             let plan = match (req.op.as_str(), &st.store) {
@@ -680,7 +699,8 @@ impl Engine {
                     records,
                     member_size,
                 } => {
-                    let queued = self.submit(st, &records, req.sync, Some(member_size), true)?;
+                    let queued =
+                        self.submit(st, arrived, &records, req.sync, Some(member_size), true)?;
                     (Engine::row(&key, &cells), queued)
                 }
                 Plan::Put {
@@ -689,7 +709,8 @@ impl Engine {
                     record,
                     member_size,
                 } => {
-                    let queued = self.submit(st, &[record], req.sync, Some(member_size), true)?;
+                    let queued =
+                        self.submit(st, arrived, &[record], req.sync, Some(member_size), true)?;
                     (Engine::row(&key, &cells), queued)
                 }
             })
@@ -723,6 +744,7 @@ impl Engine {
                 maint::scrub(&self.path, &options)
             };
             st.store = None;
+            st.checked = None;
             self.fresh(st)?;
             Ok(match outcome {
                 Ok(Outcome::Written | Outcome::Unchanged) => Response::status(0),
@@ -993,7 +1015,7 @@ mod tests {
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
             // Not `written`: a write is waited for exactly when it is durable.
-            e.submit(&mut st, records, false, None, false)
+            e.submit(&mut st, Instant::now(), records, false, None, false)
                 .unwrap()
                 .unwrap()
         };
@@ -1047,7 +1069,8 @@ mod tests {
         let e = engine(dir.path(), "s.tsvz.gz");
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
-            e.submit(&mut st, records, false, None, false).unwrap();
+            e.submit(&mut st, Instant::now(), records, false, None, false)
+                .unwrap();
         };
         let row = |k: String| Record::Data {
             key: k,
@@ -1109,7 +1132,8 @@ mod tests {
             key: "c".into(),
             values: vec!["3".into()],
         };
-        e.submit(&mut st, &[row], false, None, false).unwrap();
+        e.submit(&mut st, Instant::now(), &[row], false, None, false)
+            .unwrap();
         drop(st);
         assert!(
             crate::lock::locked_elsewhere(&p),
@@ -1117,6 +1141,38 @@ mod tests {
         );
         drop(held);
         assert_eq!(ask(&e, "keys").lines, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn requests_that_arrived_before_a_check_of_the_files_share_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let row = [Record::Data {
+            key: "k".into(),
+            values: vec!["v".into()],
+        }];
+        let waited = |at: Instant| {
+            let mut st = lock(&e.state);
+            let queued = e.submit(&mut st, at, &row, false, None, false).unwrap();
+            drop(st);
+            e.batcher.barrier();
+            queued.unwrap().waited
+        };
+        waited(Instant::now());
+        waited(Instant::now()); // follows the first batch: from here on, only ours
+        let early = Instant::now();
+        assert!(!waited(Instant::now())); // a later request, served first: its check is after `early`
+        // Another writer asks for acknowledgements on disk, in the earlier part.
+        append(&p, b"#_write_ack_#\tdisk\n");
+        // The marker came after the request that arrived at `early`: that check answers it.
+        assert!(!waited(early));
+        assert!(
+            waited(Instant::now()),
+            "a request arriving after the marker sees it"
+        );
     }
 
     #[test]
@@ -1141,7 +1197,7 @@ mod tests {
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
             // Not `written`: a write is waited for exactly when it is durable.
-            e.submit(&mut st, records, false, None, false)
+            e.submit(&mut st, Instant::now(), records, false, None, false)
                 .unwrap()
                 .unwrap()
         };
@@ -1192,7 +1248,7 @@ mod tests {
                 values: vec!["v".into()],
             }];
             // Not `written`: a write is waited for exactly when it is durable.
-            e.submit(&mut st, &data, false, None, false)
+            e.submit(&mut st, Instant::now(), &data, false, None, false)
                 .unwrap()
                 .unwrap()
         };
@@ -1224,7 +1280,7 @@ mod tests {
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);
             // Not `written`: a write is waited for exactly when it is durable.
-            e.submit(&mut st, records, false, None, false)
+            e.submit(&mut st, Instant::now(), records, false, None, false)
                 .unwrap()
                 .unwrap()
         };
@@ -1258,7 +1314,7 @@ mod tests {
                 key: k,
                 values: vec!["v".into()],
             }];
-            e.submit(&mut st, &data, false, None, written)
+            e.submit(&mut st, Instant::now(), &data, false, None, written)
                 .unwrap()
                 .unwrap()
         };
