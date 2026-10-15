@@ -588,7 +588,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             s.markers().member_size,
             Some(&recovery),
         );
-        if let (Some(old), false) = (narrowed, matches!(written, Ok(Some(_)))) {
+        if let (Some(old), true) = (narrowed, put_mode_back(&written)) {
             let _ = std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(old));
         }
         // The recovery copy goes, unless the part was left damaged: then it is all there is.
@@ -679,9 +679,19 @@ fn same_reading(r: &Store, s: &Store) -> bool {
     !r.incomplete() && r.markers() == s.markers() && trimmed_rows(r) == trimmed_rows(s)
 }
 
-/// Make `target` no more readable than any of `prefix`, whose rows it is about to hold: the
-/// intersection of their read bits, without group read unless they all share its group; its
-/// other bits stay. The mode before, when it changed.
+/// Whether a part narrowed for a rewrite gets its mode back: only when it surely holds its old
+/// bytes (nothing was written, or the old bytes went back), never when it may hold new rows.
+fn put_mode_back(written: &Result<Option<bool>, Error>) -> bool {
+    match written {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(e) => !damaged(e),
+    }
+}
+
+/// Make `target` no more open than any of `prefix`, whose rows it is about to hold: the
+/// intersection of their modes, without group access unless they all share its group, except
+/// that its owner keeps reading and writing it. The mode before, when it changed.
 fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Error> {
     use std::os::unix::fs::MetadataExt;
     let metas: Vec<std::fs::Metadata> = prefix
@@ -690,13 +700,14 @@ fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Err
         .collect::<Result<_, _>>()?;
     let own = std::fs::metadata(target).map_err(|e| Error::io(target, e))?;
     let old = own.mode() & 0o7777;
-    // Read access only: write access to the part stays its owner's (a read-only old part must
-    // not make it read-only, or it could never be rewritten again).
-    let mut read = metas.iter().fold(old & 0o444, |r, meta| r & meta.mode());
+    // Every bit is narrowed but its owner's read and write: they let the owner rewrite the
+    // part, and scrub again, even when old parts were made read-only; group and others can
+    // neither read nor write the rows more than in every part they come from.
+    let mut shared = metas.iter().fold(old & 0o7177, |m, meta| m & meta.mode());
     if metas.iter().any(|m| m.gid() != own.gid()) {
-        read &= !0o040;
+        shared &= !0o070;
     }
-    let mode = (old & !0o444) | read;
+    let mode = (old & 0o600) | shared;
     if mode == old {
         return Ok(None);
     }
@@ -1204,21 +1215,49 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_takes_read_access_only_never_write_access() {
+    fn narrowing_keeps_the_owner_able_to_rewrite_and_others_no_freer() {
         use std::os::unix::fs::PermissionsExt;
-        // Old parts made read-only to protect them must not make the part compacted into
-        // read-only too: its owner could no longer rewrite it, nor scrub again.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("s.tsvz");
-        fs::write(&p, "a\t1\n").unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
-        let target = dir.path().join("s.tsvz.1");
-        fs::write(&target, "a\t2\nb\t3\n").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
-        fs::write(dir.path().join("s.tsvz.2"), "c\t3\n").unwrap();
-        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o664, "mode {mode:o}");
+        // The part compacted into holds every prefix part's rows: no one but its owner may read
+        // or write them more than before; its owner keeps reading and writing it (to rewrite it,
+        // and to scrub again), even when old parts were made read-only.
+        for (part0, target, after) in [
+            (0o444, 0o664, 0o644),
+            (0o644, 0o666, 0o644),
+            (0o600, 0o644, 0o600),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, "a\t1\n").unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(part0)).unwrap();
+            let t = dir.path().join("s.tsvz.1");
+            fs::write(&t, "a\t2\nb\t3\n").unwrap();
+            fs::set_permissions(&t, fs::Permissions::from_mode(target)).unwrap();
+            fs::write(dir.path().join("s.tsvz.2"), "c\t3\n").unwrap();
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+            let mode = fs::metadata(&t).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, after, "{part0:o} + {target:o} -> {mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_narrowed_mode_is_put_back_only_over_the_old_bytes() {
+        // Widening again a part that a failed rewrite left holding new rows would show them.
+        let full = || io::Error::new(io::ErrorKind::StorageFull, "no space left");
+        let p = Path::new("s.tsvz");
+        let kept = replace(p, b"new", b"old", None, |b| {
+            if b == b"new" { Err(full()) } else { Ok(()) }
+        });
+        let lost = replace(p, b"new", b"old", None, |_| Err(full()));
+        assert!(put_mode_back(&Ok(None)), "nothing written");
+        assert!(
+            put_mode_back(&kept.map(|()| Some(true))),
+            "the old bytes went back"
+        );
+        assert!(
+            !put_mode_back(&lost.map(|()| Some(true))),
+            "damaged: new rows may be there"
+        );
+        assert!(!put_mode_back(&Ok(Some(true))), "written");
     }
 
     #[test]
