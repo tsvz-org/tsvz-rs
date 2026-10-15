@@ -2,6 +2,12 @@
 
 use std::path::Path;
 
+/// Whether `d` can delimit a loose file: one ASCII character other than a line break (a byte
+/// past ASCII could cut a character in two, a line break would split rows), as `-d` takes.
+pub(crate) fn usable_delimiter(d: u8) -> bool {
+    d.is_ascii() && d != b'\n' && d != b'\r'
+}
+
 /// A compression codec of §16.2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]

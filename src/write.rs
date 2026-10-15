@@ -135,6 +135,11 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
         )));
     }
     if !format.strict {
+        if !name::usable_delimiter(d) {
+            return Err(Error::Refused(format!(
+                "the delimiter {d:#04x} is not one ASCII character other than a line break; nothing was written"
+            )));
+        }
         for field in std::iter::once(key).chain(values) {
             if field.bytes().any(|b| b == d || b == b'\n' || b == b'\r') {
                 return Err(Error::Refused(format!(
@@ -387,6 +392,28 @@ mod tests {
     fn enc(r: Record, f: Format) -> Result<String, Error> {
         let mut s = String::new();
         encode_record(&r, f, &mut s).map(|()| s)
+    }
+
+    #[test]
+    fn a_loose_writer_refuses_a_delimiter_it_could_not_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.tsv");
+        for d in [0xA7, b'\n'] {
+            let row = Record::Data {
+                key: "a".into(),
+                values: vec!["1".into()],
+            };
+            let e = Writer::open(&p)
+                .unwrap()
+                .delimiter(Some(d))
+                .append(&[row])
+                .unwrap_err();
+            assert!(e.to_string().contains("delimiter"), "{d:#x}: {e}");
+        }
+        assert!(
+            !p.exists() || std::fs::read(&p).unwrap().is_empty(),
+            "nothing written"
+        );
     }
 
     #[test]

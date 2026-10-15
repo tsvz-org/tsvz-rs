@@ -36,7 +36,8 @@ pub struct Options {
     pub scope: Scope,
     /// Compute digests and record mismatches (§15); off for plain reads.
     pub verify: bool,
-    /// The delimiter of a loose file (`-d`); ignored for strict variants (§5.1).
+    /// The delimiter of a loose file (`-d`): one ASCII character other than a line break, else
+    /// the open is refused; ignored for strict variants (§5.1).
     pub delimiter: Option<u8>,
     pub warnings: Option<WarnFn>,
     /// Skip a part that cannot be opened or read, or whose codec this build lacks (§16.5),
@@ -379,6 +380,12 @@ impl Store {
         let path = path.to_path_buf();
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
+            if !name::usable_delimiter(d) {
+                return Err(Error::Refused(format!(
+                    "{}: the delimiter {d:#04x} is not one ASCII character other than a line break",
+                    path.display()
+                )));
+            }
             format.delimiter = d;
         }
         let mut store = Store {
@@ -800,6 +807,22 @@ mod tests {
 
     fn v(cells: &[&str]) -> Vec<String> {
         cells.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn a_loose_delimiter_must_be_one_ascii_character_other_than_a_line_break() {
+        // A byte past ASCII cuts characters in two (a panic); a line break splits rows.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.tsv");
+        fs::write(&p, "a\u{a7}1\n\u{e7}\n").unwrap();
+        for d in [0xA7, 0x80, b'\n', b'\r'] {
+            let options = Options {
+                delimiter: Some(d),
+                ..Options::default()
+            };
+            let e = Store::open(&p, options).err().expect("refused");
+            assert!(e.to_string().contains("delimiter"), "{d:#x}: {e}");
+        }
     }
 
     #[test]
