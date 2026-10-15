@@ -499,7 +499,7 @@ impl Engine {
             || !st
                 .store
                 .as_mut()
-                .is_some_and(|s| s.same_parts().unwrap_or(false));
+                .is_some_and(|s| s.same_parts().unwrap_or(false) && s.earlier_parts_kept());
         if others {
             let _ = self.follow(st);
         }
@@ -1066,6 +1066,43 @@ mod tests {
             fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
             "#_write_ack_#\tdisk\nu\tv\n"
         );
+    }
+
+    #[test]
+    fn a_marker_another_writer_appends_to_an_earlier_part_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(dir.path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |k: &str| {
+            let mut st = lock(&e.state);
+            let data = [Record::Data {
+                key: k.into(),
+                values: vec!["v".into()],
+            }];
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, &data, false, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        for k in ["x", "y", "z"] {
+            assert!(!submit(k).waited);
+            e.batcher.barrier();
+        }
+        // An independent writer appends to its own part, which is no longer the last (§17.7).
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"#_write_ack_#\tdisk\n")
+            .unwrap();
+        assert!(submit("w").waited, "the store now acknowledges on disk");
     }
 
     #[test]

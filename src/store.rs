@@ -368,7 +368,7 @@ impl Store {
     }
 
     /// Whether every part but the last is as it was when it was opened.
-    fn earlier_parts_kept(&self) -> bool {
+    pub(crate) fn earlier_parts_kept(&self) -> bool {
         let earlier = self.parts.len().saturating_sub(1);
         self.parts[..earlier].iter().enumerate().all(|(i, p)| {
             let now = std::fs::metadata(&p.path).ok().map(|m| Stamp::of(&m));
