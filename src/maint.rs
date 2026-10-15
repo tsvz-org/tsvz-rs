@@ -246,17 +246,13 @@ pub(crate) fn rewrite(
         })?,
         _ => content.to_vec(),
     };
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(io)?;
+    let file = lock::Handle::open(path, OpenOptions::new().read(true).write(true)).map_err(io)?;
     let _guard = lock::lock(&file, path).map_err(io)?;
     if Stamp::of(&file.metadata().map_err(io)?) != expect {
         return Ok(None);
     }
     let mut old = Vec::new();
-    (&file).read_to_end(&mut old).map_err(io)?;
+    (&*file).read_to_end(&mut old).map_err(io)?;
     if old == raw {
         return Ok(Some(false));
     }
@@ -380,11 +376,7 @@ fn match_owner(copy: &File, part: &std::fs::Metadata) -> io::Result<()> {
 /// sync it, before a rewrite drops the damage (§4.10, §16.6), as TSVZ.py does.
 fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     let io = |e: io::Error| Error::io(path, e);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(io)?;
+    let file = lock::Handle::open(path, OpenOptions::new().read(true).write(true)).map_err(io)?;
     let _guard = lock::lock(&file, path).map_err(io)?;
     // The copy is readable by whoever could read the part, and writable by its owner only: the
     // part's read bits plus owner write, never its setuid, setgid, sticky or execute bits, nor
@@ -410,7 +402,7 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         }
     };
     let copied = match_owner(&copy, &part)
-        .and_then(|()| io::copy(&mut &file, &mut copy))
+        .and_then(|()| io::copy(&mut &*file, &mut copy))
         .and_then(|_| copy.sync_all());
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&target);

@@ -30,6 +30,11 @@ jobs:
         env:
           TSVZ_PY: ${{ github.workspace }}/TSVZ/TSVZ.py
           TSVZ_REQUIRE_INTEROP: "1"
+      # The library's tests again with classic POSIX locks, which macOS always takes.
+      - run: cargo test --lib
+        if: runner.os == 'Linux'
+        env:
+          TSVZ_TEST_CLASSIC_LOCKS: "1"
       - run: cargo build --release
       - run: python3 TSVZ/tsvzconform.py --impl target/release/tsvz --class reader,writer,cli,handler --feature bzip2,xz,zstd,crc32,crc32c,sha256,blake3,file-first,handler,scrub-multipart
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:200

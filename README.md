@@ -71,8 +71,9 @@ for (key, row) in store.iter() {
 
 Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
 available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
-process loses when it closes any other descriptor of the same file; a program that keeps a store
-open should not open its files by other means while it writes.
+process loses when it closes any other descriptor of the same file. The library opens a store's
+files as `tsvz::lock::Handle`s, which it closes only once it holds no such lock on them; a
+program that opens a store's files itself while it writes should do the same.
 
 Build without the command line and C libraries with
 `default-features = false, features = ["bzip2"]` (gzip and all digests are always in).

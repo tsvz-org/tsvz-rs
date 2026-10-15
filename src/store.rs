@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use hashbrown::HashMap;
 
 use crate::codec::{self, Item};
 use crate::frame::Framer;
+use crate::lock::Handle;
 use crate::name::{self, Codec, Format};
 use crate::parts::{self, Stamp};
 use crate::replay::{Binding, Cells, Damage, EMPTY_CELLS, Markers, Mismatch, Policy, Replay, Sink};
@@ -461,7 +462,9 @@ impl Store {
 
     /// Replay one part; `last` marks the store's last part, whose end the follow state records.
     fn read_part(&mut self, part: &parts::Part, last: bool) -> Result<(), Error> {
-        let mut file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
+        let file = Handle::open(&part.path, OpenOptions::new().read(true))
+            .map_err(|e| Error::io(&part.path, e))?;
+        let mut reader: &File = &file;
         let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
         if meta.is_dir() {
             return Err(Error::io(
@@ -478,7 +481,8 @@ impl Store {
         match part.codec {
             Some(codec) => {
                 let mut data = Vec::new();
-                file.read_to_end(&mut data)
+                reader
+                    .read_to_end(&mut data)
                     .map_err(|e| Error::io(&part.path, e))?;
                 codec::for_each_item(codec, &data, &mut |item| match item {
                     Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
@@ -500,7 +504,7 @@ impl Store {
             None => {
                 let mut buf = vec![0u8; 1 << 20];
                 loop {
-                    let n = match file.read(&mut buf) {
+                    let n = match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -749,7 +753,7 @@ impl Store {
             return Ok(false); // an append only ever grows the same file
         }
         let io = |e: std::io::Error| Error::io(&path, e);
-        let file = File::open(&path).map_err(io)?;
+        let file = Handle::open(&path, OpenOptions::new().read(true)).map_err(io)?;
         let mut check = vec![0u8; want];
         if file
             .read_exact_at(&mut check, offset - want as u64)
@@ -759,8 +763,8 @@ impl Store {
             return Ok(false); // rewritten in place (§19.8)
         }
         let mut data = Vec::new();
-        (&file).seek(SeekFrom::Start(offset)).map_err(io)?;
-        (&file).read_to_end(&mut data).map_err(io)?;
+        (&*file).seek(SeekFrom::Start(offset)).map_err(io)?;
+        (&*file).read_to_end(&mut data).map_err(io)?;
         let mut framer = Framer::resume(offset, self.follow.line);
         let (replay, table) = (&mut self.replay, &mut self.table);
         replay.begin_part(&path, last == 0 && offset == 0);

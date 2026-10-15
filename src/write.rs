@@ -203,7 +203,7 @@ pub struct Appended {
     pub part: PathBuf,
     pub before: parts::Stamp,
     pub after: parts::Stamp,
-    pub file: File,
+    pub file: lock::Handle,
 }
 
 fn stamp(file: &File) -> io::Result<parts::Stamp> {
@@ -299,10 +299,7 @@ impl Writer {
                         }
                     })?);
                 }
-                let file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(path)
+                let file = lock::Handle::open(path, OpenOptions::new().append(true).create(true))
                     .map_err(io)?;
                 let (before, after) = {
                     let _guard = lock::lock(&file, path).map_err(io)?;
@@ -318,12 +315,11 @@ impl Writer {
                 })
             }
             None => {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .append(true)
-                    .create(true)
-                    .open(path)
-                    .map_err(io)?;
+                let file = lock::Handle::open(
+                    path,
+                    OpenOptions::new().read(true).append(true).create(true),
+                )
+                .map_err(io)?;
                 let (before, after) = {
                     let _guard = lock::lock(&file, path).map_err(io)?;
                     let before = stamp(&file).map_err(io)?;
