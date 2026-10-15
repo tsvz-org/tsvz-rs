@@ -721,6 +721,22 @@ fn snapshot_part(
         }
         _ => content.into_bytes(),
     };
+    // A part is added only when it gains something: when the last part already reads alone
+    // as the whole prefix and is no larger, there is nothing to compact (a scrub run again,
+    // by cron say, would add a full copy each time), only a rotation cut short to finish.
+    let action = match s.markers().rotate {
+        "delete" if s.damaged() => "rename", // a part whose damage was recovered is kept
+        action => action,
+    };
+    let size = std::fs::metadata(&last.path).map(|m| m.len());
+    if size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
+        let others = &prefix[..prefix.len() - 1];
+        if others.is_empty() || action == "keep" {
+            return Ok(Snapshotted::Done(Outcome::Unchanged));
+        }
+        rotate(others, action)?;
+        return Ok(Snapshotted::Done(Outcome::Written));
+    }
     let suffix = parts::codec_suffix(&last.path);
     let target = parts::numbered_path(store, ordinal, suffix.as_deref())?;
     let tmp = snapshot_temp(store, &target, suffix.as_deref());
@@ -766,11 +782,6 @@ fn snapshot_part(
         }
     }
     sync_dir(&target);
-    // A part whose damage was recovered is never deleted: rename instead (§19.5).
-    let action = match s.markers().rotate {
-        "delete" if s.damaged() => "rename",
-        action => action,
-    };
     rotate(prefix, action)?;
     Ok(Snapshotted::Done(Outcome::Written))
 }
@@ -1852,6 +1863,35 @@ mod tests {
         }
         assert!(!overwrites_in_place(Path::new("/proc")), "procfs");
         assert!(!overwrites_in_place(Path::new("/no/such/dir")), "unknown");
+    }
+
+    #[test]
+    fn scrubbing_again_adds_no_copy() {
+        // A snapshot part already holding the whole prefix, no larger than a new one would be:
+        // a scrub adds nothing (cron could otherwise add a full copy each time). A part with
+        // superseded rows is still compacted.
+        for action in ["keep", "rename", "delete"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, format!("#_rotate_#\t{action}\na\t1\na\t2\nb\t3\nb\n")).unwrap();
+            fs::write(dir.path().join("s.tsvz.ff"), "z\t9\n").unwrap();
+            let before = rows(&p);
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written, "{action}");
+            let mut outcome = scrub(&p, &opts()).unwrap();
+            if outcome == Outcome::Written {
+                outcome = scrub(&p, &opts()).unwrap(); // a rotation's restating part shrinks once
+            }
+            assert_eq!(outcome, Outcome::Unchanged, "{action}");
+            let names = files(dir.path());
+            let parts = names.iter().filter(|n| !n.contains("rotated")).count();
+            assert!(parts <= 3, "{action}: {names:?}");
+            assert_eq!(
+                scrub(&p, &opts()).unwrap(),
+                Outcome::Unchanged,
+                "{action}: {names:?}"
+            );
+            assert_eq!(rows(&p), before, "{action}");
+        }
     }
 
     #[test]
