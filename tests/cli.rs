@@ -853,3 +853,44 @@ fn a_write_that_fails_part_way_leaves_nothing_of_its_batch() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn a_scrub_on_a_disk_too_full_for_its_recovery_copy_still_compacts() {
+    // Scrubbing is how a full disk gets room back: with no room for the copy of the new
+    // content, a part that shrinks is rewritten in place without one, as TSVZ.py does.
+    struct Mounted(std::path::PathBuf);
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg(&self.0).status();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mounted = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=1m", "tmpfs"])
+        .arg(dir.path())
+        .output();
+    if !mounted.is_ok_and(|o| o.status.success()) {
+        eprintln!("cannot mount a small tmpfs here: skipped");
+        return;
+    }
+    let _mounted = Mounted(dir.path().to_path_buf());
+    let mut content = String::new();
+    for pass in ["a", "b", "c"] {
+        for i in 0..10_000 {
+            content.push_str(&format!("k{i:05}\t{}\n", pass.repeat(20)));
+        }
+    }
+    fs::write(dir.path().join("s.tsvz"), &content).unwrap();
+    let (code, _, err) = run_in(dir.path(), &["scrub", "s.tsvz"], b"");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("recovery copy"), "{err}");
+    let (code, out, _) = run_in(dir.path(), &["len", "s.tsvz"], b"");
+    assert_eq!((code, out.trim()), (0, "10000"));
+    let (_, out, _) = records(dir.path(), &["get", "s.tsvz", "k00042"]);
+    assert_eq!(out, format!("k00042\t{}\n", "c".repeat(20)));
+    let left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["s.tsvz"], "no recovery file left behind");
+}

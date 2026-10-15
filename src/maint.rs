@@ -555,22 +555,42 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 None => continue, // the parts changed under the read
             },
         };
-        let recovery = write_recovery(store, &target.path, content.as_bytes())?;
-        if multi
-            && !(reads_as(&recovery, &s)
-                && earlier.is_none_or(|e| reads_as_after(e, &recovery, &s)))
-        {
-            let _ = std::fs::remove_file(&recovery);
-            return refused(
-                "the compacted content did not read back as the parts it replaces (please report this)",
-            );
+        // A one-part scrub with no room for the copy (it is how a full disk gets room back)
+        // rewrites in place without one, as TSVZ.py does: the rewrite reserves its length
+        // first, so it still changes nothing when even that does not fit.
+        let recovery = match write_recovery(store, &target.path, content.as_bytes()) {
+            Ok(path) => Some(path),
+            Err(e) if !multi && no_room(&e) => {
+                if let Some(w) = &options.warnings {
+                    w(&Warning {
+                        part: target.path.clone(),
+                        offset: None,
+                        message: "no room for a recovery copy of the new content; rewriting the part in place without one (§19.8)".into(),
+                    });
+                }
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let drop_copy = || {
+            if let Some(copy) = &recovery {
+                let _ = std::fs::remove_file(copy);
+            }
+        };
+        if let (true, Some(copy)) = (multi, &recovery) {
+            if !(reads_as(copy, &s) && earlier.is_none_or(|e| reads_as_after(e, copy, &s))) {
+                drop_copy();
+                return refused(
+                    "the compacted content did not read back as the parts it replaces (please report this)",
+                );
+            }
         }
         let unchanged = others
             .iter()
             .zip(&before)
             .all(|(p, b)| stamp(&p.path).is_ok_and(|now| now == *b));
         if !unchanged {
-            let _ = std::fs::remove_file(&recovery);
+            drop_copy();
             continue; // another process changed a part being compacted
         }
         // Narrowed only now that the rows are about to go in, and put back if they do not.
@@ -578,7 +598,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             match narrow_mode(&target.path, prefix) {
                 Ok(old) => old,
                 Err(e) => {
-                    let _ = std::fs::remove_file(&recovery);
+                    drop_copy();
                     return Err(e);
                 }
             }
@@ -591,14 +611,14 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
             before[before.len() - 1],
             target.codec,
             s.markers().member_size,
-            Some(&recovery),
+            recovery.as_deref(),
         );
         if let (Some(old), true) = (narrowed, put_mode_back(&written)) {
             let _ = std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(old));
         }
         // The recovery copy goes, unless the part was left damaged: then it is all there is.
         if !written.as_ref().is_err_and(damaged) {
-            let _ = std::fs::remove_file(&recovery);
+            drop_copy();
         }
         let written = written?;
         let Some(written) = written else {
@@ -746,6 +766,12 @@ fn live_after_any_prefix(
     }
     add(earlier);
     Ok(Some(keys))
+}
+
+/// Whether `e` is a full disk or quota.
+fn no_room(e: &Error) -> bool {
+    matches!(e, Error::Io { source, .. }
+        if matches!(source.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)))
 }
 
 /// Whether two paths name the same file.
