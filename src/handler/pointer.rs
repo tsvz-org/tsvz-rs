@@ -504,12 +504,13 @@ mod tests {
     use std::fs;
     use std::os::unix::net::UnixListener;
 
-    /// A socket at `path` listening with a backlog of 0 and never accepting: a stuck handler.
+    /// A socket at `path` listening with a backlog of 1 and never accepting: a stuck handler.
+    /// (Not 0: macOS reads a backlog of 0 as the system maximum.)
     fn listen_without_room(path: &Path) -> std::os::fd::OwnedFd {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let std = UnixListener::bind(path).unwrap();
         // SAFETY: listen only changes the backlog of the socket that `std` owns.
-        assert_eq!(unsafe { libc::listen(std.as_raw_fd(), 0) }, 0);
+        assert_eq!(unsafe { libc::listen(std.as_raw_fd(), 1) }, 0);
         // SAFETY: into_raw_fd hands over the descriptor, which the OwnedFd now owns.
         unsafe { OwnedFd::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(std)) }
     }
@@ -519,10 +520,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s");
         let _listener = listen_without_room(&path);
-        for _ in 0..3 {
-            // Fill the queue; a filler that blocks is left behind with the test.
+        for _ in 0..8 {
+            // Fill the queue (Linux takes the backlog + 1, macOS up to 3/2 of it): a filler keeps
+            // its connection queued, or blocks (Linux) or is refused (macOS), and is left behind.
             let path = path.clone();
-            std::thread::spawn(move || UnixStream::connect(path));
+            std::thread::spawn(move || {
+                let _queued = UnixStream::connect(path);
+                loop {
+                    std::thread::park();
+                }
+            });
         }
         std::thread::sleep(Duration::from_millis(200));
         let info = Info {
