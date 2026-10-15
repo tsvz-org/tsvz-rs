@@ -152,10 +152,11 @@ pub fn snapshot(s: &Store) -> String {
 
 /// The content of the part a multi-part scrub compacts into, while the parts before it are
 /// still read first (§19.5 `keep`, or until they are rotated): it must leave no trace of their
-/// state. Stripping goes off and every key they leave live is deleted, every stateful marker is
-/// set explicitly, then come the rows, fully resolved (§19.4), and the final stripping and
-/// fill-empty settings. Read after those parts, or alone, it reads as the whole prefix does.
-fn restating_snapshot(s: &Store, earlier: &Store) -> String {
+/// state. Stripping goes off and every key in `deleted` (the keys any of them leave live) is
+/// deleted, every stateful marker is set explicitly, then come the rows, fully resolved
+/// (§19.4), and the final stripping and fill-empty settings. Read after those parts, or after
+/// any first ones of them, or alone, it reads as the whole prefix does.
+fn restating_snapshot(s: &Store, deleted: &[String]) -> String {
     let d = s.format().delimiter;
     let m = s.markers();
     let flag = |on: bool| if on { "true" } else { "false" };
@@ -166,7 +167,7 @@ fn restating_snapshot(s: &Store, earlier: &Store) -> String {
     }
     marker_line(&mut out, d, "#_version_#", "1");
     marker_line(&mut out, d, "#_strip_trailing_whites_#", "false");
-    for (key, _) in earlier.iter() {
+    for key in deleted {
         escape::encode_into(&mut out, key, d, true);
         out.push('\n');
     }
@@ -549,7 +550,10 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
         };
         let content = match &earlier {
             None => snapshot(&s),
-            Some(earlier) => restating_snapshot(&s, earlier),
+            Some(earlier) => match live_after_any_prefix(store, options, others, earlier)? {
+                Some(deleted) => restating_snapshot(&s, &deleted),
+                None => continue, // the parts changed under the read
+            },
         };
         let recovery = write_recovery(store, &target.path, content.as_bytes())?;
         if multi
@@ -706,6 +710,44 @@ fn put_mode_back(written: &Result<Option<bool>, Error>) -> bool {
     }
 }
 
+/// The keys live after any first ones of `others` (all of them read as `earlier`), in order:
+/// what a rotation cut short leaves before the compacted part, read from the start (rotate
+/// removes the newest first). None when the parts changed under the reads.
+fn live_after_any_prefix(
+    store: &Path,
+    options: &Options,
+    others: &[parts::Part],
+    earlier: &Store,
+) -> Result<Option<Vec<String>>, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut keys = Vec::new();
+    let mut add = |s: &Store| {
+        for (k, _) in s.iter() {
+            if seen.insert(k.to_string()) {
+                keys.push(k.to_string());
+            }
+        }
+    };
+    let keys_only = Options {
+        scope: Scope::KeysOnly,
+        ..whole(options)
+    };
+    for count in 1..others.len() {
+        let first = Store::open_prefix(store, keys_only.clone(), count)?;
+        if first
+            .parts()
+            .iter()
+            .map(|p| &p.path)
+            .ne(others[..count].iter().map(|p| &p.path))
+        {
+            return Ok(None);
+        }
+        add(&first);
+    }
+    add(earlier);
+    Ok(Some(keys))
+}
+
 /// Whether two paths name the same file.
 fn same_file(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -769,7 +811,8 @@ fn trimmed_rows(s: &Store) -> Vec<(String, Vec<String>)> {
 /// Apply `#_rotate_#` to parts whose rows another part now holds (§19.5): `rename` gives each
 /// the `.rotated` component, never replacing a file; `delete` removes them; `keep` leaves them.
 fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
-    for part in parts {
+    // Newest first: cut short, it leaves the oldest parts, read from the start as written.
+    for part in parts.iter().rev() {
         let io = |e: io::Error| Error::io(&part.path, e);
         match action {
             "rename" => {
@@ -1442,6 +1485,54 @@ mod tests {
     }
 
     #[test]
+    fn every_state_a_rotation_cut_short_can_leave_reads_as_the_store() {
+        // The newest earlier part goes first, so what a crash (or a failed unlink) leaves is the
+        // oldest parts, read from the start as written, then the compacted part: it must undo
+        // what each such prefix leaves live, not only what all of them leave (p1 deletes a).
+        // Also: part 0 turns stripping off, so "k " is a key of its own only after it.
+        for (p0, p1) in [
+            ("a\t1\nb\t2\n", "a\n"),
+            ("#_strip_trailing_whites_#\tfalse\n", "k \tv\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, p0).unwrap();
+            fs::write(dir.path().join("s.tsvz.1"), p1).unwrap();
+            fs::write(dir.path().join("s.tsvz.2"), "c\t3\n").unwrap();
+            fs::write(dir.path().join("s.tsvz.3"), "z\t9\n").unwrap();
+            let before = rows(&p);
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+            for kept in 0..=2 {
+                let state = tempfile::tempdir().unwrap();
+                let earlier = ["s.tsvz", "s.tsvz.1"];
+                for name in earlier[..kept].iter().chain(&["s.tsvz.2", "s.tsvz.3"]) {
+                    fs::copy(dir.path().join(name), state.path().join(name)).unwrap();
+                }
+                let after = rows(&state.path().join("s.tsvz"));
+                assert_eq!(after, before, "{p1:?}: {kept} earlier parts kept");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rotation_removes_the_newest_earlier_part_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = |name: &str, ordinal: Option<&str>| parts::Part {
+            path: dir.path().join(name),
+            ordinal: ordinal.map(String::from),
+            codec: None,
+        };
+        fs::create_dir(dir.path().join("s.tsvz")).unwrap(); // cannot be removed as a file
+        fs::write(dir.path().join("s.tsvz.1"), "a\n").unwrap();
+        let earlier = [part("s.tsvz", None), part("s.tsvz.1", Some("1"))];
+        assert!(rotate(&earlier, "delete").is_err());
+        assert!(
+            !dir.path().join("s.tsvz.1").exists(),
+            "the newest went first"
+        );
+    }
+
+    #[test]
     fn a_rename_rotation_cut_short_is_finished_by_the_next_scrub() {
         // A crash between the link and the unlink leaves both names: the next scrub finishes it
         // rather than fail on "File exists" forever.
@@ -1491,7 +1582,8 @@ mod tests {
             !reads_as_after(earlier(), &copy, &s),
             "seed 107: `a` resurrects"
         );
-        fs::write(&copy, restating_snapshot(&s, &earlier())).unwrap();
+        let deleted: Vec<String> = earlier().iter().map(|(k, _)| k.to_string()).collect();
+        fs::write(&copy, restating_snapshot(&s, &deleted)).unwrap();
         assert!(reads_as(&copy, &s));
         assert!(reads_as_after(earlier(), &copy, &s));
     }
