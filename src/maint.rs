@@ -1050,9 +1050,14 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             None
         };
         let s = Store::open(store, whole(options))?;
-        if s.stopped().is_some() {
+        if s.incomplete() {
+            let why = if s.stopped().is_some() {
+                "the read stopped at damaged data (§4.10)"
+            } else {
+                "the store could not be read whole (a part kept changing while it was read)"
+            };
             return Err(Error::Refused(format!(
-                "{}: clear skipped: the read stopped at damaged data (§4.10); nothing was written",
+                "{}: clear skipped: {why}; nothing was written",
                 store.display()
             )));
         }
@@ -1756,6 +1761,30 @@ mod tests {
         assert!(
             !dir.path().join("s.tsvz.1").exists(),
             "the newest went first"
+        );
+    }
+
+    #[test]
+    fn clear_refuses_a_read_torn_by_a_part_rewritten_under_it() {
+        // A part that keeps changing while it is read (an in-place scrub) makes the read torn;
+        // tombstones for the keys of that read could leave rows live.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n#_version_#\tx\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "z\t9\n").unwrap();
+        let mut options = opts();
+        let part = p.clone();
+        options.warnings = Some(std::sync::Arc::new(move |w: &Warning| {
+            if w.message.contains("#_version_#") {
+                let mut f = fs::OpenOptions::new().append(true).open(&part).unwrap();
+                std::io::Write::write_all(&mut f, b"#x\n").unwrap(); // changes on every read
+            }
+        }));
+        let e = clear(&p, &options).unwrap_err();
+        assert!(matches!(e, Error::Refused(_)), "{e}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
+            "z\t9\n"
         );
     }
 
