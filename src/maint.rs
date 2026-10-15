@@ -476,6 +476,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
         )))
     };
     let mut backed_up: Option<(Stamp, PathBuf)> = None;
+    let mut told = false;
     for _ in 0..ATTEMPTS {
         let list = parts::list(store)?;
         if list.is_empty() {
@@ -538,6 +539,23 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 Some(outcome) => return Ok(outcome),
                 None => continue, // the parts changed under the read
             }
+        }
+        if let (true, false, Some(w)) = (multi, told, &options.warnings) {
+            told = true;
+            let name = |p: &Path| {
+                p.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            };
+            w(&Warning {
+                part: target.path.clone(),
+                offset: None,
+                message: format!(
+                    "no ordinal is free between {} and the active part {}: the parts before it are compacted into {} in place (§19.8), where readers that take no lock may see it rewritten; sparse ordinals, such as UUIDv7 (§17.6), let a scrub write a new part instead",
+                    name(&target.path),
+                    name(&active.path),
+                    name(&target.path)
+                ),
+            });
         }
         let mut copy = None;
         if s.damaged() || s.stopped().is_some() {
@@ -1739,6 +1757,35 @@ mod tests {
             !dir.path().join("s.tsvz.1").exists(),
             "the newest went first"
         );
+    }
+
+    #[test]
+    fn compacting_in_place_for_want_of_an_ordinal_says_so() {
+        // Readers that take no lock (TSVZ.py's) can see a part being rewritten in place: the
+        // fallback is named, with the way to avoid it; a new snapshot part needs no word.
+        for (active, warned) in [("2", true), ("8", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, "a\t1\n").unwrap();
+            fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
+            fs::write(dir.path().join(format!("s.tsvz.{active}")), "c\t3\n").unwrap();
+            let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = said.clone();
+            let mut options = opts();
+            options.warnings = Some(std::sync::Arc::new(move |w: &Warning| {
+                log.lock().unwrap().push(w.message.clone())
+            }));
+            assert_eq!(scrub(&p, &options).unwrap(), Outcome::Written);
+            let said = said.lock().unwrap();
+            let note = said.iter().find(|m| m.contains("in place"));
+            assert_eq!(note.is_some(), warned, "{active}: {said:?}");
+            if let Some(note) = note {
+                assert!(
+                    note.contains("s.tsvz.1") && note.contains("UUIDv7"),
+                    "{note}"
+                );
+            }
+        }
     }
 
     #[test]
