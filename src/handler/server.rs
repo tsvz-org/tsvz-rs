@@ -426,14 +426,19 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>, info: InfoFn) {
         // waits for this thread before it ends.
         let idled = {
             let activity = lock(&shared.activity);
-            let idled = activity.0 == 0
-                && activity.1.elapsed() >= idle
-                && !shared.stopping.load(Ordering::SeqCst);
-            if idled {
+            activity.0 == 0 && activity.1.elapsed() >= idle && {
+                // Claimed at once against a signal or a stop request (Shared::stop): only one
+                // says why the handler stops. `idled` first, so that serve never misses it.
                 shared.idled.store(true, Ordering::SeqCst);
-                shared.stopping.store(true, Ordering::SeqCst);
+                let won = shared
+                    .stopping
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+                if !won {
+                    shared.idled.store(false, Ordering::SeqCst);
+                }
+                won
             }
-            idled
         };
         if idled {
             info(&format!("idle for {} s; stopping", idle.as_secs_f64()));
