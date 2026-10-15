@@ -10,6 +10,8 @@ authors = ["Yufei Pan <pan@zopyr.us>"]
 readme = "README.md"
 keywords = ["tsv", "key-value", "append-only", "log", "cli"]
 categories = ["command-line-utilities", "database", "parser-implementations"]
+# The implementation plans are working documents: they stay in the repository.
+exclude = ["docs/superpowers/plans/"]
 
 [features]
 default = ["cli", "bzip2", "xz", "zstd"]

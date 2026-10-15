@@ -35,3 +35,12 @@ jobs:
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:200
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:100 --handler
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:100 --scrub
+  msrv:
+    # rust-version in Cargo.toml: the oldest Rust the crate builds with.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: "1.85"
+      - run: cargo check --all-targets
