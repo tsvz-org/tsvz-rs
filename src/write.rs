@@ -301,12 +301,24 @@ impl Writer {
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
         // rotated away), the active part is looked up again. Only a store with no part yet is
         // created: a part's name is never made anew once it has gone.
+        let mut missing = None;
         for _ in 0..3 {
+            let dir = crate::store::dir_mtime(&self.store);
             let listed = parts::list(&self.store)?;
             let create = listed.is_empty();
             let part = match listed.into_iter().last() {
                 Some(part) => part,
-                None => parts::active(&self.store)?,
+                None => {
+                    let text = self
+                        .store
+                        .to_str()
+                        .ok_or_else(|| Error::BadPath(self.store.clone()))?;
+                    parts::Part {
+                        path: self.store.clone(),
+                        ordinal: None,
+                        codec: name::split_codec(text).1,
+                    }
+                }
             };
             let path = part.path.as_path();
             let io = |e: io::Error| Error::io(path, e);
@@ -341,12 +353,20 @@ impl Writer {
                 .read(part.codec.is_none());
             let file = match lock::Handle::open(path, &options) {
                 Ok(file) => file,
-                Err(e) if e.kind() == io::ErrorKind::NotFound && !create => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound && !create => {
+                    missing = Some(io(e)); // reported should it stay so
+                    continue;
+                }
                 Err(e) => return Err(io(e)),
             };
             let guard = lock::lock(&file, path).map_err(io)?;
-            let active = parts::active(&self.store).is_ok_and(|a| a.path == part.path);
+            // Still the active part: the directory is as it was listed, when its timestamp can
+            // tell; else it is listed again.
+            let same =
+                dir != 0 && !crate::store::racy(dir) && crate::store::dir_mtime(&self.store) == dir;
+            let active = same || parts::active(&self.store)?.path == part.path;
             if !active || !names(path, &file) {
+                missing = None;
                 continue;
             }
             let before = stamp(&file).map_err(io)?;
@@ -366,6 +386,9 @@ impl Writer {
                 after,
                 file,
             });
+        }
+        if let Some(e) = missing {
+            return Err(e);
         }
         Err(Error::Refused(format!(
             "{}: the active part kept changing while its lock was waited for; nothing was written",
@@ -798,6 +821,28 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("s.tsvz.2")).unwrap(),
             "c\t3\n"
+        );
+    }
+
+    #[test]
+    fn a_last_part_that_stays_missing_is_reported_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("s.tsvz.1"))
+            .unwrap();
+        let err = Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("b", &["2".into()])])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("s.tsvz.1") && !err.contains("kept changing"),
+            "{err}"
+        );
+        assert!(
+            !dir.path().join("nowhere").exists(),
+            "the link's target is not made"
         );
     }
 
