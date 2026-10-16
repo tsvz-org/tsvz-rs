@@ -232,7 +232,7 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   the writer thread counts batches that found their part not as the previous
   batch left it, and `submit` checks that the last part appended to is still as
   that batch left it and that the store has the same parts (by name; the
-  directory is listed only while its timestamp cannot show a change), each as
+  directory is listed every time: its timestamp proves nothing unchanged), each as
   the store last read it (a stat of every part: another long-running writer may
   append to an earlier part of its own, §17.7). Requests that waited for the
   engine share that check: one that began after a request arrived (another
@@ -537,9 +537,10 @@ pub struct Response { pub status: i32, pub lines: Vec<String>, pub diagnostics: 
 - Where the speed comes from: no interpreter start-up for a routed command; a
   refresh that only stats the parts when nothing changed; writes encoded once and
   appended in batches; responses written in one `write`.
-- If a workload misses the bar: profile it before release. Candidates: keeping
-  the active part open between batches, and skipping the directory listing when
-  its mtime is unchanged and not racy (already so in `refresh`).
+- If a workload misses the bar: profile it before release. Candidate: keeping
+  the active part open between batches. Not a candidate: skipping the directory
+  listing when its timestamp is unchanged, which many file systems (mergerfs,
+  network, coarse clocks) make unsafe.
 
 ## 12. Docs, CI and release
 

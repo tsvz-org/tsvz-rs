@@ -1179,13 +1179,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();
-        // A directory last changed long ago, whose timestamp shows a new part: the engine then
-        // trusts its own bookkeeping to tell whether another writer wrote.
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(dir.path())
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(long_ago))
-            .unwrap();
         let e = engine(dir.path(), "s.tsvz");
         let data = |k: &str| {
             [Record::Data {
@@ -1234,11 +1227,6 @@ mod tests {
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();
         fs::write(dir.path().join("s.tsvz.1"), "b\t2\n").unwrap();
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(dir.path())
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(long_ago))
-            .unwrap();
         let e = engine(dir.path(), "s.tsvz");
         let submit = |k: &str| {
             let mut st = lock(&e.state);
@@ -1270,11 +1258,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(dir.path())
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(long_ago))
-            .unwrap();
         let e = engine(dir.path(), "s.tsvz");
         let submit = |records: &[Record]| {
             let mut st = lock(&e.state);

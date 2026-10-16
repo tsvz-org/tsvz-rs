@@ -231,14 +231,10 @@ impl Sink for Table {
 
 /// How many bytes before the last part's read offset are kept to detect an in-place rewrite.
 pub(crate) const CHECK_BYTES: u64 = 4096;
-/// A directory modified this recently may change again within one timestamp tick.
-pub(crate) const RACY_NS: i128 = 2_000_000_000;
 
 /// What `refresh` (Task 16) needs to follow the files.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Follow {
-    pub dir_mtime: i128,
-    pub dir_racy: bool,
     pub stamps: Vec<Option<Stamp>>,
     /// Offset just after the last committed line of the last part (plain parts only).
     pub offset: u64,
@@ -261,23 +257,6 @@ pub enum Refreshed {
     Followed,
     /// Something else changed: the store was read again.
     Reloaded,
-}
-
-pub(crate) fn dir_mtime(store: &Path) -> i128 {
-    let dir = store
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::metadata(dir).map_or(0, |m| {
-        m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128
-    })
-}
-
-pub(crate) fn racy(mtime: i128) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i128);
-    now - mtime < RACY_NS
 }
 
 fn unsupported(part: &parts::Part) -> Error {
@@ -429,12 +408,7 @@ impl Store {
                 return Err(unsupported(part));
             }
         }
-        let dir = dir_mtime(&self.path);
-        self.follow = Follow {
-            dir_mtime: dir,
-            dir_racy: racy(dir),
-            ..Follow::default()
-        };
+        self.follow = Follow::default();
         let last = list.len() - 1;
         for (i, part) in list.iter().enumerate() {
             self.replay.begin_part(&part.path, i == 0);
@@ -655,23 +629,16 @@ impl Store {
     /// the directory is as the last check found it and old enough for its timestamp to show a
     /// change; else they are listed, and the directory's timestamp recorded when they are.
     pub(crate) fn same_parts(&mut self) -> Result<bool, Error> {
-        let dir = dir_mtime(&self.path);
-        if dir != self.follow.dir_mtime || self.follow.dir_racy {
-            let mut now = parts::list(&self.path)?;
-            if let Some(n) = self.limit {
-                now.truncate(n);
-            }
-            if now
-                .iter()
-                .map(|p| &p.path)
-                .ne(self.parts.iter().map(|p| &p.path))
-            {
-                return Ok(false);
-            }
-            self.follow.dir_mtime = dir;
-            self.follow.dir_racy = racy(dir);
+        // Listed every time: a directory's timestamp proves nothing unchanged (a union file
+        // system shows one branch's; coarse and network ones lag).
+        let mut now = parts::list(&self.path)?;
+        if let Some(n) = self.limit {
+            now.truncate(n);
         }
-        Ok(true)
+        Ok(now
+            .iter()
+            .map(|p| &p.path)
+            .eq(self.parts.iter().map(|p| &p.path)))
     }
 
     /// Whether the read met a checksum marker of a known algorithm (§15).
@@ -828,6 +795,27 @@ mod tests {
 
     fn v(cells: &[&str]) -> Vec<String> {
         cells.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn a_new_part_is_seen_though_the_directory_timestamp_says_nothing_changed() {
+        // A union file system (mergerfs) may create a file on a branch whose directory's
+        // timestamp is not the one shown: an unchanged timestamp proves nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let set_old = || {
+            fs::File::open(dir.path())
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(long_ago))
+                .unwrap();
+        };
+        set_old();
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        set_old();
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 2, "the new part was read");
     }
 
     #[test]
