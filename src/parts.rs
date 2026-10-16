@@ -39,6 +39,8 @@ impl Stamp {
 /// directory gives no parts; a store path that is a directory, or a directory that cannot be
 /// listed, is an error.
 pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
+    #[cfg(test)]
+    LISTINGS.with(|n| n.set(n.get() + 1));
     let text = store
         .to_str()
         .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
@@ -126,80 +128,92 @@ pub fn active(store: &Path) -> Result<Part, Error> {
     }
 }
 
-/// The directory a store's parts are in.
-fn dir_of(store: &Path) -> &Path {
+/// The directory a store's parts are in, as [`list`] reads it.
+pub(crate) fn dir_of(store: &Path) -> &Path {
     store
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
 }
 
-/// The timestamp of the directory of `store`, in nanoseconds; 0 when it cannot be read.
-pub(crate) fn dir_mtime(store: &Path) -> i128 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(dir_of(store)).map_or(0, |m| {
-        m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128
-    })
+/// A directory timestamp this recent may yet change again within the same tick.
+const RACY_NS: i128 = 2_000_000_000;
+
+/// What identifies the directory of a store's parts between a listing and a later check: its
+/// device and inode (another file system mounted there changes them) and its timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime: i128,
 }
 
-/// Whether a directory timestamp is too recent to tell a change made within the same tick.
-pub(crate) fn racy(mtime: i128) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i128);
-    now - mtime < 2_000_000_000
+impl DirStamp {
+    /// The directory of `store` as it is now; None when it cannot be read.
+    pub(crate) fn of(store: &Path) -> Option<DirStamp> {
+        let meta = std::fs::metadata(dir_of(store)).ok()?;
+        Some(DirStamp {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: Stamp::of(&meta).mtime,
+        })
+    }
+
+    /// Whether its timestamp is too recent to tell a change made within the same tick.
+    pub(crate) fn racy(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as i128);
+        now - self.mtime < RACY_NS
+    }
 }
 
 /// Whether the file system holding the directory of `store` keeps the directory's timestamp:
-/// a local kernel one, which sets it at every name made, renamed or removed in it (POSIX).
-/// Never FUSE (mergerfs shows one branch's directory), network or overlay file systems, nor
-/// one this does not know: there the directory is listed every time.
-pub fn store_dir_times_trusted(store: &Path) -> bool {
-    dir_times_trusted(dir_of(store))
+/// a local kernel one (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs; APFS), which sets it at every
+/// name made, renamed or removed in it (POSIX). Never FUSE (mergerfs shows one branch's
+/// directory), network or overlay file systems, nor one this does not know; nor HFS+, whose
+/// whole seconds let a clock stepped back repeat a timestamp. There the directory is listed.
+pub(crate) fn keeps_dir_times(store: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir_of(store).as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    kept(&fs)
 }
 
-/// [`store_dir_times_trusted`] for the directory `dir` itself.
 #[cfg(target_os = "linux")]
-pub fn dir_times_trusted(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
-        return false;
-    }
-    const EXT: i64 = 0xEF53;
-    const XFS: i64 = 0x5846_5342;
-    const BTRFS: i64 = 0x9123_683E;
-    const ZFS: i64 = 0x2FC1_2FC1;
-    const F2FS: i64 = 0xF2F5_2010;
-    const TMPFS: i64 = 0x0102_1994;
-    matches!(fs.f_type as i64, EXT | XFS | BTRFS | ZFS | F2FS | TMPFS)
+fn kept(fs: &libc::statfs) -> bool {
+    const EXT: u32 = 0xEF53;
+    const XFS: u32 = 0x5846_5342;
+    const BTRFS: u32 = 0x9123_683E;
+    const ZFS: u32 = 0x2FC1_2FC1;
+    const F2FS: u32 = 0xF2F5_2010;
+    const TMPFS: u32 = 0x0102_1994;
+    // As 32 bits: the field is narrower, and signed, on some 32-bit systems.
+    matches!(fs.f_type as u32, EXT | XFS | BTRFS | ZFS | F2FS | TMPFS)
 }
 
-/// [`store_dir_times_trusted`] for the directory `dir` itself.
 #[cfg(target_vendor = "apple")]
-pub fn dir_times_trusted(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
-        return false;
-    }
+fn kept(fs: &libc::statfs) -> bool {
     // SAFETY: f_fstypename is a NUL-terminated name within its array.
     let name = unsafe { std::ffi::CStr::from_ptr(fs.f_fstypename.as_ptr()) };
-    matches!(name.to_bytes(), b"apfs" | b"hfs")
+    name.to_bytes() == b"apfs"
 }
 
-/// [`store_dir_times_trusted`] for the directory `dir` itself.
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-pub fn dir_times_trusted(_dir: &Path) -> bool {
+fn kept(_fs: &libc::statfs) -> bool {
     false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread listed a store's parts: for tests.
+    pub(crate) static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The unnumbered part 0 of `store`, the store's own path (§17.1).

@@ -235,9 +235,10 @@ pub(crate) const CHECK_BYTES: u64 = 4096;
 /// What `refresh` (Task 16) needs to follow the files.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Follow {
-    /// The directory's timestamp when the parts were last listed, and whether it was too
-    /// recent to tell a change within the same tick (used only where it is trusted).
-    pub dir_mtime: i128,
+    /// The directory as it was just before the parts were last listed, where its timestamp is
+    /// kept ([`Store::dir_trusted`]), and whether that timestamp was too recent to tell a
+    /// change within the same tick.
+    pub dir: Option<parts::DirStamp>,
     pub dir_racy: bool,
     pub stamps: Vec<Option<Stamp>>,
     /// Offset just after the last committed line of the last part (plain parts only).
@@ -300,7 +301,7 @@ pub struct Store {
     /// file, so none waits to be closed while this process holds a classic lock on it
     /// ([`Handle`]).
     last: Option<Handle>,
-    /// Its directory's timestamp shows every change of its names ([`parts::dir_times_trusted`]).
+    /// Its directory's timestamp shows every change of its names ([`parts::keeps_dir_times`]).
     pub(crate) dir_trusted: bool,
 }
 
@@ -371,7 +372,7 @@ impl Store {
 
     fn open_once(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
         let path = path.to_path_buf();
-        let dir_trusted = parts::store_dir_times_trusted(&path);
+        let dir_trusted = parts::keeps_dir_times(&path);
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
             if !name::usable_delimiter(d) {
@@ -401,6 +402,11 @@ impl Store {
     }
 
     fn load(&mut self) -> Result<(), Error> {
+        // Sampled before the listing, so that a name made meanwhile shows as a change.
+        let dir = self
+            .dir_trusted
+            .then(|| parts::DirStamp::of(&self.path))
+            .flatten();
         let mut list = parts::list(&self.path)?;
         if let Some(n) = self.limit {
             list.truncate(n);
@@ -416,10 +422,9 @@ impl Store {
                 return Err(unsupported(part));
             }
         }
-        let dir = parts::dir_mtime(&self.path);
         self.follow = Follow {
-            dir_mtime: dir,
-            dir_racy: parts::racy(dir),
+            dir,
+            dir_racy: dir.is_none_or(|d| d.racy()),
             ..Follow::default()
         };
         let last = list.len() - 1;
@@ -642,26 +647,36 @@ impl Store {
     /// the directory is as the last check found it and old enough for its timestamp to show a
     /// change; else they are listed, and the directory's timestamp recorded when they are.
     pub(crate) fn same_parts(&mut self) -> Result<bool, Error> {
-        // Its timestamp is trusted only on a local kernel file system, which sets it at every
-        // name made, renamed or removed, and only when it was not too recent; elsewhere (a
-        // union file system shows one branch's; network ones lag) the directory is listed.
-        let dir = parts::dir_mtime(&self.path);
-        if self.dir_trusted && dir != 0 && dir == self.follow.dir_mtime && !self.follow.dir_racy {
+        // Where the directory's timestamp is kept (parts::keeps_dir_times), the same device,
+        // inode and timestamp, not too recent when last listed, mean the same names; elsewhere
+        // (a union file system shows one branch's; network ones lag) it is listed.
+        let now = if self.dir_trusted {
+            parts::DirStamp::of(&self.path)
+        } else {
+            None
+        };
+        if now.is_some() && now == self.follow.dir && !self.follow.dir_racy {
             return Ok(true);
         }
-        let mut now = parts::list(&self.path)?;
+        let mut listed = parts::list(&self.path)?;
         if let Some(n) = self.limit {
-            now.truncate(n);
+            listed.truncate(n);
         }
-        if now
+        if listed
             .iter()
             .map(|p| &p.path)
             .ne(self.parts.iter().map(|p| &p.path))
         {
             return Ok(false);
         }
-        self.follow.dir_mtime = dir;
-        self.follow.dir_racy = parts::racy(dir);
+        // Another file system mounted there: ask it again.
+        if let (Some(now), Some(before)) = (now, self.follow.dir) {
+            if (now.dev, now.ino) != (before.dev, before.ino) {
+                self.dir_trusted = parts::keeps_dir_times(&self.path);
+            }
+        }
+        self.follow.dir = now.filter(|_| self.dir_trusted);
+        self.follow.dir_racy = self.follow.dir.is_none_or(|d| d.racy());
         Ok(true)
     }
 
@@ -844,15 +859,30 @@ mod tests {
     }
 
     #[test]
-    fn a_local_file_system_keeps_directory_timestamps() {
-        // The tests run on a local kernel file system (tmpfs, ext4, APFS): there a directory's
-        // timestamp follows every new, renamed and removed name.
+    fn a_kept_directory_timestamp_spares_the_listing_until_a_name_changes() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(parts::dir_times_trusted(dir.path()));
-        assert!(!parts::dir_times_trusted(&dir.path().join("nowhere")));
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        assert!(!parts::keeps_dir_times(Path::new("/nowhere/at/all/s.tsvz")));
+        if !parts::keeps_dir_times(&p) {
+            eprintln!("skipped: the temporary directory is not on a local kernel file system");
+            return;
+        }
+        // A directory last changed long ago: its timestamp is trusted as it is.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(dir.path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
         let mut store = Store::open(&p, Options::default()).unwrap();
-        assert!(store.dir_trusted);
+        let listings = || parts::LISTINGS.with(|n| n.get());
+        let before = listings();
+        assert_eq!(store.refresh().unwrap(), Refreshed::Unchanged);
+        assert_eq!(
+            listings(),
+            before,
+            "nothing changed: the directory is not listed"
+        );
+        // A new name moves the timestamp: the directory is listed, the new part read.
         write(dir.path(), "s.tsvz.1", b"b\t2\n");
         store.refresh().unwrap();
         assert_eq!(store.len(), 2);
