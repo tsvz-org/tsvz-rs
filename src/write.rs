@@ -370,7 +370,8 @@ impl Writer {
             };
             let guard = lock::lock(&file, path).map_err(io)?;
             // Still the active part: the directory kept its timestamp, and shows no name made,
-            // renamed or removed since the listing (parts::DirTrust); else listed again.
+            // renamed or removed since the listing (parts::DirTrust), in which part 0 was no
+            // symbolic link (its target is elsewhere); else listed again.
             let unchanged = !linked && dir.is_some() && parts::DirStamp::of(&self.store) == dir;
             let active = unchanged || parts::active(&self.store)?.path == part.path;
             if !active || !names(path, &file) {

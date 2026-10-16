@@ -236,7 +236,8 @@ pub(crate) const CHECK_BYTES: u64 = 4096;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Follow {
     /// The directory as it was just before the parts were last listed, where its timestamp is
-    /// kept and was old enough to show a change ([`parts::DirTrust`]).
+    /// kept and was old enough to show a change ([`parts::DirTrust`]), and part 0 was no symbolic
+    /// link in that listing ([`parts::list_linked`]); else None, and the next check lists.
     pub dir: Option<parts::DirStamp>,
     pub stamps: Vec<Option<Stamp>>,
     /// Offset just after the last committed line of the last part (plain parts only).
@@ -664,7 +665,8 @@ impl Store {
 
     /// Whether the store still has the parts it read, by name: known without listing them while
     /// the directory is as the last check found it and old enough for its timestamp to show a
-    /// change; else they are listed, and the directory's timestamp recorded when they are.
+    /// change; else they are listed, and the directory's timestamp recorded when they are,
+    /// unless part 0 was a symbolic link in that listing.
     pub(crate) fn same_parts(&mut self) -> Result<bool, Error> {
         // Where the directory's timestamp is kept (parts::DirTrust), the same device, inode and
         // timestamp, not too recent when last listed, mean the same names; elsewhere (a union

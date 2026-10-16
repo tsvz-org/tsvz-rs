@@ -44,7 +44,8 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
 
 /// [`list`], and whether part 0 was looked up through a symbolic link (or could not be looked
 /// at): then the listing depends on the link's target, which the directory's timestamp does
-/// not follow, and that timestamp vouches for nothing ([`DirTrust`]).
+/// not follow, and that timestamp vouches for nothing ([`DirTrust`]). Always false for a loose
+/// file, whose directory is never listed nor vouched for (§20.2.4).
 pub(crate) fn list_linked(store: &Path) -> Result<(Vec<Part>, bool), Error> {
     #[cfg(test)]
     LISTINGS.with(|n| n.set(n.get() + 1));
