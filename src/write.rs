@@ -845,6 +845,43 @@ mod tests {
     }
 
     #[test]
+    fn a_write_lists_the_parts_again_after_the_lock_where_the_directory_is_not_kept() {
+        // On mergerfs, NFS, SMB, … an old, unchanged timestamp proves nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let one = dir.path().join("s.tsvz.1");
+        fs::write(&one, "b\t2\n").unwrap();
+        if !kept_and_dated_back(dir.path(), &p) {
+            return;
+        }
+        let before = listings();
+        Writer::open(&p)
+            .unwrap()
+            .dirs(parts::DirTrust::not_kept())
+            .append(&[Record::from_args("c", &["3".into()])])
+            .unwrap();
+        assert_eq!(listings() - before, 2);
+    }
+
+    #[test]
+    fn a_loose_store_s_writer_does_not_look_at_its_directory() {
+        // A loose file is one file (§20.2.4): its directory is never listed, so its timestamp
+        // would tell nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\n").unwrap();
+        let looks = || parts::STATS.with(|n| n.get()) + parts::ASKED.with(|n| n.get());
+        let before = looks();
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("b", &["2".into()])])
+            .unwrap();
+        assert_eq!(looks() - before, 0);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\nb\t2\n");
+    }
+
+    #[test]
     fn a_write_lists_the_parts_again_after_the_lock_where_the_directory_changed_just_now() {
         // A timestamp this recent may not show a name made within the same tick.
         let dir = tempfile::tempdir().unwrap();

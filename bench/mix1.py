@@ -4,12 +4,15 @@
 Each repetition copies FIXTURE into a fresh directory under WORK, starts `TSVZ serve` on the
 copy, optionally sends tsvzbench's get, set and --sync set series first (--prelude), then times
 the 5000 mix requests. tsvzbench's mix starts about 1 s after the handler wrote its pointer file
-into that directory: too recent for its timestamp to be trusted (2 s). --date-back dates the
-directory a minute back once the handler answers, as for a store nothing changed in for a while,
-without the idle CPU a --delay leaves before the timed requests. The implementations take turns, in reverse order every other repetition.
+into that directory: too recent for its timestamp to be trusted (2 s). --warm S sends `len`
+requests for S seconds first, so that the directory ages (S > 2: a store nothing changed in for
+a while) while the handler and the CPU stay busy, without the idle CPU a --delay leaves before
+the timed requests. (Dating the directory back instead would not do: a handler that saw its
+timestamp too recent does not look at it again until it may be old enough.) The implementations
+take turns, in reverse order every other repetition.
 Pin it to one CCD for steady numbers: `taskset -c 2-7 python3 bench/mix1.py ...`.
 
-    python3 bench/mix1.py --fixture F --work-dir W [--reps N] [--delay S] [--date-back] [--prelude] NAME=TSVZ...
+    python3 bench/mix1.py --fixture F --work-dir W [--reps N] [--delay S] [--warm S] [--prelude] NAME=TSVZ...
 
 FIXTURE is the 100k-row plain fixture tsvzbench generates (`fixtures/plain-100000-s1-g1/plain.tsvz`
 in its work directory). Uses tsvzbench's request and client helpers (--tsvzbench, default
@@ -61,35 +64,49 @@ def once(tb, args, tsvz, name, before, payloads):
     shutil.copy2(args.fixture, store)
     with open(os.path.join(run, 'serve.err'), 'wb') as err:
         child = subprocess.Popen([tsvz, '-q', 'serve', store], stdout=subprocess.DEVNULL, stderr=err)
+    stopped = False
     try:
         deadline = time.monotonic() + 30
         while True:
             pointer = tb.read_pointer(store)
             if pointer:
+                probe = None
                 try:
                     probe = tb.Client(pointer[0])
                     probe.roundtrip(b'len\n')
-                    probe.close()
                     break
                 except OSError:
                     pass
+                finally:
+                    if probe is not None:
+                        probe.close()
             if time.monotonic() > deadline:
                 sys.exit('%s: no handler answered' % name)
             time.sleep(0.005)
         time.sleep(args.delay)
-        if args.date_back:
-            long_ago = time.time() - 60
-            os.utime(run, (long_ago, long_ago))
         client = tb.Client(pointer[0])
-        tb.client_loop(client, before)
+        until = time.monotonic() + args.warm
+        while time.monotonic() < until:
+            client.roundtrip(b'len\n')
+        _, responses, _, _ = tb.client_loop(client, before)
+        problem = tb.check_responses(responses, [None] * len(responses))
+        if problem:
+            sys.exit('%s: the prelude: %s' % (name, problem))
         latencies, responses, _, _ = tb.client_loop(client, payloads)
         problem = tb.check_responses(responses, [None] * len(responses))
         client.roundtrip(b'stop\n')
+        stopped = True
         client.close()
         if problem:
             sys.exit('%s: %s' % (name, problem))
     finally:
-        child.wait(10)
+        if not stopped:
+            child.kill()  # an early exit: the handler would hold the store and a CPU
+        try:
+            child.wait(10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
     median = lambda xs: statistics.median(xs) * 1e6
     return median(latencies), median(latencies[0::2]), median(latencies[1::2])
 
@@ -100,7 +117,8 @@ def main():
     parser.add_argument('--work-dir', required=True)
     parser.add_argument('--reps', type=int, default=8)
     parser.add_argument('--delay', type=float, default=0.0, help='seconds between load and requests')
-    parser.add_argument('--date-back', action='store_true', help='date the directory a minute back')
+    parser.add_argument('--warm', type=float, default=0.0,
+                        help='seconds of len requests before the timed ones, the directory ageing meanwhile')
     parser.add_argument('--prelude', action='store_true', help="send tsvzbench's earlier series first")
     parser.add_argument('--tsvzbench', default=os.path.join(HERE, '..', '..', 'TSVZ', 'tsvzbench.py'))
     parser.add_argument('impls', nargs='+', metavar='NAME=TSVZ')
@@ -109,6 +127,10 @@ def main():
     import tsvzbench as tb
 
     impls = [spec.split('=', 1) for spec in args.impls]
+    for spec, impl in zip(args.impls, impls):
+        # NAME is a directory under --work-dir, removed before each repetition.
+        if len(impl) != 2 or not impl[0] or os.sep in impl[0] or impl[0] in ('.', '..'):
+            parser.error('%r: expected NAME=TSVZ, NAME a plain file name' % spec)
     before = prelude(tb) if args.prelude else []
     payloads = mix(tb)
     results = {name: [] for name, _ in impls}

@@ -93,38 +93,49 @@ A build of 0.1.2 without the second listing (not safe: measurement only) answers
 11.3 µs with a fresh directory and 11.6 µs with one older than 2 s, against 13.3 and 14.1 µs
 for 0.1.2 and 11.3 and 11.5 µs for 1c8c2aa: that listing is the whole difference.
 
-### The fix (after 0.1.2)
+### The fix (0.1.3)
 
 The writer now samples the store's directory just before its listing and, once it holds the
 lock, lists the parts again only where that sample cannot vouch for the listing. Where the
-directory keeps its timestamp (`parts::keeps_dir_times`: a local kernel file system), the same
-device, inode and timestamp, at least 2 s old when sampled, mean the same names, as the store's
-own checks already took them in 0.1.2; elsewhere (mergerfs, network) the parts are listed
-again, as before. The handler's writer thread asks the file system once (`parts::DirTrust`),
-not at every batch, and again only when another directory is at the path; and a timestamp seen
-too recent is not looked at again before it may be old enough, so a fresh directory costs no
-stat either.
+directory keeps its timestamp (`parts::DirTrust`: a local kernel file system, asked through the
+open directory, so that the answer and the timestamp are of one file system), the same device,
+inode and timestamp, in finer steps than whole seconds and at least 2 s old when sampled, mean
+the same names, as the store's own checks take them; elsewhere (mergerfs, network) the parts
+are listed again, as before. The store's checks and the writer share that one rule. The
+handler's writer thread asks the file system once, not at every batch: where it keeps the
+timestamp, again when another directory is at the path; where it does not, not again. A
+timestamp seen too recent is not looked at again before it may be old enough, by the writer or
+the store, so a fresh directory costs no stat either. A loose file's directory is never looked
+at.
 
-`--date-back` dates the directory a minute back once the handler answers: the state of a store
-nothing changed in for 2 s. Without it the directory is as tsvzbench leaves it, about 1 s after
-the handler wrote its pointer file there. The `get` after a `set`, p50, 12 pinned repetitions:
+`--warm 2.5` keeps the handler busy with `len` requests for 2.5 s before the timed ones, so
+that the directory is as in a store nothing changed in for 2 s. Without it the directory is as
+tsvzbench leaves it, about 1 s after the handler wrote its pointer file there. p50 of all the
+mix requests, and of the `get` after each `set`, 12 pinned repetitions in one run per row
+(2026-10-16):
 
-| Directory | v0.1.0 | 1c8c2aa | v0.1.2 | fix |
+| Directory | v0.1.0 | 1c8c2aa | v0.1.2 | 0.1.3 |
 |---|---|---|---|---|
-| Unchanged for a while (`--date-back`) | 9.8 µs | 9.1 µs | 11.0 µs | **9.7 µs** |
-| Changed within 2 s (as tsvzbench runs it) | 12.0 µs | 11.2 µs | 13.2 µs | 13.3 µs |
+| Unchanged for 2 s (`--warm 2.5`) | 9.7 µs, get 11.4 | 9.1, get 9.8 | 10.7, get 11.6 | **9.4, get 10.2** |
+| Changed within 2 s (as tsvzbench runs it) | 12.4 µs, get 14.9 | 11.7, get 13.9 | 13.5, get 15.9 | 13.3, get 15.6 |
 
 A handler serving a store whose parts have not changed for 2 s writes with one listing a batch
-again, as 0.1.0 did. tsvzbench's `socket mix ×1` row stays where 0.1.2 has it: there the
-directory is too new for its timestamp to show every change, so the parts are listed again, as
-they must be.
+again. tsvzbench's `socket mix ×1` row stays about where 0.1.2 has it: there the directory is
+too new for its timestamp to show every change, so the parts are listed again, as they must be.
+
+Dating the directory back (`os.utime`) instead of waiting does not show 0.1.3's steady state: a
+handler that saw the timestamp too recent does not look at it again for up to 2 s, so the 50 ms
+of timed requests list the parts at every check. A `--delay` instead of `--warm` leaves the CPU
+idle before the timed requests, which slows every build alike (about 11 µs for each).
 
 ```bash
-taskset -c 2-7 python3 bench/mix1.py --fixture $B/work/fixtures/plain-100000-s1-g1/plain.tsvz \
-  --work-dir $B/mix --date-back v0.1.0=$B/tsvz-0.1.0 v0.1.2=$B/tsvz-0.1.2 fix=target/release/tsvz
+taskset -c 2-7 python3 bench/mix1.py --fixture $B/fixtures/plain-100000-s1-g1/plain.tsvz \
+  --work-dir $B/mix --reps 12 --warm 2.5 v0.1.0=$B/tsvz-v0.1.0 1c8c2aa=$B/tsvz-1c8c2aa \
+  v0.1.2=$B/tsvz-v0.1.2 0.1.3=target/release/tsvz
 ```
 
-To build each commit for such a comparison from `git archive`, touch the extracted files: the
+The fixture is tsvzbench's (`tsvzbench.Fixtures(B + '/fixtures', 1).get('plain', 100000)`). To
+build each commit for such a comparison from `git archive`, touch the extracted files: the
 archive keeps commit times, and cargo skips a rebuild it believes is fresh.
 
 ## Run to run on this machine

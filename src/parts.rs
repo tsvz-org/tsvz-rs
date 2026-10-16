@@ -174,31 +174,62 @@ fn now_ns() -> i128 {
         .map_or(0, |d| d.as_nanos() as i128)
 }
 
-/// Whether the directory of a store keeps its timestamp ([`keeps_dir_times`]), asked once per
-/// directory (device and inode), so that another file system mounted there is asked again.
-/// Where it does not, the directory is not even stat'ed again.
+/// Whether the directory of a store's parts keeps a timestamp that shows every change of its
+/// names, and that timestamp. Its file system is asked once per directory (device and inode),
+/// from the directory as it was opened, so that the answer and the timestamp are of one file
+/// system; another directory found at the path (another file system mounted there) is asked
+/// again. Where the timestamp is not kept, the directory is not looked at again: the answer
+/// stands for the life of this value. A loose file's directory is never looked at: it is never
+/// listed (§20.2.4).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DirTrust {
-    asked: Option<(u64, u64)>,
-    kept: bool,
+    kept: Kept,
     /// Until when (ns since the epoch) the timestamp last seen too recent must still be so,
     /// changed since or not: the directory is not stat'ed before then.
     racy_until: i128,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Kept {
+    #[default]
+    Unasked,
+    No,
+    Yes {
+        dev: u64,
+        ino: u64,
+    },
+}
+
 impl DirTrust {
-    /// The directory of `store` as it is now, where its timestamp is kept and old enough to
-    /// show any change from now on; else None.
+    /// A directory found not to keep its timestamp, as on mergerfs: for tests.
+    #[cfg(test)]
+    pub(crate) fn not_kept() -> DirTrust {
+        DirTrust {
+            kept: Kept::No,
+            racy_until: 0,
+        }
+    }
+
+    /// The directory of `store` as it is now, where its timestamp is kept, in finer steps than
+    /// whole seconds, and old enough to show any change from now on; else None.
     pub(crate) fn stamp(&mut self, store: &Path) -> Option<DirStamp> {
-        if (self.asked.is_some() && !self.kept) || now_ns() < self.racy_until {
+        if self.kept == Kept::No || now_ns() < self.racy_until {
             return None;
         }
-        let now = DirStamp::of(store)?;
-        if self.asked != Some((now.dev, now.ino)) {
-            self.asked = Some((now.dev, now.ino));
-            self.kept = keeps_dir_times(store);
-        }
-        if !self.kept {
+        let now = match self.kept {
+            Kept::Yes { dev, ino } => match DirStamp::of(store)? {
+                now if (now.dev, now.ino) == (dev, ino) => now,
+                _ => self.ask(store)?,
+            },
+            _ if name::format_of(store).is_some_and(|f| !f.strict) => {
+                self.kept = Kept::No;
+                return None;
+            }
+            _ => self.ask(store)?,
+        };
+        // Whole seconds (ext2, ext4 with 128-byte inodes, a time set so): a clock stepped back
+        // could give a later change the very timestamp of an earlier one.
+        if now.mtime % 1_000_000_000 == 0 {
             return None;
         }
         if now.racy() {
@@ -207,26 +238,58 @@ impl DirTrust {
         }
         Some(now)
     }
+
+    /// Ask the directory of `store` ([`ask`]) and record the answer; None when it is not kept,
+    /// or the directory could not be opened (it is asked again next time).
+    fn ask(&mut self, store: &Path) -> Option<DirStamp> {
+        match ask(store) {
+            Ok(Some(now)) => {
+                self.kept = Kept::Yes {
+                    dev: now.dev,
+                    ino: now.ino,
+                };
+                Some(now)
+            }
+            Ok(None) => {
+                self.kept = Kept::No;
+                None
+            }
+            Err(_) => None,
+        }
+    }
 }
 
-/// Whether the file system holding the directory of `store` keeps the directory's timestamp:
-/// a local kernel one (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs; APFS), which sets it at every
-/// name made, renamed or removed in it (POSIX). Never FUSE (mergerfs shows one branch's
-/// directory), network or overlay file systems, nor one this does not know; nor HFS+, whose
-/// whole seconds let a clock stepped back repeat a timestamp. There the directory is listed.
-pub(crate) fn keeps_dir_times(store: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
+/// Whether the file system holding the directory of `store` keeps the directory's timestamp,
+/// and if so the directory as it is now, both from one open directory. Kept on a local kernel
+/// file system (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs; APFS), which sets it at every name made,
+/// renamed or removed in it (POSIX). Never FUSE (mergerfs shows one branch's directory),
+/// network or overlay file systems, nor one this does not know; nor HFS+, whose whole seconds
+/// let a clock stepped back repeat a timestamp. There the directory is listed. An error when
+/// the directory cannot be opened.
+fn ask(store: &Path) -> std::io::Result<Option<DirStamp>> {
+    use std::os::fd::AsRawFd;
     #[cfg(test)]
     ASKED.with(|n| n.set(n.get() + 1));
-    let Ok(c) = std::ffi::CString::new(dir_of(store).as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
+    let dir = std::fs::File::open(dir_of(store))?;
+    // SAFETY: fstatfs reads the open descriptor and writes the struct it is given.
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
-        return false;
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut fs) } != 0 || !kept(&fs) {
+        return Ok(None);
     }
-    kept(&fs)
+    #[cfg(test)]
+    STATS.with(|n| n.set(n.get() + 1));
+    let meta = dir.metadata()?;
+    Ok(Some(DirStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime: Stamp::of(&meta).mtime,
+    }))
+}
+
+/// Whether the directory of `store` keeps its timestamp ([`ask`]): for tests.
+#[cfg(test)]
+pub(crate) fn keeps_dir_times(store: &Path) -> bool {
+    matches!(ask(store), Ok(Some(_)))
 }
 
 #[cfg(target_os = "linux")]
@@ -258,9 +321,9 @@ thread_local! {
     /// How many times this thread listed a store's parts: for tests.
     pub(crate) static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many times this thread asked whether a directory keeps its timestamp: for tests.
-    static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many times this thread stat'ed a store's directory: for tests.
-    static STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The unnumbered part 0 of `store`, the store's own path (§17.1).
@@ -598,6 +661,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn a_directory_that_does_not_keep_its_timestamp_is_asked_once_too() {
+        // procfs, like mergerfs, is no file system whose directory timestamps are trusted.
+        let p = Path::new("/proc/self/s.tsvz");
+        let mut trust = DirTrust::default();
+        let before = asked();
+        for _ in 0..3 {
+            assert_eq!(trust.stamp(p), None);
+        }
+        assert_eq!(asked() - before, 1);
+    }
+
+    #[test]
     fn another_directory_at_the_path_is_asked_again() {
         // As when another file system is mounted there: a mergerfs pool over a former ext4
         // directory must not inherit its answer.
@@ -655,15 +731,51 @@ mod tests {
             eprintln!("skipped: the temporary directory is not on a local kernel file system");
             return;
         }
+        // Too recent for 0.8 s more: time enough for the first look on a loaded machine.
+        date_back(dir.path(), std::time::Duration::from_millis(1200));
+        if DirStamp::of(&p).unwrap().mtime % 1_000_000_000 == 0 {
+            eprintln!("skipped: the temporary directory keeps whole seconds only");
+            return;
+        }
         let mut trust = DirTrust::default();
-        // Too recent for 0.1 s more.
-        date_back(dir.path(), std::time::Duration::from_millis(1900));
         assert_eq!(trust.stamp(&p), None);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(900));
         date_back(dir.path(), std::time::Duration::from_secs(60));
         assert!(
             trust.stamp(&p).is_some(),
             "stat'ed again, and old enough now"
         );
+    }
+
+    #[test]
+    fn a_timestamp_in_whole_seconds_is_not_trusted() {
+        // ext2, or ext4 with 128-byte inodes, keeps whole seconds: a clock stepped back may
+        // give a later change the very timestamp of an earlier one.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        if !keeps_dir_times(&p) {
+            eprintln!("skipped: the temporary directory is not on a local kernel file system");
+            return;
+        }
+        date_back(dir.path(), std::time::Duration::from_secs(60));
+        if DirStamp::of(&p).unwrap().mtime % 1_000_000_000 == 0 {
+            eprintln!("skipped: the temporary directory keeps whole seconds only");
+            return;
+        }
+        assert!(DirTrust::default().stamp(&p).is_some(), "in nanoseconds");
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        fs::File::open(dir.path())
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+            )
+            .unwrap();
+        assert_eq!(DirTrust::default().stamp(&p), None, "in whole seconds");
     }
 }

@@ -236,10 +236,8 @@ pub(crate) const CHECK_BYTES: u64 = 4096;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Follow {
     /// The directory as it was just before the parts were last listed, where its timestamp is
-    /// kept ([`Store::dir_trusted`]), and whether that timestamp was too recent to tell a
-    /// change within the same tick.
+    /// kept and was old enough to show a change ([`parts::DirTrust`]).
     pub dir: Option<parts::DirStamp>,
-    pub dir_racy: bool,
     pub stamps: Vec<Option<Stamp>>,
     /// Offset just after the last committed line of the last part (plain parts only).
     pub offset: u64,
@@ -301,8 +299,8 @@ pub struct Store {
     /// file, so none waits to be closed while this process holds a classic lock on it
     /// ([`Handle`]).
     last: Option<Handle>,
-    /// Its directory's timestamp shows every change of its names ([`parts::keeps_dir_times`]).
-    pub(crate) dir_trusted: bool,
+    /// Whether its directory's timestamp shows every change of its names.
+    pub(crate) dirs: parts::DirTrust,
 }
 
 impl Store {
@@ -372,7 +370,6 @@ impl Store {
 
     fn open_once(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
         let path = path.to_path_buf();
-        let dir_trusted = parts::keeps_dir_times(&path);
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
             if !name::usable_delimiter(d) {
@@ -395,7 +392,7 @@ impl Store {
             follow: Follow::default(),
             torn: false,
             last: None,
-            dir_trusted,
+            dirs: parts::DirTrust::default(),
         };
         store.load()?;
         Ok(store)
@@ -403,10 +400,7 @@ impl Store {
 
     fn load(&mut self) -> Result<(), Error> {
         // Sampled before the listing, so that a name made meanwhile shows as a change.
-        let dir = self
-            .dir_trusted
-            .then(|| parts::DirStamp::of(&self.path))
-            .flatten();
+        let dir = self.dirs.stamp(&self.path);
         let mut list = parts::list(&self.path)?;
         if let Some(n) = self.limit {
             list.truncate(n);
@@ -424,7 +418,6 @@ impl Store {
         }
         self.follow = Follow {
             dir,
-            dir_racy: dir.is_none_or(|d| d.racy()),
             ..Follow::default()
         };
         let last = list.len() - 1;
@@ -647,15 +640,11 @@ impl Store {
     /// the directory is as the last check found it and old enough for its timestamp to show a
     /// change; else they are listed, and the directory's timestamp recorded when they are.
     pub(crate) fn same_parts(&mut self) -> Result<bool, Error> {
-        // Where the directory's timestamp is kept (parts::keeps_dir_times), the same device,
-        // inode and timestamp, not too recent when last listed, mean the same names; elsewhere
-        // (a union file system shows one branch's; network ones lag) it is listed.
-        let now = if self.dir_trusted {
-            parts::DirStamp::of(&self.path)
-        } else {
-            None
-        };
-        if now.is_some() && now == self.follow.dir && !self.follow.dir_racy {
+        // Where the directory's timestamp is kept (parts::DirTrust), the same device, inode and
+        // timestamp, not too recent when last listed, mean the same names; elsewhere (a union
+        // file system shows one branch's; network ones lag) it is listed.
+        let now = self.dirs.stamp(&self.path);
+        if now.is_some() && now == self.follow.dir {
             return Ok(true);
         }
         let mut listed = parts::list(&self.path)?;
@@ -669,14 +658,7 @@ impl Store {
         {
             return Ok(false);
         }
-        // Another file system mounted there: ask it again.
-        if let (Some(now), Some(before)) = (now, self.follow.dir) {
-            if (now.dev, now.ino) != (before.dev, before.ino) {
-                self.dir_trusted = parts::keeps_dir_times(&self.path);
-            }
-        }
-        self.follow.dir = now.filter(|_| self.dir_trusted);
-        self.follow.dir_racy = self.follow.dir.is_none_or(|d| d.racy());
+        self.follow.dir = now;
         Ok(true)
     }
 
@@ -851,7 +833,7 @@ mod tests {
         };
         set_old();
         let mut store = Store::open(&p, Options::default()).unwrap();
-        store.dir_trusted = false; // as on mergerfs, NFS, SMB, …
+        store.dirs = parts::DirTrust::not_kept(); // as on mergerfs, NFS, SMB, …
         write(dir.path(), "s.tsvz.1", b"b\t2\n");
         set_old();
         store.refresh().unwrap();

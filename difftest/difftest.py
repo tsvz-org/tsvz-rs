@@ -310,7 +310,7 @@ def main():
     python = [sys.executable, os.path.abspath(args.tsvz)]
     if args.handler:
         python.append('--x-direct')  # the files, not the handler that serves them
-    keep = args.keep
+    keep = args.keep or None
     failed = 0
     refused = {}
     seen = {}
