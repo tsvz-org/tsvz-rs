@@ -301,24 +301,14 @@ impl Writer {
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
         // rotated away), the active part is looked up again. Only a store with no part yet is
         // created: a part's name is never made anew once it has gone.
-        let mut missing = None;
-        for _ in 0..3 {
-            let dir = crate::store::dir_mtime(&self.store);
+        // The error of a part found missing by every try so far, the same part each time.
+        let mut missing: Option<Error> = None;
+        for at in 0..3 {
             let listed = parts::list(&self.store)?;
             let create = listed.is_empty();
             let part = match listed.into_iter().last() {
                 Some(part) => part,
-                None => {
-                    let text = self
-                        .store
-                        .to_str()
-                        .ok_or_else(|| Error::BadPath(self.store.clone()))?;
-                    parts::Part {
-                        path: self.store.clone(),
-                        ordinal: None,
-                        codec: name::split_codec(text).1,
-                    }
-                }
+                None => parts::unnumbered(&self.store)?,
             };
             let path = part.path.as_path();
             let io = |e: io::Error| Error::io(path, e);
@@ -354,17 +344,19 @@ impl Writer {
             let file = match lock::Handle::open(path, &options) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !create => {
-                    missing = Some(io(e)); // reported should it stay so
+                    let e = io(e);
+                    let same = missing
+                        .as_ref()
+                        .is_some_and(|m| m.to_string() == e.to_string());
+                    missing = (at == 0 || same).then_some(e); // reported should it stay so
                     continue;
                 }
                 Err(e) => return Err(io(e)),
             };
             let guard = lock::lock(&file, path).map_err(io)?;
-            // Still the active part: the directory is as it was listed, when its timestamp can
-            // tell; else it is listed again.
-            let same =
-                dir != 0 && !crate::store::racy(dir) && crate::store::dir_mtime(&self.store) == dir;
-            let active = same || parts::active(&self.store)?.path == part.path;
+            // Still the active part: listed again (a directory's timestamp cannot tell, on a
+            // union file system whose parts sit on several branches).
+            let active = parts::active(&self.store)?.path == part.path;
             if !active || !names(path, &file) {
                 missing = None;
                 continue;

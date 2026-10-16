@@ -120,19 +120,21 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
 /// The part appends go to: the store's last part in replay order, or the store path itself
 /// when the store has no part yet (§17.7, §20.2.2).
 pub fn active(store: &Path) -> Result<Part, Error> {
-    let mut parts = list(store)?;
-    Ok(match parts.pop() {
-        Some(last) => last,
-        None => {
-            let text = store
-                .to_str()
-                .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
-            Part {
-                path: store.to_path_buf(),
-                ordinal: None,
-                codec: name::split_codec(text).1,
-            }
-        }
+    match list(store)?.pop() {
+        Some(last) => Ok(last),
+        None => unnumbered(store),
+    }
+}
+
+/// The unnumbered part 0 of `store`, the store's own path (§17.1).
+pub fn unnumbered(store: &Path) -> Result<Part, Error> {
+    let text = store
+        .to_str()
+        .ok_or_else(|| Error::BadPath(store.to_path_buf()))?;
+    Ok(Part {
+        path: store.to_path_buf(),
+        ordinal: None,
+        codec: name::split_codec(text).1,
     })
 }
 

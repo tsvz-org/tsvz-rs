@@ -68,16 +68,15 @@ impl Shared {
         self.claim(None);
     }
 
-    /// Stop the handler, for `why`, unless something stopped it already; whether this did.
-    fn claim(&self, why: Option<String>) -> bool {
+    /// Stop the handler, for `why`, unless something stopped it already.
+    fn claim(&self, why: Option<String>) {
         let mut said = lock(&self.why);
         if self.stopping.swap(true, Ordering::SeqCst) {
-            return false;
+            return;
         }
         *said = why;
         drop(said);
         self.wake();
-        true
     }
 
     fn wake(&self) {
@@ -290,7 +289,8 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     loop {
         let ready = wait_for(&listener, &wakened);
         if shared.stopping.load(Ordering::SeqCst) {
-            if let Some(why) = lock(&shared.why).take() {
+            let why = lock(&shared.why).take();
+            if let Some(why) = why {
                 (config.info)(&why);
             }
             break;

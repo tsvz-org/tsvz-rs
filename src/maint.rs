@@ -468,7 +468,24 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     let mut missing: Option<Error> = None;
     for at in 0..ATTEMPTS {
         match attempt(store, options, &mut backed_up, &mut told) {
-            Ok(Step::Done(outcome)) => return Ok(outcome),
+            Ok(Step::Done(outcome)) => {
+                // Copies of a damaged part an attempt made, other than the one the outcome names.
+                let named = match &outcome {
+                    Outcome::Partial { backup } => backup.clone(),
+                    _ => None,
+                };
+                if let Some(w) = &options.warnings {
+                    for (_, copy) in backed_up.iter().filter(|(_, c)| Some(c) != named.as_ref()) {
+                        w(&Warning {
+                            part: copy.clone(),
+                            offset: None,
+                            message: "a copy of the damaged part, as it was before it changed"
+                                .into(),
+                        });
+                    }
+                }
+                return Ok(outcome);
+            }
             Ok(Step::Again(gone)) => {
                 let same = |a: &Error, b: &Error| io_path(a).is_some() && io_path(a) == io_path(b);
                 missing = match (gone, missing.take()) {
@@ -781,18 +798,6 @@ fn attempt(
             action => action,
         };
         rotate(others, action)?;
-    }
-    if let (Some(w), [earlier @ .., _]) = (&options.warnings, &backed_up[..]) {
-        for (_, old) in earlier {
-            w(&Warning {
-                part: target.path.clone(),
-                offset: None,
-                message: format!(
-                    "{} holds an earlier copy of the damaged part, as it was before it changed",
-                    old.display()
-                ),
-            });
-        }
     }
     Ok(Step::Done(if s.stopped().is_some() {
         Outcome::Partial { backup: copy }
@@ -1373,7 +1378,7 @@ fn trimmed_rows(s: &Store) -> Vec<(String, Vec<String>)> {
 fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
     // Newest first: cut short, it leaves the oldest parts, read from the start as written. A
     // part already gone was rotated by another scrub.
-    let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+    let not_found = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     for part in parts.iter().rev() {
         let io = |e: io::Error| Error::io(&part.path, e);
         match action {
@@ -1385,16 +1390,16 @@ fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
                     Err(e)
                         if e.kind() == io::ErrorKind::AlreadyExists
                             && same_file(&part.path, &rotated) => {}
-                    Err(e) if gone(&e) => continue,
+                    Err(e) if not_found(&e) => continue,
                     Err(e) => return Err(io(e)),
                 }
                 match std::fs::remove_file(&part.path) {
-                    Err(e) if !gone(&e) => return Err(io(e)),
+                    Err(e) if !not_found(&e) => return Err(io(e)),
                     _ => {}
                 }
             }
             "delete" => match std::fs::remove_file(&part.path) {
-                Err(e) if !gone(&e) => return Err(io(e)),
+                Err(e) if !not_found(&e) => return Err(io(e)),
                 _ => {}
             },
             _ => return Ok(()),
