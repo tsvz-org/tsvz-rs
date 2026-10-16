@@ -99,9 +99,10 @@ The writer now samples the store's directory just before its listing and, once i
 lock, lists the parts again only where that sample cannot vouch for the listing. Where the
 directory keeps its timestamp (`parts::DirTrust`: a local kernel file system, asked through the
 open directory, so that the answer and the timestamp are of one file system), the same device,
-inode and change time (`ctime`: no program can set it back), in finer steps than whole seconds
-and at least 2 s old when sampled, mean the same names, as the store's own checks take them;
-elsewhere (mergerfs, network) the parts are listed again, as before. The store's checks and the
+inode and change time (`ctime`: no program sets it back on Linux; on macOS `setattrlist` can),
+in finer steps than whole seconds and at least 2 s old when sampled, mean the same names, as the
+store's own checks take them, unless part 0 is a symbolic link (listed by its target); elsewhere
+(mergerfs, network) the parts are listed again, as before. The store's checks and the
 writer share that one rule. The handler's writer thread does not ask the file system at every
 batch: only when the stamp is other than the last one asked about; where the file system does
 not keep the timestamp, not again. A timestamp seen too recent is not looked at again before it may

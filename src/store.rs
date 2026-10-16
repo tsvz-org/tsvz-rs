@@ -427,7 +427,7 @@ impl Store {
     fn load(&mut self) -> Result<(), Error> {
         // Sampled before the listing, so that a name made meanwhile shows as a change.
         let dir = self.dirs.stamp(&self.path);
-        let mut list = parts::list(&self.path)?;
+        let (mut list, linked) = parts::list_linked(&self.path)?;
         if let Some(n) = self.limit {
             list.truncate(n);
         }
@@ -443,7 +443,7 @@ impl Store {
             }
         }
         self.follow = Follow {
-            dir,
+            dir: dir.filter(|_| !linked),
             ..Follow::default()
         };
         let last = list.len() - 1;
@@ -673,7 +673,7 @@ impl Store {
         if now.is_some() && now == self.follow.dir {
             return Ok(true);
         }
-        let mut listed = parts::list(&self.path)?;
+        let (mut listed, linked) = parts::list_linked(&self.path)?;
         if let Some(n) = self.limit {
             listed.truncate(n);
         }
@@ -684,7 +684,7 @@ impl Store {
         {
             return Ok(false);
         }
-        self.follow.dir = now;
+        self.follow.dir = now.filter(|_| !linked);
         Ok(true)
     }
 
@@ -853,10 +853,12 @@ mod tests {
         let _ahead = parts::RunAhead::by(60);
         let mut store = Store::open(&p, Options::default()).unwrap();
         store.dirs = parts::DirTrust::not_kept(); // as on mergerfs, NFS, SMB, …
-        let listings = || parts::LISTINGS.with(|n| n.get());
-        let before = listings();
+        let before = parts::listings();
         store.refresh().unwrap();
-        assert_eq!(listings() - before, 1);
+        assert_eq!(parts::listings() - before, 1);
+        write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 2, "the new part was read");
     }
 
     #[test]
@@ -875,9 +877,59 @@ mod tests {
         let _ahead = parts::RunAhead::by(60);
         let mut store = Store::open(&p, Options::default()).unwrap();
         assert_eq!(store.len(), 1);
+        // A check that lists the same names keeps no stamp either.
+        assert_eq!(store.refresh().unwrap(), Refreshed::Unchanged);
         write(&o, "real.tsvz", b"a\t1\n");
         store.refresh().unwrap();
         assert_eq!(store.len(), 2, "part 0 was read");
+    }
+
+    #[test]
+    fn a_part_0_that_became_a_symbolic_link_is_listed_at_every_check() {
+        // After a stamp was trusted: the listing, not the file system, says part 0 is a link.
+        let root = tempfile::tempdir().unwrap();
+        let (d, o) = (root.path().join("d"), root.path().join("o"));
+        fs::create_dir(&d).unwrap();
+        fs::create_dir(&o).unwrap();
+        let p = write(&d, "s.tsvz", b"a\t1\n");
+        write(&d, "s.tsvz.1", b"b\t2\n");
+        if !parts::fine_times(&p) {
+            return;
+        }
+        let _ahead = parts::RunAhead::by(60);
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(store.refresh().unwrap(), Refreshed::Unchanged);
+        fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(o.join("real.tsvz"), &p).unwrap();
+        let _later = parts::RunAhead::by(60);
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 1);
+        write(&o, "real.tsvz", b"a\t9\n");
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 2, "part 0 was read");
+    }
+
+    #[test]
+    fn a_part_0_that_is_no_longer_a_link_lets_the_directory_be_trusted_again() {
+        let root = tempfile::tempdir().unwrap();
+        let (d, o) = (root.path().join("d"), root.path().join("o"));
+        fs::create_dir(&d).unwrap();
+        fs::create_dir(&o).unwrap();
+        let p = d.join("s.tsvz");
+        std::os::unix::fs::symlink(write(&o, "real.tsvz", b"a\t1\n"), &p).unwrap();
+        write(&d, "s.tsvz.1", b"b\t2\n");
+        if !parts::fine_times(&d.join("other.tsvz")) {
+            return;
+        }
+        let _ahead = parts::RunAhead::by(60);
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        fs::remove_file(&p).unwrap();
+        write(&d, "s.tsvz", b"a\t1\n");
+        let _later = parts::RunAhead::by(60);
+        store.refresh().unwrap();
+        let before = parts::listings();
+        assert_eq!(store.refresh().unwrap(), Refreshed::Unchanged);
+        assert_eq!(parts::listings(), before, "trusted again");
     }
 
     #[test]
@@ -885,11 +937,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
         write(dir.path(), "s.tsvz.1", b"b\t2\n");
-        let asked = || parts::ASKED.with(|n| n.get());
         TORN.with(|t| t.set(2));
-        let before = asked();
+        let before = parts::asked();
         Store::open(&p, Options::default()).unwrap();
-        assert_eq!(asked() - before, 1, "asked by the first read only");
+        assert_eq!(parts::asked() - before, 1, "asked by the first read only");
     }
 
     #[test]
@@ -903,11 +954,10 @@ mod tests {
         // A directory last changed long ago: its timestamp is trusted as it is.
         let _ahead = parts::RunAhead::by(60);
         let mut store = Store::open(&p, Options::default()).unwrap();
-        let listings = || parts::LISTINGS.with(|n| n.get());
-        let before = listings();
+        let before = parts::listings();
         assert_eq!(store.refresh().unwrap(), Refreshed::Unchanged);
         assert_eq!(
-            listings(),
+            parts::listings(),
             before,
             "nothing changed: the directory is not listed"
         );
@@ -944,10 +994,9 @@ mod tests {
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
         let mut store = Store::open(&p, Options::default()).unwrap();
         store.dirs = parts::DirTrust::not_kept();
-        let asked = || parts::ASKED.with(|n| n.get());
-        let before = asked();
+        let before = parts::asked();
         store.reload().unwrap();
-        assert_eq!(asked(), before, "not asked again");
+        assert_eq!(parts::asked(), before, "not asked again");
     }
 
     #[test]

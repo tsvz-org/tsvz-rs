@@ -350,10 +350,10 @@ def main():
                 if keep is None:
                     keep = tempfile.mkdtemp(prefix='difftest-')  # made only when a seed disagrees
                 target = os.path.join(keep, 'seed%d' % seed)
-                if os.path.islink(target) or os.path.isfile(target):  # from an earlier run into the same --keep
+                if os.path.isdir(target) and not os.path.islink(target):  # from an earlier run into the same --keep
+                    shutil.rmtree(target)
+                elif os.path.lexists(target):
                     os.remove(target)
-                else:
-                    shutil.rmtree(target, ignore_errors=True)
                 shutil.copytree(directory, target)
                 print('seed %d disagrees (files in %s):\n%s' % (seed, target, '\n'.join(problems)))
         finally:

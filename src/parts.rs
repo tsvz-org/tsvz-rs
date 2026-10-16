@@ -39,6 +39,13 @@ impl Stamp {
 /// directory gives no parts; a store path that is a directory, or a directory that cannot be
 /// listed, is an error.
 pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
+    list_linked(store).map(|(parts, _)| parts)
+}
+
+/// [`list`], and whether part 0 was looked up through a symbolic link (or could not be looked
+/// at): then the listing depends on the link's target, which the directory's timestamp does
+/// not follow, and that timestamp vouches for nothing ([`DirTrust`]).
+pub(crate) fn list_linked(store: &Path) -> Result<(Vec<Part>, bool), Error> {
     #[cfg(test)]
     LISTINGS.with(|n| n.set(n.get() + 1));
     let text = store
@@ -51,7 +58,7 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
     }
     if name::format_of(store).is_some_and(|f| !f.strict) {
         // A loose file is one file (§20.2.4): numbered siblings such as rotated logs are not parts.
-        return Ok(if store.is_file() {
+        let parts = if store.is_file() {
             vec![Part {
                 path: store.to_path_buf(),
                 ordinal: None,
@@ -59,7 +66,8 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
             }]
         } else {
             Vec::new()
-        });
+        };
+        return Ok((parts, false));
     }
     let base = Path::new(base);
     let file_name = base
@@ -98,7 +106,13 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
     }
     numbered.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     let mut parts = Vec::with_capacity(numbered.len() + 1);
-    if store.is_file() {
+    let (part0, linked) = match std::fs::symlink_metadata(store) {
+        Ok(meta) if meta.file_type().is_symlink() => (store.is_file(), true),
+        Ok(meta) => (meta.is_file(), false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, false),
+        Err(_) => (store.is_file(), true),
+    };
+    if part0 {
         parts.push(Part {
             path: store.to_path_buf(),
             ordinal: None,
@@ -116,7 +130,7 @@ pub fn list(store: &Path) -> Result<Vec<Part>, Error> {
             codec: n.codec,
         });
     }
-    Ok(parts)
+    Ok((parts, linked))
 }
 
 /// The part appends go to: the store's last part in replay order, or the store path itself
@@ -143,8 +157,9 @@ const RACY_NS: i128 = 2_000_000_000;
 /// device and inode (another file system mounted there changes them) and its change time, which
 /// every name made, renamed or removed in it sets and which, unlike its modification time, no
 /// program sets back on Linux (setting the modification time sets it to now; on macOS
-/// setattrlist can set it). Within one clock tick a change may leave it as it was (tmpfs, f2fs):
-/// only a stamp at least 2 s old (`RACY_NS`) is trusted.
+/// setattrlist can set it). The kernel takes it from a coarse clock, so a change within the
+/// same tick may leave it as it was, on every file system: only a stamp at least 2 s old
+/// (`RACY_NS`) is trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirStamp {
     pub dev: u64,
@@ -213,10 +228,10 @@ impl Drop for RunAhead {
 /// that the answer and the timestamp are of one file system; and asked again whenever the
 /// directory's stamp is other than the last one asked about (another directory, another file
 /// system mounted there, which may even reuse the device and inode numbers: a moved stamp means
-/// a listing anyway). Where the timestamp is not kept, or kept in whole seconds, or part 0 is a
-/// symbolic link (listed by its target, which the directory does not follow), the directory is
+/// a listing anyway). Where the timestamp is not kept, or kept in whole seconds, the directory is
 /// not looked at again: the answer stands for the life of this value (a store keeps it across
-/// its reloads). A loose file's directory is never looked at: it is never listed (§20.2.4).
+/// its reloads). A loose file's directory is never looked at: it is never listed (§20.2.4). A
+/// stamp vouches for no listing in which part 0 is a symbolic link ([`list_linked`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DirTrust {
     kept: Kept,
@@ -302,9 +317,8 @@ impl DirTrust {
 /// file system (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs; APFS), which sets it at every name made,
 /// renamed or removed in it (POSIX). Never FUSE (mergerfs shows one branch's directory),
 /// network or overlay file systems, nor one this does not know; nor HFS+, whose whole seconds
-/// let a clock stepped back repeat a timestamp; nor where part 0 is a symbolic link, listed by
-/// its target. There the directory is listed. An error when the directory cannot be opened as
-/// one (a FIFO there is not waited on).
+/// let a clock stepped back repeat a timestamp. There the directory is listed. An error when
+/// the directory cannot be opened as one (a FIFO there is not waited on).
 fn ask(store: &Path) -> std::io::Result<Option<DirStamp>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -317,9 +331,6 @@ fn ask(store: &Path) -> std::io::Result<Option<DirStamp>> {
     // SAFETY: fstatfs reads the open descriptor and writes the struct it is given.
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut fs) } != 0 || !kept(&fs) {
-        return Ok(None);
-    }
-    if std::fs::symlink_metadata(store).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(None);
     }
     #[cfg(test)]
@@ -368,6 +379,24 @@ fn kept(fs: &libc::statfs) -> bool {
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn kept(_fs: &libc::statfs) -> bool {
     false
+}
+
+/// How many times this thread listed a store's parts: for tests.
+#[cfg(test)]
+pub(crate) fn listings() -> usize {
+    LISTINGS.with(|n| n.get())
+}
+
+/// How many times this thread asked whether a directory keeps its timestamp: for tests.
+#[cfg(test)]
+pub(crate) fn asked() -> usize {
+    ASKED.with(|n| n.get())
+}
+
+/// How many times this thread stat'ed a store's directory: for tests.
+#[cfg(test)]
+pub(crate) fn stats() -> usize {
+    STATS.with(|n| n.get())
 }
 
 #[cfg(test)]
@@ -694,14 +723,6 @@ mod tests {
         );
         fs::rename(&store, rotated_path(&store, true)).unwrap();
         assert!(list(&store).unwrap().is_empty(), "nor is a rotated part 0");
-    }
-
-    fn asked() -> usize {
-        ASKED.with(|n| n.get())
-    }
-
-    fn stats() -> usize {
-        STATS.with(|n| n.get())
     }
 
     #[test]

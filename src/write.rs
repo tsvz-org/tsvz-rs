@@ -319,7 +319,7 @@ impl Writer {
         for at in 0..3 {
             // Sampled before the listing, so that a name made meanwhile shows as a change.
             let dir = self.dirs.stamp(&self.store);
-            let listed = parts::list(&self.store)?;
+            let (listed, linked) = parts::list_linked(&self.store)?;
             let create = listed.is_empty();
             let part = match listed.into_iter().last() {
                 Some(part) => part,
@@ -371,7 +371,7 @@ impl Writer {
             let guard = lock::lock(&file, path).map_err(io)?;
             // Still the active part: the directory kept its timestamp, and shows no name made,
             // renamed or removed since the listing (parts::DirTrust); else listed again.
-            let unchanged = dir.is_some() && parts::DirStamp::of(&self.store) == dir;
+            let unchanged = !linked && dir.is_some() && parts::DirStamp::of(&self.store) == dir;
             let active = unchanged || parts::active(&self.store)?.path == part.path;
             if !active || !names(path, &file) {
                 missing = None;
@@ -810,9 +810,7 @@ mod tests {
         parts::fine_times(store).then(|| parts::RunAhead::by(60))
     }
 
-    fn listings() -> usize {
-        parts::LISTINGS.with(|n| n.get())
-    }
+    use parts::listings;
 
     #[test]
     fn a_write_lists_the_parts_once_where_the_kept_directory_shows_no_change() {
@@ -856,13 +854,36 @@ mod tests {
     }
 
     #[test]
+    fn a_write_lists_the_parts_again_after_the_lock_where_part_0_is_a_link() {
+        // Part 0 is listed by its target, which the directory's timestamp does not follow.
+        let root = tempfile::tempdir().unwrap();
+        let (d, o) = (root.path().join("d"), root.path().join("o"));
+        fs::create_dir(&d).unwrap();
+        fs::create_dir(&o).unwrap();
+        let real = o.join("real.tsvz");
+        fs::write(&real, "a\t1\n").unwrap();
+        let p = d.join("s.tsvz");
+        std::os::unix::fs::symlink(&real, &p).unwrap();
+        let Some(_ahead) = kept_and_aged(&d.join("other.tsvz")) else {
+            return;
+        };
+        let before = listings();
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("b", &["2".into()])])
+            .unwrap();
+        assert_eq!(listings() - before, 2);
+        assert_eq!(fs::read_to_string(&real).unwrap(), "a\t1\nb\t2\n");
+    }
+
+    #[test]
     fn a_loose_store_s_writer_does_not_look_at_its_directory() {
         // A loose file is one file (§20.2.4): its directory is never listed, so its timestamp
         // would tell nothing.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
         fs::write(&p, "a\t1\n").unwrap();
-        let looks = || parts::STATS.with(|n| n.get()) + parts::ASKED.with(|n| n.get());
+        let looks = || parts::stats() + parts::asked();
         let before = looks();
         Writer::open(&p)
             .unwrap()
