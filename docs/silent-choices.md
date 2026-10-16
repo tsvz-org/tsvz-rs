@@ -49,7 +49,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | Strict stores only (departs from TSVZ.py) | `serve` refuses a loose file and the CLI never forwards one: tsvz-rs and TSVZ.py read loose files by different rules, so a forwarded command could print what the other tool's files would not | — |
 | Loose files | Design section 5.6's simple rule; TSVZ.py uses its 3.39 rules instead (§20.2.4 allows both), which also cut a row longer than the first to its width | — |
 | When the parts are listed again | At every check of a store (a read through a handler, a write's check of other writers), except where the directory's timestamp is kept: on a local kernel file system (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs on Linux; APFS on macOS), which sets it at every name made, renamed or removed, the same directory (device and inode) with the same timestamp, at least 2 s old when last listed, means the same names. Never on FUSE (mergerfs shows one branch's directory), network, overlay or unknown file systems, nor HFS+ (whole seconds). Another file system mounted there is asked again. A writer checks once it holds the lock that no part was started since its listing (§17.7): by the same rule, the directory sampled just before that listing (its file system asked once per directory, not per batch), else by listing the parts again | — |
-| `-V` | `tsvz-rs` and the crate version (`tsvz-rs 0.1.2`) | — |
+| `-V` | `tsvz-rs` and the crate version (`tsvz-rs 0.1.3`) | — |
 
 ## Where TSVZ.py departs from the spec
 
