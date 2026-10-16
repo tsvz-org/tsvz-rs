@@ -310,7 +310,7 @@ def main():
     python = [sys.executable, os.path.abspath(args.tsvz)]
     if args.handler:
         python.append('--x-direct')  # the files, not the handler that serves them
-    keep = args.keep or tempfile.mkdtemp(prefix='difftest-')
+    keep = args.keep
     failed = 0
     refused = {}
     seen = {}
@@ -347,6 +347,8 @@ def main():
                 problems += scrub_problems
             if problems:
                 failed += 1
+                if keep is None:
+                    keep = tempfile.mkdtemp(prefix='difftest-')  # made only when a seed disagrees
                 target = os.path.join(keep, 'seed%d' % seed)
                 shutil.copytree(directory, target)
                 print('seed %d disagrees (files in %s):\n%s' % (seed, target, '\n'.join(problems)))
