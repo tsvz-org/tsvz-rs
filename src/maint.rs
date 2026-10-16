@@ -464,11 +464,19 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     let mut backed_up: Vec<(Stamp, PathBuf)> = Vec::new();
     let mut told = false;
     let mut why = "the store kept changing while it was being compacted".to_string();
-    let mut missing = None;
-    for _ in 0..ATTEMPTS {
+    // The error of a file found missing by every attempt so far, the same file each time.
+    let mut missing: Option<Error> = None;
+    for at in 0..ATTEMPTS {
         match attempt(store, options, &mut backed_up, &mut told) {
             Ok(Step::Done(outcome)) => return Ok(outcome),
-            Ok(Step::Again(gone)) => missing = gone,
+            Ok(Step::Again(gone)) => {
+                let same = |a: &Error, b: &Error| io_path(a).is_some() && io_path(a) == io_path(b);
+                missing = match (gone, missing.take()) {
+                    (Some(e), None) if at == 0 => Some(e),
+                    (Some(e), Some(before)) if same(&e, &before) => Some(e),
+                    _ => None,
+                };
+            }
             Ok(Step::Refused(reason)) => {
                 why = reason;
                 missing = None;
@@ -479,7 +487,7 @@ pub fn scrub(store: &Path, options: &Options) -> Result<Outcome, Error> {
     }
     // A file missing at every attempt is no change of the parts: its error says which.
     if let Some(e) = missing {
-        return Err(e);
+        why = e.to_string();
     }
     // A refusal after an attempt backed up a damaged part says so.
     let copies: Vec<String> = backed_up
@@ -511,6 +519,14 @@ enum Step {
     Again(Option<Error>),
     /// Refused, for this reason.
     Refused(String),
+}
+
+/// The file an I/O error is about.
+fn io_path(e: &Error) -> Option<&Path> {
+    match e {
+        Error::Io { path, .. } => Some(path),
+        _ => None,
+    }
 }
 
 /// Whether `e` says a file being read is not there (any more): never a rewrite that left a
@@ -650,7 +666,7 @@ fn attempt(
         copy = match backed_up.last() {
             Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
             last => {
-                let path = backup(&target.path, options)?;
+                let path = read!(backup(&target.path, options), Step::Again);
                 // A copy of the part as it was before (appends since) holds nothing more.
                 if let Some((_, old)) = last {
                     if starts_with_file(&path, old) {
@@ -702,6 +718,7 @@ fn attempt(
             }
             None
         }
+        Err(e) if gone(&e) => return Ok(Step::Again(Some(e))),
         Err(e) => return Err(e),
     };
     let drop_copy = || {
@@ -727,7 +744,11 @@ fn attempt(
             Ok(old) => old,
             Err(e) => {
                 drop_copy();
-                return Err(e);
+                return if gone(&e) {
+                    Ok(Step::Again(Some(e)))
+                } else {
+                    Err(e)
+                };
             }
         }
     } else {
@@ -748,7 +769,8 @@ fn attempt(
     if !written.as_ref().is_err_and(damaged) {
         drop_copy();
     }
-    let written = written?;
+    // Missing before a byte was written (a rewrite that damaged the part is never `gone`).
+    let written = read!(written, Step::Again);
     let Some(written) = written else {
         return Ok(Step::Again(None)); // another writer committed after the read
     };
@@ -759,6 +781,18 @@ fn attempt(
             action => action,
         };
         rotate(others, action)?;
+    }
+    if let (Some(w), [earlier @ .., _]) = (&options.warnings, &backed_up[..]) {
+        for (_, old) in earlier {
+            w(&Warning {
+                part: target.path.clone(),
+                offset: None,
+                message: format!(
+                    "{} holds an earlier copy of the damaged part, as it was before it changed",
+                    old.display()
+                ),
+            });
+        }
     }
     Ok(Step::Done(if s.stopped().is_some() {
         Outcome::Partial { backup: copy }
@@ -1005,21 +1039,28 @@ fn stem_and_ext(store: &Path) -> (String, String) {
 /// crash would leave behind.
 fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, Error> {
     static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = PathBuf::from(format!(
-        "{}.scrub-{}-{}-{n}.{}",
-        part.display(),
-        local_timestamp(),
-        std::process::id(),
-        variant_ext(store)
-    ));
+    let (mut file, path) = loop {
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = PathBuf::from(format!(
+            "{}.scrub-{}-{}-{n}.{}",
+            part.display(),
+            local_timestamp(),
+            std::process::id(),
+            variant_ext(store)
+        ));
+        // Taken (another host's scrub, same second and pid): the next number.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => break (file, path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    };
     let io = |e: io::Error| Error::io(&path, e);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(io)?;
     if let Err(e) = file.write_all(content).and_then(|()| file.sync_all()) {
         let _ = std::fs::remove_file(&path);
         return Err(io(e));
@@ -1330,7 +1371,9 @@ fn trimmed_rows(s: &Store) -> Vec<(String, Vec<String>)> {
 /// Apply `#_rotate_#` to parts whose rows another part now holds (§19.5): `rename` gives each
 /// the `.rotated` component, never replacing a file; `delete` removes them; `keep` leaves them.
 fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
-    // Newest first: cut short, it leaves the oldest parts, read from the start as written.
+    // Newest first: cut short, it leaves the oldest parts, read from the start as written. A
+    // part already gone was rotated by another scrub.
+    let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     for part in parts.iter().rev() {
         let io = |e: io::Error| Error::io(&part.path, e);
         match action {
@@ -1342,11 +1385,18 @@ fn rotate(parts: &[parts::Part], action: &str) -> Result<(), Error> {
                     Err(e)
                         if e.kind() == io::ErrorKind::AlreadyExists
                             && same_file(&part.path, &rotated) => {}
+                    Err(e) if gone(&e) => continue,
                     Err(e) => return Err(io(e)),
                 }
-                std::fs::remove_file(&part.path).map_err(io)?;
+                match std::fs::remove_file(&part.path) {
+                    Err(e) if !gone(&e) => return Err(io(e)),
+                    _ => {}
+                }
             }
-            "delete" => std::fs::remove_file(&part.path).map_err(io)?,
+            "delete" => match std::fs::remove_file(&part.path) {
+                Err(e) if !gone(&e) => return Err(io(e)),
+                _ => {}
+            },
             _ => return Ok(()),
         }
     }
@@ -1873,6 +1923,30 @@ mod tests {
             ),
         );
         assert!(damaged(&e) && !gone(&e));
+    }
+
+    #[test]
+    fn a_part_another_scrub_rotated_already_counts_as_rotated() {
+        for action in ["delete", "rename"] {
+            let dir = tempfile::tempdir().unwrap();
+            let gone = dir.path().join("s.tsvz.1");
+            let here = dir.path().join("s.tsvz.2");
+            fs::write(&here, "a\t1\n").unwrap();
+            let parts = [
+                parts::Part {
+                    path: gone,
+                    ordinal: Some("1".into()),
+                    codec: None,
+                },
+                parts::Part {
+                    path: here.clone(),
+                    ordinal: Some("2".into()),
+                    codec: None,
+                },
+            ];
+            rotate(&parts, action).unwrap();
+            assert!(!here.exists(), "{action}");
+        }
     }
 
     #[test]
