@@ -461,6 +461,21 @@ fn an_idle_handler_stops_after_its_timeout() {
 }
 
 #[test]
+fn a_signal_stops_the_handler_which_says_why_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "");
+    let mut served = Served::start(&s, &["--x-idle-timeout", "3600"]);
+    served.signal(libc::SIGTERM);
+    assert_eq!(served.wait(), 0);
+    let err = served.stderr();
+    let why = err
+        .find("signal 15; stopping")
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(why < err.find("stopped serving").unwrap(), "{err}");
+    assert_eq!(err.matches("; stopping").count(), 1, "{err}");
+}
+
+#[test]
 fn the_socket_is_private_unless_widened() {
     let mode_of = |s: &Path| {
         let info = pointer::lookup(s).unwrap().unwrap();

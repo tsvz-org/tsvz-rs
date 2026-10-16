@@ -48,8 +48,9 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
 /// What the connections and the stoppers share.
 struct Shared {
     stopping: AtomicBool,
-    /// The idle timeout stopped the handler (its thread says so, and is waited for).
-    idled: AtomicBool,
+    /// Why the handler stops, said by serve once its accept loop ends: set by the one that
+    /// claimed the stop (the idle timeout, a signal), under this mutex.
+    why: Mutex<Option<String>>,
     /// The write end of the accept loop's wake-up pair.
     wake: UnixStream,
     /// Open connections (for the idle timeout) and when the last one closed.
@@ -64,9 +65,19 @@ impl Shared {
     /// which needs no path (the socket's directory may be gone, as `/run/user/UID` is after a
     /// logout).
     fn stop(&self) {
-        if !self.stopping.swap(true, Ordering::SeqCst) {
-            self.wake();
+        self.claim(None);
+    }
+
+    /// Stop the handler, for `why`, unless something stopped it already; whether this did.
+    fn claim(&self, why: Option<String>) -> bool {
+        let mut said = lock(&self.why);
+        if self.stopping.swap(true, Ordering::SeqCst) {
+            return false;
         }
+        *said = why;
+        drop(said);
+        self.wake();
+        true
     }
 
     fn wake(&self) {
@@ -95,12 +106,11 @@ fn block_signals() -> libc::sigset_t {
     }
 }
 
-fn wait_for_signal(set: libc::sigset_t, shared: Arc<Shared>, info: InfoFn) {
+fn wait_for_signal(set: libc::sigset_t, shared: Arc<Shared>) {
     let mut signal = 0;
     // SAFETY: sigwait reads the set and writes the signal number.
     if unsafe { libc::sigwait(&set, &mut signal) } == 0 {
-        info(&format!("signal {signal}; stopping"));
-        shared.stop();
+        shared.claim(Some(format!("signal {signal}; stopping")));
     }
 }
 
@@ -238,7 +248,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     }
     let shared = Arc::new(Shared {
         stopping: AtomicBool::new(false),
-        idled: AtomicBool::new(false),
+        why: Mutex::new(None),
         wake,
         activity: Mutex::new((0, Instant::now())),
         open: Mutex::new(HashMap::new()),
@@ -250,22 +260,18 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         .any(|&s| unsafe { libc::sigismember(&signals, s) } == 1);
     let mut helpers = Ok(());
     if any {
-        let (shared, info) = (shared.clone(), config.info.clone());
+        let shared = shared.clone();
         helpers = std::thread::Builder::new()
             .name("tsvz-signals".into())
-            .spawn(move || wait_for_signal(signals, shared, info))
+            .spawn(move || wait_for_signal(signals, shared))
             .map(drop);
     }
-    let mut idler = None;
     if let (Some(idle), Ok(())) = (config.idle, &helpers) {
-        let (shared, info) = (shared.clone(), config.info.clone());
-        match std::thread::Builder::new()
+        let shared = shared.clone();
+        helpers = std::thread::Builder::new()
             .name("tsvz-idle".into())
-            .spawn(move || watch_idle(idle, shared, info))
-        {
-            Ok(thread) => idler = Some(thread),
-            Err(e) => helpers = Err(e),
-        }
+            .spawn(move || watch_idle(idle, shared))
+            .map(drop);
     }
     if let Err(e) = helpers {
         engine.close();
@@ -284,6 +290,9 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     loop {
         let ready = wait_for(&listener, &wakened);
         if shared.stopping.load(Ordering::SeqCst) {
+            if let Some(why) = lock(&shared.why).take() {
+                (config.info)(&why);
+            }
             break;
         }
         if !ready {
@@ -316,9 +325,6 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     engine.close();
     let _ = std::fs::remove_dir_all(&dir);
     held.release();
-    if let (true, Some(thread)) = (shared.idled.load(Ordering::SeqCst), idler) {
-        let _ = thread.join(); // it says why it stopped the handler first
-    }
     (config.info)(&format!("stopped serving {}", store.display()));
     Ok(())
 }
@@ -416,33 +422,15 @@ fn wait_for(listener: &UnixListener, wakened: &UnixStream) -> bool {
     unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) > 0 }
 }
 
-fn watch_idle(idle: Duration, shared: Arc<Shared>, info: InfoFn) {
+fn watch_idle(idle: Duration, shared: Arc<Shared>) {
     let tick = (idle / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
     while !shared.stopping.load(Ordering::SeqCst) {
         std::thread::sleep(tick);
-        // Decided, and the stop set, under the lock that counts new connections: one counted
-        // before is served to its end, one after is refused (start_connection). Said after it
-        // (no output under the lock), unless something else stopped the handler first; serve
-        // waits for this thread before it ends.
-        let idled = {
-            let activity = lock(&shared.activity);
-            activity.0 == 0 && activity.1.elapsed() >= idle && {
-                // Claimed at once against a signal or a stop request (Shared::stop): only one
-                // says why the handler stops. `idled` first, so that serve never misses it.
-                shared.idled.store(true, Ordering::SeqCst);
-                let won = shared
-                    .stopping
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok();
-                if !won {
-                    shared.idled.store(false, Ordering::SeqCst);
-                }
-                won
-            }
-        };
-        if idled {
-            info(&format!("idle for {} s; stopping", idle.as_secs_f64()));
-            shared.wake();
+        // Decided under the lock that counts new connections: one counted before is served to
+        // its end, one after is refused (start_connection).
+        let activity = lock(&shared.activity);
+        if activity.0 == 0 && activity.1.elapsed() >= idle {
+            shared.claim(Some(format!("idle for {} s; stopping", idle.as_secs_f64())));
         }
     }
 }
@@ -620,7 +608,7 @@ mod tests {
         let (wake, _) = UnixStream::pair().unwrap();
         Arc::new(Shared {
             stopping: AtomicBool::new(false),
-            idled: AtomicBool::new(false),
+            why: Mutex::new(None),
             wake,
             activity: Mutex::new((0, Instant::now())),
             open: Mutex::new(HashMap::new()),
@@ -753,7 +741,7 @@ mod tests {
         let (wake, _wakened) = UnixStream::pair().unwrap();
         let shared = Arc::new(Shared {
             stopping: AtomicBool::new(false),
-            idled: AtomicBool::new(false),
+            why: Mutex::new(None),
             wake,
             activity: Mutex::new((0, Instant::now())),
             open: Mutex::new(HashMap::new()),
