@@ -151,6 +151,8 @@ pub(crate) struct DirStamp {
 impl DirStamp {
     /// The directory of `store` as it is now; None when it cannot be read.
     pub(crate) fn of(store: &Path) -> Option<DirStamp> {
+        #[cfg(test)]
+        STATS.with(|n| n.set(n.get() + 1));
         let meta = std::fs::metadata(dir_of(store)).ok()?;
         Some(DirStamp {
             dev: meta.dev(),
@@ -161,10 +163,49 @@ impl DirStamp {
 
     /// Whether its timestamp is too recent to tell a change made within the same tick.
     pub(crate) fn racy(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as i128);
-        now - self.mtime < RACY_NS
+        now_ns() - self.mtime < RACY_NS
+    }
+}
+
+/// The time now, in nanoseconds since the epoch.
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128)
+}
+
+/// Whether the directory of a store keeps its timestamp ([`keeps_dir_times`]), asked once per
+/// directory (device and inode), so that another file system mounted there is asked again.
+/// Where it does not, the directory is not even stat'ed again.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DirTrust {
+    asked: Option<(u64, u64)>,
+    kept: bool,
+    /// Until when (ns since the epoch) the timestamp last seen too recent must still be so,
+    /// changed since or not: the directory is not stat'ed before then.
+    racy_until: i128,
+}
+
+impl DirTrust {
+    /// The directory of `store` as it is now, where its timestamp is kept and old enough to
+    /// show any change from now on; else None.
+    pub(crate) fn stamp(&mut self, store: &Path) -> Option<DirStamp> {
+        if (self.asked.is_some() && !self.kept) || now_ns() < self.racy_until {
+            return None;
+        }
+        let now = DirStamp::of(store)?;
+        if self.asked != Some((now.dev, now.ino)) {
+            self.asked = Some((now.dev, now.ino));
+            self.kept = keeps_dir_times(store);
+        }
+        if !self.kept {
+            return None;
+        }
+        if now.racy() {
+            self.racy_until = now.mtime + RACY_NS;
+            return None;
+        }
+        Some(now)
     }
 }
 
@@ -175,6 +216,8 @@ impl DirStamp {
 /// whole seconds let a clock stepped back repeat a timestamp. There the directory is listed.
 pub(crate) fn keeps_dir_times(store: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    ASKED.with(|n| n.set(n.get() + 1));
     let Ok(c) = std::ffi::CString::new(dir_of(store).as_os_str().as_bytes()) else {
         return false;
     };
@@ -214,6 +257,10 @@ fn kept(_fs: &libc::statfs) -> bool {
 thread_local! {
     /// How many times this thread listed a store's parts: for tests.
     pub(crate) static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread asked whether a directory keeps its timestamp: for tests.
+    static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread stat'ed a store's directory: for tests.
+    static STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The unnumbered part 0 of `store`, the store's own path (§17.1).
@@ -528,5 +575,95 @@ mod tests {
         );
         fs::rename(&store, rotated_path(&store, true)).unwrap();
         assert!(list(&store).unwrap().is_empty(), "nor is a rotated part 0");
+    }
+
+    fn asked() -> usize {
+        ASKED.with(|n| n.get())
+    }
+
+    #[test]
+    fn a_directory_is_asked_once_whether_it_keeps_its_timestamp() {
+        // Once per directory, not per batch: on mergerfs a statfs a batch would be wasted.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        // Old enough to be stat'ed at every look.
+        date_back(dir.path(), std::time::Duration::from_secs(60));
+        let mut trust = DirTrust::default();
+        let before = asked();
+        for _ in 0..3 {
+            trust.stamp(&p);
+        }
+        assert_eq!(asked() - before, 1);
+    }
+
+    #[test]
+    fn another_directory_at_the_path_is_asked_again() {
+        // As when another file system is mounted there: a mergerfs pool over a former ext4
+        // directory must not inherit its answer.
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("d");
+        fs::create_dir(&sub).unwrap();
+        let p = sub.join("s.tsvz");
+        if !keeps_dir_times(&p) {
+            eprintln!("skipped: the temporary directory is not on a local kernel file system");
+            return;
+        }
+        // Old enough to be stat'ed at the next look (a recent one waits until it may not be).
+        date_back(&sub, std::time::Duration::from_secs(60));
+        let mut trust = DirTrust::default();
+        let before = asked();
+        trust.stamp(&p);
+        fs::rename(&sub, root.path().join("d.old")).unwrap();
+        fs::create_dir(&sub).unwrap();
+        trust.stamp(&p);
+        assert_eq!(asked() - before, 2);
+    }
+
+    fn stats() -> usize {
+        STATS.with(|n| n.get())
+    }
+
+    /// Set the timestamp of the directory `dir` to `ago` in the past.
+    fn date_back(dir: &Path, ago: std::time::Duration) {
+        fs::File::open(dir)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now() - ago))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_timestamp_too_recent_is_not_looked_at_again_while_it_must_still_be() {
+        // Changed or not, the directory's timestamp stays too recent until 2 s past the one
+        // seen: until then each batch lists the parts without a stat first.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let mut trust = DirTrust::default();
+        let before = stats();
+        assert_eq!(trust.stamp(&p), None);
+        assert_eq!(trust.stamp(&p), None);
+        assert_eq!(stats() - before, 1);
+    }
+
+    #[test]
+    fn a_timestamp_too_recent_is_looked_at_again_once_it_may_be_old_enough() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        if !keeps_dir_times(&p) {
+            eprintln!("skipped: the temporary directory is not on a local kernel file system");
+            return;
+        }
+        let mut trust = DirTrust::default();
+        // Too recent for 0.1 s more.
+        date_back(dir.path(), std::time::Duration::from_millis(1900));
+        assert_eq!(trust.stamp(&p), None);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        date_back(dir.path(), std::time::Duration::from_secs(60));
+        assert!(
+            trust.stamp(&p).is_some(),
+            "stat'ed again, and old enough now"
+        );
     }
 }

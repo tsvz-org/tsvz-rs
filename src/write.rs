@@ -235,6 +235,7 @@ pub struct Writer {
     member_size: usize,
     fsync: bool,
     warn: Option<WarnFn>,
+    dirs: parts::DirTrust,
 }
 
 impl Writer {
@@ -247,7 +248,19 @@ impl Writer {
             member_size: DEFAULT_MEMBER_SIZE as usize,
             fsync: false,
             warn: None,
+            dirs: parts::DirTrust::default(),
         })
+    }
+
+    /// What an earlier writer of the store learnt of its directory ([`Writer::dirs_known`]),
+    /// so that its file system is not asked again at every batch.
+    pub(crate) fn dirs(mut self, known: parts::DirTrust) -> Writer {
+        self.dirs = known;
+        self
+    }
+
+    pub(crate) fn dirs_known(&self) -> parts::DirTrust {
+        self.dirs
     }
 
     /// The most uncompressed bytes per compressed member (§16.7); default 1 MiB.
@@ -304,6 +317,8 @@ impl Writer {
         // The error of a part found missing by every try so far, the same part each time.
         let mut missing: Option<Error> = None;
         for at in 0..3 {
+            // Sampled before the listing, so that a name made meanwhile shows as a change.
+            let dir = self.dirs.stamp(&self.store);
             let listed = parts::list(&self.store)?;
             let create = listed.is_empty();
             let part = match listed.into_iter().last() {
@@ -354,9 +369,10 @@ impl Writer {
                 Err(e) => return Err(io(e)),
             };
             let guard = lock::lock(&file, path).map_err(io)?;
-            // Still the active part: listed again (once a batch; the store's checks, once a
-            // request, are where a kept directory timestamp spares the listing).
-            let active = parts::active(&self.store)?.path == part.path;
+            // Still the active part: the directory kept its timestamp, and shows no name made,
+            // renamed or removed since the listing (parts::DirTrust); else listed again.
+            let unchanged = dir.is_some() && parts::DirStamp::of(&self.store) == dir;
+            let active = unchanged || parts::active(&self.store)?.path == part.path;
             if !active || !names(path, &file) {
                 missing = None;
                 continue;
@@ -785,6 +801,91 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap(),
             "c\t3\nb\t2\n"
+        );
+    }
+
+    /// Date the directory `dir` of `store` a minute back; false (the test is skipped) where its
+    /// file system does not keep directory timestamps.
+    fn kept_and_dated_back(dir: &Path, store: &Path) -> bool {
+        if !parts::keeps_dir_times(store) {
+            eprintln!("skipped: the temporary directory is not on a local kernel file system");
+            return false;
+        }
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(dir)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(long_ago))
+            .unwrap();
+        true
+    }
+
+    fn listings() -> usize {
+        parts::LISTINGS.with(|n| n.get())
+    }
+
+    #[test]
+    fn a_write_lists_the_parts_once_where_the_kept_directory_shows_no_change() {
+        // The part chosen from the listing is still the active one after the lock: the
+        // directory's timestamp, kept and old, shows no name made, renamed or removed since.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let one = dir.path().join("s.tsvz.1");
+        fs::write(&one, "b\t2\n").unwrap();
+        if !kept_and_dated_back(dir.path(), &p) {
+            return;
+        }
+        let before = listings();
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("c", &["3".into()])])
+            .unwrap();
+        assert_eq!(listings() - before, 1);
+        assert_eq!(fs::read_to_string(&one).unwrap(), "b\t2\nc\t3\n");
+    }
+
+    #[test]
+    fn a_write_lists_the_parts_again_after_the_lock_where_the_directory_changed_just_now() {
+        // A timestamp this recent may not show a name made within the same tick.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let before = listings();
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("b", &["2".into()])])
+            .unwrap();
+        assert_eq!(listings() - before, 2);
+    }
+
+    #[test]
+    fn a_part_started_while_the_writer_waits_takes_the_write_in_a_kept_directory_too() {
+        // The directory was listed while its timestamp was old: the new part moves it, so the
+        // parts are listed again after the lock and the write goes to the new part (§17.7).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let one = dir.path().join("s.tsvz.1");
+        fs::write(&one, "b\t2\n").unwrap();
+        if !kept_and_dated_back(dir.path(), &p) {
+            return;
+        }
+        let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
+        let guard = lock::lock(&held, &one).unwrap();
+        let store = p.clone();
+        let writer = std::thread::spawn(move || {
+            Writer::open(&store)
+                .unwrap()
+                .append(&[Record::from_args("c", &["3".into()])])
+        });
+        until_waiting(&one);
+        fs::write(dir.path().join("s.tsvz.2"), "").unwrap();
+        drop(guard);
+        writer.join().unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&one).unwrap(), "b\t2\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.tsvz.2")).unwrap(),
+            "c\t3\n"
         );
     }
 

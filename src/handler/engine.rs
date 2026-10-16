@@ -164,6 +164,8 @@ impl Batcher {
     }
 
     fn run(&self) {
+        // What the batches learn of the store's directory, kept from one to the next.
+        let mut dirs = crate::parts::DirTrust::default();
         loop {
             let batch = {
                 let mut q = lock(&self.queue);
@@ -188,9 +190,10 @@ impl Batcher {
             }
             let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (&r[..], *n)).collect();
             let result = Writer::open(&self.store).and_then(|w| {
-                w.fsync(durable)
-                    .warnings(self.log.clone())
-                    .append_runs_at(&runs)
+                let mut w = w.fsync(durable).warnings(self.log.clone()).dirs(dirs);
+                let appended = w.append_runs_at(&runs);
+                dirs = w.dirs_known();
+                appended
             });
             let mut q = lock(&self.queue);
             q.written = last;

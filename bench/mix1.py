@@ -3,10 +3,13 @@
 
 Each repetition copies FIXTURE into a fresh directory under WORK, starts `TSVZ serve` on the
 copy, optionally sends tsvzbench's get, set and --sync set series first (--prelude), then times
-the 5000 mix requests. The implementations take turns, in reverse order every other repetition.
+the 5000 mix requests. tsvzbench's mix starts about 1 s after the handler wrote its pointer file
+into that directory: too recent for its timestamp to be trusted (2 s). --date-back dates the
+directory a minute back once the handler answers, as for a store nothing changed in for a while,
+without the idle CPU a --delay leaves before the timed requests. The implementations take turns, in reverse order every other repetition.
 Pin it to one CCD for steady numbers: `taskset -c 2-7 python3 bench/mix1.py ...`.
 
-    python3 bench/mix1.py --fixture F --work-dir W [--reps N] [--delay S] [--prelude] NAME=TSVZ...
+    python3 bench/mix1.py --fixture F --work-dir W [--reps N] [--delay S] [--date-back] [--prelude] NAME=TSVZ...
 
 FIXTURE is the 100k-row plain fixture tsvzbench generates (`fixtures/plain-100000-s1-g1/plain.tsvz`
 in its work directory). Uses tsvzbench's request and client helpers (--tsvzbench, default
@@ -74,6 +77,9 @@ def once(tb, args, tsvz, name, before, payloads):
                 sys.exit('%s: no handler answered' % name)
             time.sleep(0.005)
         time.sleep(args.delay)
+        if args.date_back:
+            long_ago = time.time() - 60
+            os.utime(run, (long_ago, long_ago))
         client = tb.Client(pointer[0])
         tb.client_loop(client, before)
         latencies, responses, _, _ = tb.client_loop(client, payloads)
@@ -94,6 +100,7 @@ def main():
     parser.add_argument('--work-dir', required=True)
     parser.add_argument('--reps', type=int, default=8)
     parser.add_argument('--delay', type=float, default=0.0, help='seconds between load and requests')
+    parser.add_argument('--date-back', action='store_true', help='date the directory a minute back')
     parser.add_argument('--prelude', action='store_true', help="send tsvzbench's earlier series first")
     parser.add_argument('--tsvzbench', default=os.path.join(HERE, '..', '..', 'TSVZ', 'tsvzbench.py'))
     parser.add_argument('impls', nargs='+', metavar='NAME=TSVZ')

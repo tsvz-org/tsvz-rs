@@ -91,13 +91,37 @@ left (1c8c2aa: one).
 
 A build of 0.1.2 without the second listing (not safe: measurement only) answers the `get` in
 11.3 µs with a fresh directory and 11.6 µs with one older than 2 s, against 13.3 and 14.1 µs
-for 0.1.2 and 11.3 and 11.5 µs for 1c8c2aa: that listing is the whole difference. A cheaper
-check would compare the directory stamp sampled for the first listing where the store trusts it
-(`parts::dir_times_trusted`), and list again elsewhere (mergerfs, network); not done here.
+for 0.1.2 and 11.3 and 11.5 µs for 1c8c2aa: that listing is the whole difference.
+
+### The fix (after 0.1.2)
+
+The writer now samples the store's directory just before its listing and, once it holds the
+lock, lists the parts again only where that sample cannot vouch for the listing. Where the
+directory keeps its timestamp (`parts::keeps_dir_times`: a local kernel file system), the same
+device, inode and timestamp, at least 2 s old when sampled, mean the same names, as the store's
+own checks already took them in 0.1.2; elsewhere (mergerfs, network) the parts are listed
+again, as before. The handler's writer thread asks the file system once (`parts::DirTrust`),
+not at every batch, and again only when another directory is at the path; and a timestamp seen
+too recent is not looked at again before it may be old enough, so a fresh directory costs no
+stat either.
+
+`--date-back` dates the directory a minute back once the handler answers: the state of a store
+nothing changed in for 2 s. Without it the directory is as tsvzbench leaves it, about 1 s after
+the handler wrote its pointer file there. The `get` after a `set`, p50, 12 pinned repetitions:
+
+| Directory | v0.1.0 | 1c8c2aa | v0.1.2 | fix |
+|---|---|---|---|---|
+| Unchanged for a while (`--date-back`) | 9.8 µs | 9.1 µs | 11.0 µs | **9.7 µs** |
+| Changed within 2 s (as tsvzbench runs it) | 12.0 µs | 11.2 µs | 13.2 µs | 13.3 µs |
+
+A handler serving a store whose parts have not changed for 2 s writes with one listing a batch
+again, as 0.1.0 did. tsvzbench's `socket mix ×1` row stays where 0.1.2 has it: there the
+directory is too new for its timestamp to show every change, so the parts are listed again, as
+they must be.
 
 ```bash
 taskset -c 2-7 python3 bench/mix1.py --fixture $B/work/fixtures/plain-100000-s1-g1/plain.tsvz \
-  --work-dir $B/mix v0.1.0=$B/tsvz-0.1.0 v0.1.2=$B/tsvz-0.1.2
+  --work-dir $B/mix --date-back v0.1.0=$B/tsvz-0.1.0 v0.1.2=$B/tsvz-0.1.2 fix=target/release/tsvz
 ```
 
 To build each commit for such a comparison from `git archive`, touch the extracted files: the
