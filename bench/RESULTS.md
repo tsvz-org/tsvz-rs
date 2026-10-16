@@ -1,19 +1,21 @@
 # tsvz-rs against TSVZ.py: tsvzbench results
 
-Date: 2026-10-14. A ratio (×) is tsvz-rs's time over TSVZ.py's: below 1 is faster. Both runs
-used the same fixtures (seed 1) on a warm page cache, with the work directory on f2fs. Both
-tools ran their own handler for the `cli via handler` and `socket` rows.
+Date: 2026-10-15. A ratio (×) is an implementation's time over TSVZ.py's: below 1 is faster.
+Each run measured TSVZ.py 4.8, tsvz-rs 0.1.2 and tsvz-rs 0.1.0 side by side, on the same fixtures
+(seed 1) on a warm page cache, with the work directory on f2fs; run 2 swapped the order of the
+two tsvz-rs builds. Each tool ran its own handler for the `cli via handler` and `socket` rows.
 
 ## Commands
 
 ```bash
-cargo build --release
-mkdir -p /mnt/gen5/tsvzbench-rs
-for run in 1 2; do
-  python3 ../TSVZ/tsvzbench.py --impl "py=python3 ../TSVZ/TSVZ.py" --impl "rs=target/release/tsvz" \
-    --suite standard --only cold,bulk,perop,maint --work-dir /mnt/gen5/tsvzbench-rs \
-    --json /mnt/gen5/tsvzbench-rs/run$run.json | tee /mnt/gen5/tsvzbench-rs/run$run.txt
-done
+B=/mnt/gen5/tsvzbench-rs; mkdir -p $B/src-0.1.0
+cargo build --release && cp target/release/tsvz $B/tsvz-0.1.2
+git archive v0.1.0 | tar -x -C $B/src-0.1.0
+(cd $B/src-0.1.0 && cargo build --release --locked) && cp $B/src-0.1.0/target/release/tsvz $B/tsvz-0.1.0
+python3 ../TSVZ/tsvzbench.py --impl "py=python3 ../TSVZ/TSVZ.py" \
+  --impl "rs012=$B/tsvz-0.1.2" --impl "rs010=$B/tsvz-0.1.0" \
+  --suite standard --only cold,bulk,perop,maint --work-dir $B/work --json $B/run1.json | tee $B/run1.txt
+# run 2: the same, with rs010 before rs012
 ```
 
 ## Machine and versions
@@ -21,173 +23,234 @@ done
 - CPU: AMD Ryzen 9 9950X3D 16-Core Processor
 - Kernel: 7.0.14-23-pve
 - File system of the work directory: f2fs
-- Python 3.13.5; TSVZ.py 4.8 @ 2026-10-14 by pan@zopyr.us; tsvz-rs 0.1.0 (branch `prerelease`, commit 6560e26)
+- Python 3.13.5; TSVZ.py 4.8 @ 2026-10-14 by pan@zopyr.us; tsvz-rs 0.1.2 (`main`, commit
+  0b3d729) and 0.1.0 (tag `v0.1.0`, commit b4319f9); tsvzbench 1.0
 
 ## Summary
 
-tsvz-rs is faster than TSVZ.py on every cold, bulk, per-op and maint workload, in both runs, with
-one tie: `socket --sync set`, where each request waits for its own `fdatasync`, takes the
-device's flush latency in both tools (712-718 µs at p50).
+tsvz-rs 0.1.2 is faster than TSVZ.py on every cold, bulk, per-op and maint workload in both runs,
+with two exceptions: `socket --sync set`, where each request waits for its own `fdatasync`
+(705-714 µs at p50 in both tools), and `socket set` in run 2 (below).
 
-- **cold** (one-shot reads (read, len, get, verify) of 10k-1M-row stores, plain, escaped, with markers, checksums, gzip and multi-part): median ratio ×0.13 in both runs; every workload between ×0.02 and ×0.32.
-- **bulk** (set - and delete - batches of 10k-1M records): median ratio ×0.11 in both runs; every workload between ×0.04 and ×0.28.
-- **perop** (single set and get commands, the same through each tool's handler, and requests straight to the handler socket, alone and from 4 and 16 clients): median ratio ×0.30 and ×0.29; every workload between ×0.02 and ×0.91, except `socket --sync set` at ×1.00 (see above). A command through the handler takes 0.6-0.7 ms against 42 ms; the handler answers a `get` in 7 µs against 19 µs, and 16 clients mixing requests get 102k requests/s against 21-24k.
-- **maint** (scrub and clear): median ratio ×0.26 in both runs; every workload between ×0.23 and ×0.33.
+- **cold** (one-shot reads (read, len, get, verify) of 10k-1M-row stores, plain, escaped, with
+  markers, checksums, gzip and multi-part): ×0.11 (geometric mean) in both runs; median ×0.18;
+  every workload between ×0.02 (startup, 0.7 ms against 38.5 ms) and ×0.35 (`read 1M`, 0.78 s
+  against 2.23 s). A `get` from a 1M-row store takes 57-59 ms against 1.53-1.59 s.
+- **bulk** (set - and delete - batches of 10k-1M records): ×0.10 and ×0.09; every workload
+  between ×0.03 and ×0.29. A million new records take 0.50-0.52 s against 2.15 s.
+- **perop** (single set and get commands, the same through each tool's handler, and requests
+  straight to the handler socket, alone and from 4 and 16 clients): ×0.12 and ×0.13; every
+  workload but the two socket set rows between ×0.02 and ×0.36. A command takes 0.6-0.7 ms
+  against 39-42 ms; the handler answers a `get` in 7 µs against 19 µs, and 16 clients mixing
+  requests get 108-110k requests/s against 21-32k.
+- **maint** (scrub and clear): ×0.27 in both runs; every workload between ×0.23 and ×0.33.
+  `scrub multipart 100k` has no ratio: TSVZ.py refuses to scrub a multi-part store. This
+  fixture's last two ordinals are consecutive, so tsvz-rs compacts the parts before the active
+  one into the last of them, in place; under the default `#_rotate_# keep` the earlier parts
+  stay, and the store grows from 7.2 to 13.5 MiB.
+- **footprint**: 372 bytes per row read against 896 (203 against 600 for `len`); the handler
+  loads a 100k-row store in 36 ms against 174 ms, holding 37 MiB against 92 MiB.
 
-`socket set` is the narrowest margin (×0.91 and ×0.82; 9 µs at p50 against 10-11 µs). Before each
-write the handler now checks that no other writer changed the store since it last read it, so
-that `#_write_ack_#` and `#_member_size_#` are decided on the markers in force (it was ×0.41 when
-it decided on the markers as of the last read). The 16-client mix also gets less than on
-2026-10-13 (102k against 131-136k requests/s); measured alone, that check took it from 131k to
-115k.
+`socket set` came out ×0.78 in run 1 and ×1.01 in run 2. Within a run, the p50 of each of its
+five repetitions lands near 7.3 µs or at 9.1-10.3 µs for tsvz-rs, and at 9.2-9.8 µs or near
+13 µs for TSVZ.py, whatever the build or its order: run 2 caught TSVZ.py in its fast mode in
+every repetition. Read it as roughly even.
 
-`scrub multipart 100k` has no ratio: TSVZ.py refuses to scrub a multi-part store. tsvz-rs
-writes a new snapshot part when an ordinal is free before the active part; this fixture's last
-two ordinals are consecutive (`…5062`, active `…5063`), so it compacts the parts before the
-active one into the last of them, in place. Under the default `#_rotate_# keep` the earlier
-parts stay, so the store grows (7.2 MiB → 13.5 MiB); `#_rotate_# rename` or `delete` moves them
-out of the store.
+0.1.0 and 0.1.2 have the same family means within 0.01 in both runs: the correctness work of
+0.1.1 and 0.1.2 cost nothing measurable, but for one workload, `socket mix ×1`.
 
-The handler loads a 100k-row store in 36 ms against 175-182 ms, holding 37 MiB against 92 MiB.
+## `socket mix ×1`: 2 µs slower since 05618e0
+
+One client sends `set k`, then `get k`, over its own keys. In both runs (and a third, per-op
+only) 0.1.2 took 16-17 µs at p50 against 13-14 µs for 0.1.0, while 4 and 16 clients were a
+little faster on 0.1.2 (145 µs against 152-158 µs at ×16).
+
+`bench/mix1.py` runs that workload alone. Pinned to one CCD (`taskset -c 2-7`), its repetitions
+agree to a few tenths of a µs, so every commit from 0.1.0 to 0.1.2 was built and timed with
+it (8 repetitions each, interleaved). The time of the `get` after a `set`:
+
+| Build | `get` after `set`, p50 | Step |
+|---|---|---|
+| v0.1.0 | 12.0 µs | |
+| 69b60e2 (classic lock not lost to a close, write5) | 12.6 µs | +0.5 |
+| c836b2d (one lock table per inode) | 11.7 µs | −0.9 |
+| 64405fa (a store follows its last part through one kept descriptor) | 10.9 µs | −0.8 |
+| 1c8c2aa | 11.2 µs | |
+| **05618e0** (a waiting write goes to the store's active part) | **13.2 µs** | **+2.0** |
+| v0.1.2 (0b3d729) | 13.2 µs | |
+
+The `set` stays at about 7 µs throughout (6.9-7.4): the handler answers it once queued (`#_write_ack_#`
+memory), and a read first waits for queued writes (`Engine::fresh`, `Batcher::barrier`), so the
+`get` that follows pays for writing the `set`. Since 05618e0, `Writer::append_runs_at` lists the
+store's directory to choose its part and lists it again once it holds the lock, to check that no
+part was started meanwhile (§17.7); before, it listed once. Counted with `strace -f -c` over
+2500 set/get pairs, that is one more listing (`openat`, `fstat`, two `getdents64`, `close`) and
+two more `statx` a pair: 4 listings instead of 3. When the directory is older than 2 s, the
+store's own checks trust its timestamp (0.1.2), and the writer's two listings are all that is
+left (1c8c2aa: one).
+
+A build of 0.1.2 without the second listing (not safe: measurement only) answers the `get` in
+11.3 µs with a fresh directory and 11.6 µs with one older than 2 s, against 13.3 and 14.1 µs
+for 0.1.2 and 11.3 and 11.5 µs for 1c8c2aa: that listing is the whole difference. A cheaper
+check would compare the directory stamp sampled for the first listing where the store trusts it
+(`parts::dir_times_trusted`), and list again elsewhere (mergerfs, network); not done here.
+
+```bash
+taskset -c 2-7 python3 bench/mix1.py --fixture $B/work/fixtures/plain-100000-s1-g1/plain.tsvz \
+  --work-dir $B/mix v0.1.0=$B/tsvz-0.1.0 v0.1.2=$B/tsvz-0.1.2
+```
+
+To build each commit for such a comparison from `git archive`, touch the extracted files: the
+archive keeps commit times, and cargo skips a rebuild it believes is fresh.
+
+## Run to run on this machine
+
+Against the 2026-10-14 results, `len 1M` went from 233-243 ms to 332-334 ms, `read 1M` from
+697-728 ms to 777-783 ms, and the handler's peak RSS from 45 to 71 MiB, in both builds. Commit
+6560e26, the one measured then, rebuilt and run alongside gives today's numbers (`len 1M`: median
+336 ms, single runs down to 219 ms): the machine, not the code. Compare builds within one run,
+not against an earlier file; pin (`taskset`) when µs differences matter.
 
 ## Run 1
 
 ```
-tsvzbench: probing py
-tsvzbench: probing rs
-tsvzbench 1.0  2026-10-14T17:52:32-0700  suite standard  seed 1
+tsvzbench 1.0  2026-10-15T22:33:22-0700  suite standard  seed 1
 host ksxx  cpu AMD Ryzen 9 9950X3D 16-Core Processor ×32  Linux 7.0.14-23-pve  python 3.13.5  fs f2fs  warm page cache
-  py           python3 /mnt/klein/work/cas/TSVZ/TSVZ.py  [TSVZ.py 4.8 @ 2026-10-14 by pan@zopyr.us]  handler: yes  startup 38.3 ms
-  rs           /mnt/gen5/tsvzbench-rs/tsvz-release-candidate  [tsvz-rs 0.1.0]  handler: yes  startup 880 µs
+  py           python3 /mnt/klein/work/cas/TSVZ/TSVZ.py  [TSVZ.py 4.8 @ 2026-10-14 by pan@zopyr.us]  handler: yes  startup 38.5 ms
+  rs012        /mnt/gen5/tsvzbench-rs/tsvz-0.1.2  [tsvz-rs 0.1.2]  handler: yes  startup 698 µs
+  rs010        /mnt/gen5/tsvzbench-rs/tsvz-0.1.0  [tsvz-rs 0.1.0]  handler: yes  startup 610 µs
 
 [cold]
-workload             | py wall  | ±  | net      | cpu      | rss       | ok | rs wall  | ±   | net      | cpu      | rss       | ok | ×
----------------------+----------+----+----------+----------+-----------+----+----------+-----+----------+----------+-----------+----+------
-startup              | 38.3 ms  | 1% |          | 37.4 ms  | 34.2 MiB  | ✓  | 880 µs   | 17% |          | 614 µs   | ≤8.8 MiB  | ✓  | ×0.02
-read 10k             | 56.8 ms  | 0% | 18.5 ms  | 55.9 ms  | 41.5 MiB  | ✓  | 5.9 ms   | 3%  | 5.0 ms   | 5.6 ms   | ≤8.8 MiB  | ✓  | ×0.10
-len 10k              | 51.1 ms  | 1% | 12.9 ms  | 50.4 ms  | 38.8 MiB  | ✓  | 2.5 ms   | 6%  | 1.6 ms   | 2.2 ms   | ≤8.8 MiB  | ✓  | ×0.05
-get 10k              | 50.6 ms  | 0% | 12.4 ms  | 49.7 ms  | 38.8 MiB  | ✓  | 1.6 ms   | 6%  | 762 µs   | 1.4 ms   | ≤8.8 MiB  | ✓  | ×0.03
-read 100k            | 231.8 ms | 1% | 193.6 ms | 230.7 ms | 119.0 MiB | ✓  | 51.3 ms  | 1%  | 50.4 ms  | 51.0 ms  | 37.2 MiB  | ✓  | ×0.22
-len 100k             | 178.3 ms | 1% | 140.0 ms | 177.3 ms | 95.5 MiB  | ✓  | 14.9 ms  | 0%  | 14.0 ms  | 14.7 ms  | 19.5 MiB  | ✓  | ×0.08
-get 100k             | 167.8 ms | 0% | 129.5 ms | 166.9 ms | 89.4 MiB  | ✓  | 7.0 ms   | 0%  | 6.1 ms   | 6.7 ms   | ≤8.8 MiB  | ✓  | ×0.04
-read 1M              | 2.25 s   | 1% | 2.21 s   | 2.25 s   | 886.8 MiB | ✓  | 727.9 ms | 3%  | 727.1 ms | 727.5 ms | 358.9 MiB | ✓  | ×0.32
-len 1M               | 1.83 s   | 1% | 1.79 s   | 1.83 s   | 605.9 MiB | ✓  | 243.4 ms | 6%  | 242.6 ms | 243.0 ms | 197.4 MiB | ✓  | ×0.13
-get 1M               | 1.60 s   | 0% | 1.57 s   | 1.60 s   | 555.8 MiB | ✓  | 58.2 ms  | 2%  | 57.3 ms  | 57.7 ms  | ≤8.8 MiB  | ✓  | ×0.04
-read churn 100k      | 663.7 ms | 0% | 625.5 ms | 662.5 ms | 157.5 MiB | ✓  | 187.7 ms | 7%  | 186.8 ms | 187.1 ms | 60.1 MiB  | ✓  | ×0.28
-read escaped 100k    | 305.1 ms | 0% | 266.8 ms | 303.8 ms | 155.5 MiB | ✓  | 66.1 ms  | 3%  | 65.3 ms  | 65.7 ms  | 38.0 MiB  | ✓  | ×0.22
-read markers 100k    | 249.3 ms | 1% | 211.1 ms | 248.2 ms | 106.8 MiB | ✓  | 45.3 ms  | 1%  | 44.4 ms  | 44.6 ms  | 29.7 MiB  | ✓  | ×0.18
-read checksum 100k   | 265.2 ms | 1% | 227.0 ms | 263.9 ms | 119.2 MiB | ✓  | 52.7 ms  | 1%  | 51.8 ms  | 52.2 ms  | 37.4 MiB  | ✓  | ×0.20
-read gz 100k         | 252.7 ms | 1% | 214.4 ms | 251.4 ms | 119.4 MiB | ✓  | 69.6 ms  | 1%  | 68.7 ms  | 69.0 ms  | 56.9 MiB  | ✓  | ×0.28
-read multipart 100k  | 235.4 ms | 1% | 197.1 ms | 234.1 ms | 118.9 MiB | ✓  | 56.8 ms  | 2%  | 55.9 ms  | 56.2 ms  | 38.0 MiB  | ✓  | ×0.24
-verify checksum 100k | 170.5 ms | 1% | 132.2 ms | 169.5 ms | 38.7 MiB  | ✓  | 20.3 ms  | 3%  | 19.4 ms  | 19.7 ms  | 19.5 MiB  | ✓  | ×0.12
+workload             | py wall  | ±  | net      | cpu      | rss       | ok | rs012 wall | ±   | net      | cpu      | rss       | ok | ×     | rs010 wall | ±   | net      | cpu      | rss       | ok | ×
+---------------------+----------+----+----------+----------+-----------+----+------------+-----+----------+----------+-----------+----+-------+------------+-----+----------+----------+-----------+----+------
+startup              | 38.5 ms  | 2% |          | 37.5 ms  | 34.9 MiB  | ✓  | 698 µs     | 9%  |          | 453 µs   | ≤8.8 MiB  | ✓  | ×0.02 | 610 µs     | 5%  |          | 368 µs   | ≤8.8 MiB  | ✓  | ×0.02
+read 10k             | 56.1 ms  | 0% | 17.6 ms  | 55.3 ms  | 41.2 MiB  | ✓  | 6.0 ms     | 1%  | 5.3 ms   | 5.7 ms   | ≤8.8 MiB  | ✓  | ×0.11 | 5.8 ms     | 0%  | 5.2 ms   | 5.6 ms   | ≤8.8 MiB  | ✓  | ×0.10
+len 10k              | 51.3 ms  | 1% | 12.8 ms  | 50.5 ms  | 39.4 MiB  | ✓  | 2.1 ms     | 6%  | 1.4 ms   | 1.9 ms   | ≤8.8 MiB  | ✓  | ×0.04 | 2.2 ms     | 5%  | 1.6 ms   | 2.0 ms   | ≤8.8 MiB  | ✓  | ×0.04
+get 10k              | 50.2 ms  | 0% | 11.7 ms  | 49.4 ms  | 38.6 MiB  | ✓  | 1.8 ms     | 13% | 1.1 ms   | 1.5 ms   | ≤8.8 MiB  | ✓  | ×0.04 | 1.6 ms     | 11% | 986 µs   | 1.2 ms   | ≤8.8 MiB  | ✓  | ×0.03
+read 100k            | 228.1 ms | 0% | 189.6 ms | 226.8 ms | 119.0 MiB | ✓  | 52.8 ms    | 1%  | 52.2 ms  | 52.3 ms  | 37.3 MiB  | ✓  | ×0.23 | 53.3 ms    | 0%  | 52.7 ms  | 52.7 ms  | 37.2 MiB  | ✓  | ×0.23
+len 100k             | 181.3 ms | 0% | 142.8 ms | 180.3 ms | 95.7 MiB  | ✓  | 14.5 ms    | 3%  | 13.9 ms  | 14.2 ms  | 19.8 MiB  | ✓  | ×0.08 | 14.4 ms    | 1%  | 13.8 ms  | 14.1 ms  | 19.6 MiB  | ✓  | ×0.08
+get 100k             | 165.2 ms | 0% | 126.7 ms | 164.0 ms | 89.3 MiB  | ✓  | 6.9 ms     | 3%  | 6.2 ms   | 6.6 ms   | ≤8.8 MiB  | ✓  | ×0.04 | 7.1 ms     | 6%  | 6.5 ms   | 6.7 ms   | ≤8.8 MiB  | ✓  | ×0.04
+read 1M              | 2.23 s   | 0% | 2.19 s   | 2.23 s   | 887.3 MiB | ✓  | 777.1 ms   | 1%  | 776.4 ms | 776.5 ms | 359.2 MiB | ✓  | ×0.35 | 783.8 ms   | 1%  | 783.2 ms | 783.3 ms | 359.3 MiB | ✓  | ×0.35
+len 1M               | 1.83 s   | 1% | 1.79 s   | 1.83 s   | 605.9 MiB | ✓  | 334.4 ms   | 1%  | 333.7 ms | 333.8 ms | 197.8 MiB | ✓  | ×0.18 | 332.0 ms   | 1%  | 331.4 ms | 331.4 ms | 197.5 MiB | ✓  | ×0.18
+get 1M               | 1.53 s   | 0% | 1.49 s   | 1.53 s   | 556.0 MiB | ✓  | 56.6 ms    | 0%  | 55.9 ms  | 56.1 ms  | ≤8.8 MiB  | ✓  | ×0.04 | 58.6 ms    | 1%  | 58.0 ms  | 58.2 ms  | ≤8.8 MiB  | ✓  | ×0.04
+read churn 100k      | 648.9 ms | 0% | 610.4 ms | 647.5 ms | 157.6 MiB | ✓  | 185.0 ms   | 4%  | 184.3 ms | 184.4 ms | 60.2 MiB  | ✓  | ×0.29 | 186.2 ms   | 1%  | 185.6 ms | 185.5 ms | 60.2 MiB  | ✓  | ×0.29
+read escaped 100k    | 297.6 ms | 0% | 259.1 ms | 296.4 ms | 155.6 MiB | ✓  | 64.6 ms    | 2%  | 64.0 ms  | 64.1 ms  | 37.8 MiB  | ✓  | ×0.22 | 65.9 ms    | 0%  | 65.3 ms  | 65.4 ms  | 38.0 MiB  | ✓  | ×0.22
+read markers 100k    | 243.4 ms | 0% | 204.9 ms | 242.5 ms | 106.8 MiB | ✓  | 44.1 ms    | 1%  | 43.4 ms  | 43.8 ms  | 29.7 MiB  | ✓  | ×0.18 | 44.3 ms    | 1%  | 43.6 ms  | 43.7 ms  | 29.7 MiB  | ✓  | ×0.18
+read checksum 100k   | 260.8 ms | 1% | 222.2 ms | 259.7 ms | 118.9 MiB | ✓  | 52.4 ms    | 0%  | 51.7 ms  | 51.8 ms  | 37.3 MiB  | ✓  | ×0.20 | 54.2 ms    | 1%  | 53.6 ms  | 53.8 ms  | 37.3 MiB  | ✓  | ×0.21
+read gz 100k         | 246.4 ms | 0% | 207.9 ms | 245.1 ms | 119.6 MiB | ✓  | 67.8 ms    | 1%  | 67.1 ms  | 67.2 ms  | 57.2 MiB  | ✓  | ×0.28 | 68.1 ms    | 1%  | 67.5 ms  | 67.5 ms  | 56.7 MiB  | ✓  | ×0.28
+read multipart 100k  | 226.8 ms | 1% | 188.3 ms | 225.3 ms | 118.7 MiB | ✓  | 54.6 ms    | 2%  | 53.9 ms  | 54.0 ms  | 38.4 MiB  | ✓  | ×0.24 | 54.5 ms    | 1%  | 53.9 ms  | 53.9 ms  | 38.3 MiB  | ✓  | ×0.24
+verify checksum 100k | 170.1 ms | 1% | 131.6 ms | 168.9 ms | 38.2 MiB  | ✓  | 20.1 ms    | 2%  | 19.4 ms  | 19.8 ms  | 19.7 MiB  | ✓  | ×0.12 | 20.6 ms    | 1%  | 20.0 ms  | 20.3 ms  | 19.5 MiB  | ✓  | ×0.12
 
 [bulk]
-workload       | py wall  | ±  | net      | cpu      | rss       | disk      | ok | rs wall  | ±   | net      | cpu      | rss       | disk      | ok | ×
----------------+----------+----+----------+----------+-----------+-----------+----+----------+-----+----------+----------+-----------+-----------+----+------
-set - new 10k  | 53.8 ms  | 1% | 15.6 ms  | 52.7 ms  | 40.5 MiB  | 737.6 KiB | ✓  | 6.0 ms   | 6%  | 5.1 ms   | 5.7 ms   | ≤8.8 MiB  | 737.6 KiB | ✓  | ×0.11
-set - new 100k | 189.0 ms | 1% | 150.8 ms | 187.8 ms | 101.1 MiB | 7.2 MiB   | ✓  | 53.2 ms  | 2%  | 52.3 ms  | 52.7 ms  | 60.1 MiB  | 7.2 MiB   | ✓  | ×0.28
-set - new 1M   | 2.17 s   | 1% | 2.13 s   | 2.17 s   | 719.7 MiB | 72.0 MiB  | ✓  | 511.3 ms | 0%  | 510.5 ms | 510.7 ms | 580.9 MiB | 72.0 MiB  | ✓  | ×0.24
-set - add 100k | 41.0 ms  | 0% | 2.7 ms   | 40.1 ms  | 34.8 MiB  | 7.3 MiB   | ✓  | 1.5 ms   | 17% | 612 µs   | 1.3 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.04
-delete - 100k  | 46.5 ms  | 1% | 8.2 ms   | 45.4 ms  | 36.0 MiB  | 7.3 MiB   | ✓  | 1.8 ms   | 8%  | 881 µs   | 1.4 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.04
+workload       | py wall  | ±  | net      | cpu      | rss       | disk      | ok | rs012 wall | ±  | net      | cpu      | rss       | disk      | ok | ×     | rs010 wall | ±   | net      | cpu      | rss       | disk      | ok | ×
+---------------+----------+----+----------+----------+-----------+-----------+----+------------+----+----------+----------+-----------+-----------+----+-------+------------+-----+----------+----------+-----------+-----------+----+------
+set - new 10k  | 53.1 ms  | 1% | 14.5 ms  | 52.1 ms  | 40.6 MiB  | 737.6 KiB | ✓  | 6.0 ms     | 1% | 5.3 ms   | 5.7 ms   | ≤8.8 MiB  | 737.6 KiB | ✓  | ×0.11 | 6.1 ms     | 2%  | 5.5 ms   | 5.9 ms   | ≤8.8 MiB  | 737.6 KiB | ✓  | ×0.12
+set - new 100k | 186.6 ms | 1% | 148.1 ms | 185.4 ms | 101.0 MiB | 7.2 MiB   | ✓  | 53.6 ms    | 1% | 52.9 ms  | 53.2 ms  | 60.5 MiB  | 7.2 MiB   | ✓  | ×0.29 | 53.6 ms    | 2%  | 53.0 ms  | 53.1 ms  | 60.1 MiB  | 7.2 MiB   | ✓  | ×0.29
+set - new 1M   | 2.15 s   | 1% | 2.11 s   | 2.15 s   | 719.9 MiB | 72.0 MiB  | ✓  | 521.1 ms   | 1% | 520.4 ms | 520.6 ms | 581.2 MiB | 72.0 MiB  | ✓  | ×0.24 | 508.9 ms   | 1%  | 508.3 ms | 508.3 ms | 581.2 MiB | 72.0 MiB  | ✓  | ×0.24
+set - add 100k | 40.7 ms  | 1% | 2.1 ms   | 39.9 ms  | 35.2 MiB  | 7.3 MiB   | ✓  | 1.3 ms     | 7% | 553 µs   | 993 µs   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.03 | 1.2 ms     | 0%  | 547 µs   | 932 µs   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.03
+delete - 100k  | 45.2 ms  | 1% | 6.6 ms   | 44.4 ms  | 36.3 MiB  | 7.3 MiB   | ✓  | 1.7 ms     | 2% | 1.0 ms   | 1.3 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.04 | 1.7 ms     | 12% | 1.0 ms   | 1.4 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.04
 
 [perop]
-workload            | py p50   | p95      | p99      | ops/s   | rss      | ok | rs p50 | p95    | p99    | ops/s    | rss      | ok | ×     | ceiling ops/s
---------------------+----------+----------+----------+---------+----------+----+--------+--------+--------+----------+----------+----+-------+--------------
-cli set             | 39.8 ms  | 41.6 ms  | 43.9 ms  | 25/s    | 34.8 MiB | ✓  | 622 µs | 924 µs | 1.1 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 |
-cli get             | 169.3 ms | 171.7 ms | 173.7 ms | 6/s     | 89.5 MiB | ✓  | 6.6 ms | 7.2 ms | 7.4 ms | 149/s    | ≤8.8 MiB | ✓  | ×0.04 |
-cli via handler set | 41.6 ms  | 43.5 ms  | 44.0 ms  | 24/s    | 35.0 MiB | ✓  | 695 µs | 1.1 ms | 1.3 ms | 1.3k/s   | ≤8.8 MiB | ✓  | ×0.02 |
-cli via handler get | 41.7 ms  | 43.5 ms  | 45.4 ms  | 24/s    | 35.0 MiB | ✓  | 641 µs | 934 µs | 1.1 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 |
-socket get          | 19 µs    | 21 µs    | 27 µs    | 50.3k/s |          | ✓  | 7 µs   | 9 µs   | 12 µs  | 138.0k/s |          | ✓  | ×0.36 | 288.1k/s
-socket set          | 11 µs    | 22 µs    | 28 µs    | 68.5k/s |          | ✓  | 9 µs   | 14 µs  | 31 µs  | 95.4k/s  |          | ✓  | ×0.82 | 233.8k/s
-socket --sync set   | 718 µs   | 787 µs   | 968 µs   | 1.3k/s  |          | ✓  | 718 µs | 783 µs | 913 µs | 1.4k/s   |          | ✓  | ×1.00 | 244.0k/s
-socket mix ×1       | 46 µs    | 81 µs    | 91 µs    | 27.0k/s |          | ✓  | 15 µs  | 21 µs  | 27 µs  | 71.4k/s  |          | ✓  | ×0.33 | 239.7k/s
-socket mix ×4       | 125 µs   | 239 µs   | 464 µs   | 30.5k/s |          | ✓  | 37 µs  | 68 µs  | 86 µs  | 108.7k/s |          | ✓  | ×0.30 | 933.2k/s
-socket mix ×16      | 521 µs   | 1.4 ms   | 2.1 ms   | 23.6k/s |          | ✓  | 158 µs | 340 µs | 554 µs | 101.8k/s |          | ✓  | ×0.30 | 1.81M/s
+workload            | py p50   | p95      | p99      | ops/s   | rss      | ok | rs012 p50 | p95    | p99    | ops/s    | rss      | ok | ×     | rs010 p50 | p95    | p99    | ops/s    | rss      | ok | ×     | ceiling ops/s
+--------------------+----------+----------+----------+---------+----------+----+-----------+--------+--------+----------+----------+----+-------+-----------+--------+--------+----------+----------+----+-------+--------------
+cli set             | 39.2 ms  | 40.4 ms  | 40.8 ms  | 26/s    | 34.8 MiB | ✓  | 606 µs    | 950 µs | 1.2 ms | 1.6k/s   | ≤8.8 MiB | ✓  | ×0.02 | 602 µs    | 843 µs | 1.1 ms | 1.6k/s   | ≤8.8 MiB | ✓  | ×0.02 |
+cli get             | 166.6 ms | 169.9 ms | 175.8 ms | 6/s     | 89.5 MiB | ✓  | 6.4 ms    | 6.9 ms | 7.1 ms | 157/s    | ≤8.8 MiB | ✓  | ×0.04 | 6.7 ms    | 7.3 ms | 8.0 ms | 148/s    | ≤8.8 MiB | ✓  | ×0.04 |
+cli via handler set | 41.6 ms  | 43.1 ms  | 44.9 ms  | 24/s    | 34.8 MiB | ✓  | 668 µs    | 1.1 ms | 1.2 ms | 1.4k/s   | ≤8.8 MiB | ✓  | ×0.02 | 667 µs    | 1.0 ms | 1.2 ms | 1.4k/s   | ≤8.8 MiB | ✓  | ×0.02 |
+cli via handler get | 41.7 ms  | 42.8 ms  | 43.5 ms  | 24/s    | 34.8 MiB | ✓  | 626 µs    | 968 µs | 1.1 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 | 629 µs    | 1.0 ms | 1.1 ms | 1.4k/s   | ≤8.8 MiB | ✓  | ×0.02 |
+socket get          | 19 µs    | 21 µs    | 27 µs    | 51.0k/s |          | ✓  | 7 µs      | 9 µs   | 12 µs  | 136.7k/s |          | ✓  | ×0.36 | 7 µs      | 9 µs   | 12 µs  | 134.3k/s |          | ✓  | ×0.37 | 290.6k/s
+socket set          | 12 µs    | 23 µs    | 29 µs    | 67.9k/s |          | ✓  | 9 µs      | 13 µs  | 19 µs  | 71.1k/s  |          | ✓  | ×0.78 | 9 µs      | 13 µs  | 24 µs  | 69.7k/s  |          | ✓  | ×0.77 | 267.3k/s
+socket --sync set   | 714 µs   | 781 µs   | 912 µs   | 1.4k/s  |          | ✓  | 714 µs    | 782 µs | 952 µs | 1.4k/s   |          | ✓  | ×1.00 | 714 µs    | 954 µs | 1.4 ms | 1.4k/s   |          | ✓  | ×1.00 | 248.8k/s
+socket mix ×1       | 50 µs    | 93 µs    | 106 µs   | 19.1k/s |          | ✓  | 17 µs     | 24 µs  | 30 µs  | 59.1k/s  |          | ✓  | ×0.33 | 14 µs     | 21 µs  | 26 µs  | 74.6k/s  |          | ✓  | ×0.28 | 255.3k/s
+socket mix ×4       | 138 µs   | 293 µs   | 497 µs   | 25.2k/s |          | ✓  | 35 µs     | 64 µs  | 82 µs  | 110.6k/s |          | ✓  | ×0.25 | 38 µs     | 67 µs  | 87 µs  | 102.3k/s |          | ✓  | ×0.28 | 898.3k/s
+socket mix ×16      | 574 µs   | 1.5 ms   | 2.3 ms   | 20.7k/s |          | ✓  | 145 µs    | 309 µs | 462 µs | 107.7k/s |          | ✓  | ×0.25 | 158 µs    | 334 µs | 505 µs | 103.4k/s |          | ✓  | ×0.27 | 1.84M/s
 
 [maint]
-workload             | py wall  | ±  | net      | cpu      | rss       | disk             | ok      | rs wall  | ±   | net      | cpu      | rss       | disk             | ok | ×
----------------------+----------+----+----------+----------+-----------+------------------+---------+----------+-----+----------+----------+-----------+------------------+----+------
-scrub churn 100k     | 717.6 ms | 1% | 679.3 ms | 713.3 ms | 170.4 MiB | 24.0 MiB→7.2 MiB | ✓       | 195.5 ms | 11% | 194.6 ms | 190.4 ms | 106.7 MiB | 24.0 MiB→7.2 MiB | ✓  | ×0.27
-scrub markers 100k   | 273.0 ms | 0% | 234.7 ms | 267.8 ms | 106.9 MiB | 4.4 MiB→7.4 MiB  | ✓       | 70.3 ms  | 1%  | 69.5 ms  | 67.3 ms  | 68.7 MiB  | 4.4 MiB→7.4 MiB  | ✓  | ×0.26
-clear 100k           | 173.5 ms | 0% | 135.2 ms | 169.4 ms | 93.1 MiB  | 7.2 MiB→20 B     | ✓       | 39.8 ms  | 0%  | 38.9 ms  | 37.9 ms  | 43.3 MiB  | 7.2 MiB→20 B     | ✓  | ×0.23
-scrub multipart 100k | 168.2 ms | 0% | 129.9 ms | 167.1 ms | 87.2 MiB  | 7.2 MiB→7.2 MiB  | refused | 250.8 ms | 0%  | 249.9 ms | 244.4 ms | 157.0 MiB | 7.2 MiB→13.5 MiB | ✓  | —
+workload             | py wall  | ±  | net      | cpu      | rss       | disk             | ok      | rs012 wall | ±  | net      | cpu      | rss       | disk             | ok | ×     | rs010 wall | ±  | net      | cpu      | rss       | disk             | ok | ×
+---------------------+----------+----+----------+----------+-----------+------------------+---------+------------+----+----------+----------+-----------+------------------+----+-------+------------+----+----------+----------+-----------+------------------+----+------
+scrub churn 100k     | 706.5 ms | 3% | 667.9 ms | 702.0 ms | 170.8 MiB | 24.0 MiB→7.2 MiB | ✓       | 231.0 ms   | 4% | 230.3 ms | 226.2 ms | 106.7 MiB | 24.0 MiB→7.2 MiB | ✓  | ×0.33 | 233.0 ms   | 1% | 232.4 ms | 228.3 ms | 106.5 MiB | 24.0 MiB→7.2 MiB | ✓  | ×0.33
+scrub markers 100k   | 266.0 ms | 1% | 227.5 ms | 261.8 ms | 107.1 MiB | 4.4 MiB→7.4 MiB  | ✓       | 68.8 ms    | 2% | 68.1 ms  | 65.7 ms  | 68.7 MiB  | 4.4 MiB→7.4 MiB  | ✓  | ×0.26 | 70.1 ms    | 3% | 69.5 ms  | 66.6 ms  | 68.6 MiB  | 4.4 MiB→7.4 MiB  | ✓  | ×0.26
+clear 100k           | 171.0 ms | 1% | 132.4 ms | 166.6 ms | 93.3 MiB  | 7.2 MiB→20 B     | ✓       | 40.9 ms    | 3% | 40.2 ms  | 38.9 ms  | 43.5 MiB  | 7.2 MiB→20 B     | ✓  | ×0.24 | 39.5 ms    | 0% | 38.8 ms  | 37.2 ms  | 43.3 MiB  | 7.2 MiB→20 B     | ✓  | ×0.23
+scrub multipart 100k | 165.4 ms | 1% | 126.8 ms | 163.9 ms | 87.1 MiB  | 7.2 MiB→7.2 MiB  | refused | 234.8 ms   | 1% | 234.1 ms | 229.1 ms | 157.1 MiB | 7.2 MiB→13.5 MiB | ✓  | —     | 237.5 ms   | 1% | 236.9 ms | 231.8 ms | 157.3 MiB | 7.2 MiB→13.5 MiB | ✓  | —
 
 [footprint]
-  py           memory/row (read) 895 B; memory/row (len) 601 B; disk/record 75 B; handler load 175.0 ms, rss after load 92.3 MiB, peak rss 96.3 MiB, cpu 5.54 s
-  rs           memory/row (read) 372 B; memory/row (len) 203 B; disk/record 75 B; handler load 35.9 ms, rss after load 36.9 MiB, peak rss 44.8 MiB, cpu 1.91 s
+  py           memory/row (read) 896 B; memory/row (len) 600 B; disk/record 75 B; handler load 173.8 ms, rss after load 92.4 MiB, peak rss 96.3 MiB, cpu 6.30 s
+  rs012        memory/row (read) 372 B; memory/row (len) 203 B; disk/record 75 B; handler load 35.8 ms, rss after load 36.8 MiB, peak rss 70.6 MiB, cpu 1.89 s
+  rs010        memory/row (read) 373 B; memory/row (len) 203 B; disk/record 75 B; handler load 40.9 ms, rss after load 36.8 MiB, peak rss 71.0 MiB, cpu 1.96 s
 
 [summary] ratio = time against py, geometric mean per family (lower is faster)
   py           cold ×1.00  bulk ×1.00  perop ×1.00  maint ×1.00   ✗ 0  ! 0  ⏱ 0
-  rs           cold ×0.11  bulk ×0.10  perop ×0.13  maint ×0.25   ✗ 0  ! 0  ⏱ 0
+  rs012        cold ×0.11  bulk ×0.10  perop ×0.12  maint ×0.27   ✗ 0  ! 0  ⏱ 0
+  rs010        cold ×0.11  bulk ×0.10  perop ×0.12  maint ×0.27   ✗ 0  ! 0  ⏱ 0
 ```
 
 ## Run 2
 
 ```
-tsvzbench: probing py
-tsvzbench: probing rs
-tsvzbench 1.0  2026-10-14T17:56:18-0700  suite standard  seed 1
+tsvzbench 1.0  2026-10-15T22:38:01-0700  suite standard  seed 1
 host ksxx  cpu AMD Ryzen 9 9950X3D 16-Core Processor ×32  Linux 7.0.14-23-pve  python 3.13.5  fs f2fs  warm page cache
-  py           python3 /mnt/klein/work/cas/TSVZ/TSVZ.py  [TSVZ.py 4.8 @ 2026-10-14 by pan@zopyr.us]  handler: yes  startup 37.4 ms
-  rs           /mnt/gen5/tsvzbench-rs/tsvz-release-candidate  [tsvz-rs 0.1.0]  handler: yes  startup 597 µs
+  py           python3 /mnt/klein/work/cas/TSVZ/TSVZ.py  [TSVZ.py 4.8 @ 2026-10-14 by pan@zopyr.us]  handler: yes  startup 38.5 ms
+  rs010        /mnt/gen5/tsvzbench-rs/tsvz-0.1.0  [tsvz-rs 0.1.0]  handler: yes  startup 821 µs
+  rs012        /mnt/gen5/tsvzbench-rs/tsvz-0.1.2  [tsvz-rs 0.1.2]  handler: yes  startup 675 µs
 
 [cold]
-workload             | py wall  | ±  | net      | cpu      | rss       | ok | rs wall  | ±  | net      | cpu      | rss       | ok | ×
----------------------+----------+----+----------+----------+-----------+----+----------+----+----------+----------+-----------+----+------
-startup              | 37.4 ms  | 1% |          | 36.6 ms  | 35.0 MiB  | ✓  | 597 µs   | 4% |          | 367 µs   | ≤8.8 MiB  | ✓  | ×0.02
-read 10k             | 56.0 ms  | 0% | 18.6 ms  | 54.9 ms  | 41.3 MiB  | ✓  | 6.2 ms   | 3% | 5.6 ms   | 5.8 ms   | ≤8.8 MiB  | ✓  | ×0.11
-len 10k              | 51.2 ms  | 1% | 13.8 ms  | 50.5 ms  | 38.6 MiB  | ✓  | 2.6 ms   | 2% | 2.0 ms   | 2.3 ms   | ≤8.8 MiB  | ✓  | ×0.05
-get 10k              | 50.4 ms  | 0% | 13.0 ms  | 49.7 ms  | 38.8 MiB  | ✓  | 2.0 ms   | 3% | 1.4 ms   | 1.6 ms   | ≤8.8 MiB  | ✓  | ×0.04
-read 100k            | 232.5 ms | 0% | 195.1 ms | 231.4 ms | 118.6 MiB | ✓  | 50.9 ms  | 1% | 50.3 ms  | 50.5 ms  | 37.4 MiB  | ✓  | ×0.22
-len 100k             | 176.0 ms | 0% | 138.6 ms | 174.8 ms | 95.6 MiB  | ✓  | 14.8 ms  | 2% | 14.2 ms  | 14.5 ms  | 19.8 MiB  | ✓  | ×0.08
-get 100k             | 166.2 ms | 1% | 128.8 ms | 165.3 ms | 89.4 MiB  | ✓  | 6.8 ms   | 1% | 6.2 ms   | 6.5 ms   | ≤8.8 MiB  | ✓  | ×0.04
-read 1M              | 2.24 s   | 0% | 2.20 s   | 2.24 s   | 887.0 MiB | ✓  | 696.8 ms | 0% | 696.2 ms | 696.1 ms | 358.9 MiB | ✓  | ×0.31
-len 1M               | 1.80 s   | 0% | 1.76 s   | 1.80 s   | 606.3 MiB | ✓  | 233.6 ms | 3% | 233.0 ms | 233.0 ms | 197.4 MiB | ✓  | ×0.13
-get 1M               | 1.56 s   | 0% | 1.52 s   | 1.56 s   | 555.6 MiB | ✓  | 59.4 ms  | 0% | 58.8 ms  | 58.9 ms  | ≤8.8 MiB  | ✓  | ×0.04
-read churn 100k      | 603.0 ms | 1% | 565.6 ms | 601.6 ms | 157.8 MiB | ✓  | 138.0 ms | 2% | 137.5 ms | 137.5 ms | 60.2 MiB  | ✓  | ×0.23
-read escaped 100k    | 303.1 ms | 0% | 265.7 ms | 302.0 ms | 155.8 MiB | ✓  | 63.7 ms  | 0% | 63.1 ms  | 63.3 ms  | 37.8 MiB  | ✓  | ×0.21
-read markers 100k    | 248.9 ms | 0% | 211.6 ms | 247.7 ms | 106.8 MiB | ✓  | 44.5 ms  | 2% | 43.9 ms  | 44.0 ms  | 29.7 MiB  | ✓  | ×0.18
-read checksum 100k   | 262.3 ms | 0% | 224.9 ms | 261.1 ms | 119.1 MiB | ✓  | 51.4 ms  | 0% | 50.8 ms  | 51.0 ms  | 37.1 MiB  | ✓  | ×0.20
-read gz 100k         | 248.4 ms | 0% | 211.0 ms | 247.3 ms | 119.4 MiB | ✓  | 68.1 ms  | 1% | 67.5 ms  | 67.6 ms  | 56.8 MiB  | ✓  | ×0.27
-read multipart 100k  | 230.3 ms | 0% | 193.0 ms | 229.3 ms | 118.7 MiB | ✓  | 53.2 ms  | 0% | 52.6 ms  | 52.9 ms  | 38.2 MiB  | ✓  | ×0.23
-verify checksum 100k | 171.3 ms | 1% | 133.9 ms | 170.2 ms | 38.5 MiB  | ✓  | 19.8 ms  | 0% | 19.2 ms  | 19.4 ms  | 19.5 MiB  | ✓  | ×0.12
+workload             | py wall  | ±  | net      | cpu      | rss       | ok | rs010 wall | ±   | net      | cpu      | rss       | ok | ×     | rs012 wall | ±   | net      | cpu      | rss       | ok | ×
+---------------------+----------+----+----------+----------+-----------+----+------------+-----+----------+----------+-----------+----+-------+------------+-----+----------+----------+-----------+----+------
+startup              | 38.5 ms  | 2% |          | 37.7 ms  | 35.0 MiB  | ✓  | 821 µs     | 17% |          | 583 µs   | ≤8.8 MiB  | ✓  | ×0.02 | 675 µs     | 15% |          | 429 µs   | ≤8.8 MiB  | ✓  | ×0.02
+read 10k             | 56.7 ms  | 1% | 18.2 ms  | 55.6 ms  | 41.6 MiB  | ✓  | 6.2 ms     | 3%  | 5.4 ms   | 5.9 ms   | ≤8.7 MiB  | ✓  | ×0.11 | 6.1 ms     | 7%  | 5.5 ms   | 5.9 ms   | ≤8.8 MiB  | ✓  | ×0.11
+len 10k              | 51.9 ms  | 1% | 13.5 ms  | 51.0 ms  | 39.0 MiB  | ✓  | 2.5 ms     | 12% | 1.7 ms   | 2.2 ms   | ≤8.8 MiB  | ✓  | ×0.05 | 2.2 ms     | 2%  | 1.5 ms   | 1.9 ms   | ≤8.8 MiB  | ✓  | ×0.04
+get 10k              | 50.4 ms  | 1% | 11.9 ms  | 49.4 ms  | 38.5 MiB  | ✓  | 1.7 ms     | 7%  | 915 µs   | 1.5 ms   | ≤8.8 MiB  | ✓  | ×0.03 | 1.9 ms     | 8%  | 1.2 ms   | 1.5 ms   | ≤8.8 MiB  | ✓  | ×0.04
+read 100k            | 231.2 ms | 0% | 192.7 ms | 230.0 ms | 119.4 MiB | ✓  | 54.1 ms    | 2%  | 53.3 ms  | 53.7 ms  | 37.3 MiB  | ✓  | ×0.23 | 54.8 ms    | 1%  | 54.1 ms  | 54.2 ms  | 37.5 MiB  | ✓  | ×0.24
+len 100k             | 183.3 ms | 0% | 144.8 ms | 182.2 ms | 95.6 MiB  | ✓  | 15.0 ms    | 2%  | 14.1 ms  | 14.7 ms  | 19.7 MiB  | ✓  | ×0.08 | 14.7 ms    | 2%  | 14.0 ms  | 14.5 ms  | 19.8 MiB  | ✓  | ×0.08
+get 100k             | 165.5 ms | 0% | 127.0 ms | 164.4 ms | 89.3 MiB  | ✓  | 7.4 ms     | 3%  | 6.6 ms   | 7.0 ms   | ≤8.8 MiB  | ✓  | ×0.04 | 7.1 ms     | 2%  | 6.4 ms   | 6.8 ms   | ≤8.8 MiB  | ✓  | ×0.04
+read 1M              | 2.25 s   | 0% | 2.22 s   | 2.25 s   | 887.4 MiB | ✓  | 782.7 ms   | 1%  | 781.8 ms | 782.0 ms | 359.2 MiB | ✓  | ×0.35 | 781.6 ms   | 1%  | 780.9 ms | 780.9 ms | 359.0 MiB | ✓  | ×0.35
+len 1M               | 1.78 s   | 0% | 1.74 s   | 1.78 s   | 606.4 MiB | ✓  | 333.0 ms   | 1%  | 332.1 ms | 332.4 ms | 197.4 MiB | ✓  | ×0.19 | 332.7 ms   | 1%  | 332.1 ms | 332.2 ms | 197.5 MiB | ✓  | ×0.19
+get 1M               | 1.59 s   | 1% | 1.56 s   | 1.59 s   | 556.0 MiB | ✓  | 59.7 ms    | 0%  | 58.8 ms  | 59.2 ms  | ≤8.8 MiB  | ✓  | ×0.04 | 58.5 ms    | 1%  | 57.9 ms  | 58.1 ms  | ≤8.8 MiB  | ✓  | ×0.04
+read churn 100k      | 649.7 ms | 1% | 611.2 ms | 648.4 ms | 157.8 MiB | ✓  | 184.7 ms   | 1%  | 183.9 ms | 184.1 ms | 60.0 MiB  | ✓  | ×0.28 | 185.1 ms   | 0%  | 184.5 ms | 184.5 ms | 60.4 MiB  | ✓  | ×0.28
+read escaped 100k    | 296.9 ms | 0% | 258.5 ms | 295.7 ms | 155.8 MiB | ✓  | 63.5 ms    | 1%  | 62.7 ms  | 62.9 ms  | 37.9 MiB  | ✓  | ×0.21 | 64.8 ms    | 1%  | 64.1 ms  | 64.2 ms  | 37.8 MiB  | ✓  | ×0.22
+read markers 100k    | 244.9 ms | 0% | 206.4 ms | 243.5 ms | 106.9 MiB | ✓  | 43.9 ms    | 2%  | 43.0 ms  | 43.3 ms  | 29.5 MiB  | ✓  | ×0.18 | 44.5 ms    | 1%  | 43.9 ms  | 44.2 ms  | 29.8 MiB  | ✓  | ×0.18
+read checksum 100k   | 261.3 ms | 0% | 222.8 ms | 260.1 ms | 119.3 MiB | ✓  | 52.8 ms    | 1%  | 52.0 ms  | 52.4 ms  | 37.3 MiB  | ✓  | ×0.20 | 53.1 ms    | 1%  | 52.4 ms  | 52.6 ms  | 37.5 MiB  | ✓  | ×0.20
+read gz 100k         | 270.1 ms | 9% | 231.6 ms | 269.1 ms | 117.5 MiB | ✓  | 69.8 ms    | 3%  | 69.0 ms  | 69.4 ms  | 56.7 MiB  | ✓  | ×0.26 | 71.1 ms    | 3%  | 70.4 ms  | 70.7 ms  | 57.0 MiB  | ✓  | ×0.26
+read multipart 100k  | 225.9 ms | 0% | 187.4 ms | 224.7 ms | 118.6 MiB | ✓  | 54.8 ms    | 1%  | 54.0 ms  | 54.2 ms  | 38.3 MiB  | ✓  | ×0.24 | 53.9 ms    | 1%  | 53.2 ms  | 53.4 ms  | 38.2 MiB  | ✓  | ×0.24
+verify checksum 100k | 168.1 ms | 1% | 129.6 ms | 167.1 ms | 38.7 MiB  | ✓  | 19.8 ms    | 1%  | 19.0 ms  | 19.4 ms  | 19.7 MiB  | ✓  | ×0.12 | 19.7 ms    | 2%  | 19.1 ms  | 19.3 ms  | 19.7 MiB  | ✓  | ×0.12
 
 [bulk]
-workload       | py wall  | ±  | net      | cpu      | rss       | disk      | ok | rs wall  | ±   | net      | cpu      | rss       | disk      | ok | ×
----------------+----------+----+----------+----------+-----------+-----------+----+----------+-----+----------+----------+-----------+-----------+----+------
-set - new 10k  | 52.9 ms  | 0% | 15.5 ms  | 52.0 ms  | 40.4 MiB  | 737.6 KiB | ✓  | 6.1 ms   | 4%  | 5.5 ms   | 5.8 ms   | ≤8.8 MiB  | 737.6 KiB | ✓  | ×0.11
-set - new 100k | 184.1 ms | 0% | 146.7 ms | 183.0 ms | 101.0 MiB | 7.2 MiB   | ✓  | 52.4 ms  | 1%  | 51.8 ms  | 51.9 ms  | 60.2 MiB  | 7.2 MiB   | ✓  | ×0.28
-set - new 1M   | 2.13 s   | 0% | 2.09 s   | 2.13 s   | 720.1 MiB | 72.0 MiB  | ✓  | 510.6 ms | 1%  | 510.0 ms | 510.0 ms | 581.1 MiB | 72.0 MiB  | ✓  | ×0.24
-set - add 100k | 40.7 ms  | 1% | 3.3 ms   | 39.9 ms  | 35.1 MiB  | 7.3 MiB   | ✓  | 1.6 ms   | 6%  | 1.0 ms   | 1.3 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.04
-delete - 100k  | 45.3 ms  | 2% | 7.9 ms   | 44.4 ms  | 36.4 MiB  | 7.3 MiB   | ✓  | 1.6 ms   | 11% | 1.1 ms   | 1.3 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.04
+workload       | py wall  | ±  | net      | cpu      | rss       | disk      | ok | rs010 wall | ±  | net      | cpu      | rss       | disk      | ok | ×     | rs012 wall | ±  | net      | cpu      | rss       | disk      | ok | ×
+---------------+----------+----+----------+----------+-----------+-----------+----+------------+----+----------+----------+-----------+-----------+----+-------+------------+----+----------+----------+-----------+-----------+----+------
+set - new 10k  | 53.1 ms  | 1% | 14.6 ms  | 52.1 ms  | 40.5 MiB  | 737.6 KiB | ✓  | 5.7 ms     | 3% | 4.9 ms   | 5.4 ms   | ≤8.8 MiB  | 737.6 KiB | ✓  | ×0.11 | 5.6 ms     | 0% | 4.9 ms   | 5.3 ms   | ≤8.8 MiB  | 737.6 KiB | ✓  | ×0.10
+set - new 100k | 185.5 ms | 1% | 147.0 ms | 184.4 ms | 101.3 MiB | 7.2 MiB   | ✓  | 53.1 ms    | 1% | 52.3 ms  | 52.5 ms  | 60.4 MiB  | 7.2 MiB   | ✓  | ×0.29 | 52.6 ms    | 1% | 51.9 ms  | 52.2 ms  | 60.3 MiB  | 7.2 MiB   | ✓  | ×0.28
+set - new 1M   | 2.16 s   | 0% | 2.12 s   | 2.15 s   | 719.8 MiB | 72.0 MiB  | ✓  | 507.8 ms   | 1% | 507.0 ms | 507.1 ms | 581.1 MiB | 72.0 MiB  | ✓  | ×0.24 | 504.5 ms   | 1% | 503.8 ms | 503.9 ms | 581.0 MiB | 72.0 MiB  | ✓  | ×0.23
+set - add 100k | 41.0 ms  | 1% | 2.5 ms   | 40.0 ms  | 34.9 MiB  | 7.3 MiB   | ✓  | 1.2 ms     | 3% | 392 µs   | 958 µs   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.03 | 1.3 ms     | 5% | 612 µs   | 947 µs   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.03
+delete - 100k  | 45.8 ms  | 3% | 7.3 ms   | 44.7 ms  | 36.0 MiB  | 7.3 MiB   | ✓  | 1.9 ms     | 1% | 1.1 ms   | 1.6 ms   | ≤8.9 MiB  | 7.3 MiB   | ✓  | ×0.04 | 1.5 ms     | 3% | 833 µs   | 1.3 ms   | ≤8.8 MiB  | 7.3 MiB   | ✓  | ×0.03
 
 [perop]
-workload            | py p50   | p95      | p99      | ops/s   | rss      | ok | rs p50 | p95    | p99    | ops/s    | rss      | ok | ×     | ceiling ops/s
---------------------+----------+----------+----------+---------+----------+----+--------+--------+--------+----------+----------+----+-------+--------------
-cli set             | 39.0 ms  | 40.4 ms  | 41.6 ms  | 26/s    | 34.8 MiB | ✓  | 619 µs | 1.0 ms | 1.2 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 |
-cli get             | 168.0 ms | 171.5 ms | 174.4 ms | 6/s     | 89.5 MiB | ✓  | 6.7 ms | 7.2 ms | 7.7 ms | 148/s    | ≤8.8 MiB | ✓  | ×0.04 |
-cli via handler set | 41.5 ms  | 43.1 ms  | 43.5 ms  | 24/s    | 34.9 MiB | ✓  | 667 µs | 1.1 ms | 1.3 ms | 1.4k/s   | ≤8.8 MiB | ✓  | ×0.02 |
-cli via handler get | 41.5 ms  | 43.0 ms  | 43.5 ms  | 24/s    | 34.9 MiB | ✓  | 635 µs | 907 µs | 1.0 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 |
-socket get          | 19 µs    | 21 µs    | 27 µs    | 51.4k/s |          | ✓  | 7 µs   | 8 µs   | 12 µs  | 139.4k/s |          | ✓  | ×0.36 | 278.6k/s
-socket set          | 10 µs    | 19 µs    | 25 µs    | 94.5k/s |          | ✓  | 9 µs   | 14 µs  | 30 µs  | 95.4k/s  |          | ✓  | ×0.91 | 248.1k/s
-socket --sync set   | 713 µs   | 780 µs   | 947 µs   | 1.4k/s  |          | ✓  | 712 µs | 774 µs | 899 µs | 1.4k/s   |          | ✓  | ×1.00 | 248.5k/s
-socket mix ×1       | 49 µs    | 90 µs    | 105 µs   | 25.9k/s |          | ✓  | 15 µs  | 22 µs  | 30 µs  | 62.4k/s  |          | ✓  | ×0.31 | 256.4k/s
-socket mix ×4       | 124 µs   | 242 µs   | 468 µs   | 30.1k/s |          | ✓  | 37 µs  | 68 µs  | 89 µs  | 105.9k/s |          | ✓  | ×0.30 | 922.7k/s
-socket mix ×16      | 565 µs   | 1.5 ms   | 2.2 ms   | 21.1k/s |          | ✓  | 156 µs | 333 µs | 518 µs | 102.5k/s |          | ✓  | ×0.28 | 1.77M/s
+workload            | py p50   | p95      | p99      | ops/s   | rss      | ok | rs010 p50 | p95    | p99    | ops/s    | rss      | ok | ×     | rs012 p50 | p95    | p99    | ops/s    | rss      | ok | ×     | ceiling ops/s
+--------------------+----------+----------+----------+---------+----------+----+-----------+--------+--------+----------+----------+----+-------+-----------+--------+--------+----------+----------+----+-------+--------------
+cli set             | 39.4 ms  | 40.9 ms  | 42.6 ms  | 25/s    | 34.8 MiB | ✓  | 602 µs    | 1.1 ms | 1.2 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 | 613 µs    | 1.0 ms | 1.1 ms | 1.6k/s   | ≤8.8 MiB | ✓  | ×0.02 |
+cli get             | 166.8 ms | 169.8 ms | 173.9 ms | 6/s     | 89.5 MiB | ✓  | 6.7 ms    | 7.3 ms | 7.5 ms | 148/s    | ≤8.8 MiB | ✓  | ×0.04 | 6.6 ms    | 7.4 ms | 7.9 ms | 149/s    | ≤8.8 MiB | ✓  | ×0.04 |
+cli via handler set | 41.7 ms  | 43.0 ms  | 44.5 ms  | 24/s    | 34.9 MiB | ✓  | 670 µs    | 1.0 ms | 1.3 ms | 1.4k/s   | ≤8.8 MiB | ✓  | ×0.02 | 675 µs    | 1.1 ms | 1.3 ms | 1.4k/s   | ≤8.8 MiB | ✓  | ×0.02 |
+cli via handler get | 41.6 ms  | 42.7 ms  | 43.6 ms  | 24/s    | 35.0 MiB | ✓  | 628 µs    | 904 µs | 1.0 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 | 636 µs    | 947 µs | 1.0 ms | 1.5k/s   | ≤8.8 MiB | ✓  | ×0.02 |
+socket get          | 19 µs    | 21 µs    | 26 µs    | 51.6k/s |          | ✓  | 7 µs      | 9 µs   | 11 µs  | 137.2k/s |          | ✓  | ×0.36 | 7 µs      | 9 µs   | 12 µs  | 133.3k/s |          | ✓  | ×0.36 | 289.6k/s
+socket set          | 9 µs     | 14 µs    | 21 µs    | 95.9k/s |          | ✓  | 9 µs      | 12 µs  | 27 µs  | 96.2k/s  |          | ✓  | ×0.96 | 10 µs     | 13 µs  | 23 µs  | 70.4k/s  |          | ✓  | ×1.01 | 251.1k/s
+socket --sync set   | 705 µs   | 772 µs   | 897 µs   | 1.4k/s  |          | ✓  | 705 µs    | 773 µs | 945 µs | 1.4k/s   |          | ✓  | ×1.00 | 705 µs    | 772 µs | 951 µs | 1.4k/s   |          | ✓  | ×1.00 | 255.2k/s
+socket mix ×1       | 45 µs    | 81 µs    | 101 µs   | 26.6k/s |          | ✓  | 13 µs     | 21 µs  | 27 µs  | 76.6k/s  |          | ✓  | ×0.28 | 16 µs     | 23 µs  | 30 µs  | 60.9k/s  |          | ✓  | ×0.35 | 263.9k/s
+socket mix ×4       | 132 µs   | 266 µs   | 472 µs   | 30.2k/s |          | ✓  | 37 µs     | 66 µs  | 82 µs  | 106.5k/s |          | ✓  | ×0.28 | 33 µs     | 59 µs  | 77 µs  | 115.7k/s |          | ✓  | ×0.25 | 955.9k/s
+socket mix ×16      | 411 µs   | 1.2 ms   | 1.7 ms   | 32.3k/s |          | ✓  | 152 µs    | 339 µs | 521 µs | 101.0k/s |          | ✓  | ×0.37 | 145 µs    | 308 µs | 460 µs | 109.8k/s |          | ✓  | ×0.35 | 1.75M/s
 
 [maint]
-workload             | py wall  | ±  | net      | cpu      | rss       | disk             | ok      | rs wall  | ±  | net      | cpu      | rss       | disk             | ok | ×
----------------------+----------+----+----------+----------+-----------+------------------+---------+----------+----+----------+----------+-----------+------------------+----+------
-scrub churn 100k     | 718.0 ms | 1% | 680.6 ms | 713.7 ms | 170.8 MiB | 24.0 MiB→7.2 MiB | ✓       | 236.7 ms | 0% | 236.1 ms | 232.1 ms | 106.5 MiB | 24.0 MiB→7.2 MiB | ✓  | ×0.33
-scrub markers 100k   | 268.6 ms | 0% | 231.2 ms | 265.3 ms | 107.0 MiB | 4.4 MiB→7.4 MiB  | ✓       | 69.3 ms  | 1% | 68.7 ms  | 66.3 ms  | 68.7 MiB  | 4.4 MiB→7.4 MiB  | ✓  | ×0.26
-clear 100k           | 174.2 ms | 1% | 136.8 ms | 170.1 ms | 93.1 MiB  | 7.2 MiB→20 B     | ✓       | 41.2 ms  | 4% | 40.6 ms  | 39.2 ms  | 43.4 MiB  | 7.2 MiB→20 B     | ✓  | ×0.24
-scrub multipart 100k | 166.6 ms | 0% | 129.2 ms | 165.3 ms | 87.3 MiB  | 7.2 MiB→7.2 MiB  | refused | 248.6 ms | 0% | 248.0 ms | 243.4 ms | 157.2 MiB | 7.2 MiB→13.5 MiB | ✓  | —
+workload             | py wall  | ±  | net      | cpu      | rss       | disk             | ok      | rs010 wall | ±  | net      | cpu      | rss       | disk             | ok | ×     | rs012 wall | ±  | net      | cpu      | rss       | disk             | ok | ×
+---------------------+----------+----+----------+----------+-----------+------------------+---------+------------+----+----------+----------+-----------+------------------+----+-------+------------+----+----------+----------+-----------+------------------+----+------
+scrub churn 100k     | 725.5 ms | 2% | 687.0 ms | 721.0 ms | 170.7 MiB | 24.0 MiB→7.2 MiB | ✓       | 234.9 ms   | 1% | 234.1 ms | 230.1 ms | 106.7 MiB | 24.0 MiB→7.2 MiB | ✓  | ×0.32 | 235.9 ms   | 2% | 235.2 ms | 230.9 ms | 106.7 MiB | 24.0 MiB→7.2 MiB | ✓  | ×0.33
+scrub markers 100k   | 268.9 ms | 0% | 230.5 ms | 264.9 ms | 106.9 MiB | 4.4 MiB→7.4 MiB  | ✓       | 68.2 ms    | 1% | 67.4 ms  | 65.0 ms  | 68.6 MiB  | 4.4 MiB→7.4 MiB  | ✓  | ×0.25 | 69.6 ms    | 1% | 69.0 ms  | 65.4 ms  | 68.7 MiB  | 4.4 MiB→7.4 MiB  | ✓  | ×0.26
+clear 100k           | 171.6 ms | 0% | 133.1 ms | 167.4 ms | 93.2 MiB  | 7.2 MiB→20 B     | ✓       | 40.2 ms    | 1% | 39.3 ms  | 38.0 ms  | 43.4 MiB  | 7.2 MiB→20 B     | ✓  | ×0.23 | 39.9 ms    | 1% | 39.2 ms  | 38.0 ms  | 43.6 MiB  | 7.2 MiB→20 B     | ✓  | ×0.23
+scrub multipart 100k | 169.1 ms | 0% | 130.7 ms | 168.0 ms | 86.9 MiB  | 7.2 MiB→7.2 MiB  | refused | 239.4 ms   | 1% | 238.6 ms | 233.7 ms | 157.3 MiB | 7.2 MiB→13.5 MiB | ✓  | —     | 245.7 ms   | 1% | 245.0 ms | 239.9 ms | 157.2 MiB | 7.2 MiB→13.5 MiB | ✓  | —
 
 [footprint]
-  py           memory/row (read) 896 B; memory/row (len) 601 B; disk/record 75 B; handler load 181.5 ms, rss after load 92.3 MiB, peak rss 96.5 MiB, cpu 6.04 s
-  rs           memory/row (read) 372 B; memory/row (len) 203 B; disk/record 75 B; handler load 35.9 ms, rss after load 36.8 MiB, peak rss 45.0 MiB, cpu 1.90 s
+  py           memory/row (read) 896 B; memory/row (len) 601 B; disk/record 75 B; handler load 173.8 ms, rss after load 92.4 MiB, peak rss 96.5 MiB, cpu 4.86 s
+  rs010        memory/row (read) 373 B; memory/row (len) 203 B; disk/record 75 B; handler load 35.9 ms, rss after load 36.8 MiB, peak rss 70.9 MiB, cpu 1.88 s
+  rs012        memory/row (read) 372 B; memory/row (len) 203 B; disk/record 75 B; handler load 35.9 ms, rss after load 36.9 MiB, peak rss 70.6 MiB, cpu 1.85 s
 
 [summary] ratio = time against py, geometric mean per family (lower is faster)
   py           cold ×1.00  bulk ×1.00  perop ×1.00  maint ×1.00   ✗ 0  ! 0  ⏱ 0
-  rs           cold ×0.11  bulk ×0.10  perop ×0.13  maint ×0.27   ✗ 0  ! 0  ⏱ 0
+  rs010        cold ×0.12  bulk ×0.10  perop ×0.13  maint ×0.27   ✗ 0  ! 0  ⏱ 0
+  rs012        cold ×0.11  bulk ×0.09  perop ×0.13  maint ×0.27   ✗ 0  ! 0  ⏱ 0
 ```
