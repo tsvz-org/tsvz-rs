@@ -306,7 +306,7 @@ pub struct Store {
 impl Store {
     /// Read the store at `path` (the unnumbered file's path, §20.1.3).
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Store, Error> {
-        Store::open_limited(path.as_ref(), options, None)
+        Store::open_limited(path.as_ref(), options, None, parts::DirTrust::default())
     }
 
     /// Read only the first `count` parts of the store at `path`: the immutable prefix a
@@ -316,7 +316,12 @@ impl Store {
         options: Options,
         count: usize,
     ) -> Result<Store, Error> {
-        Store::open_limited(path.as_ref(), options, Some(count))
+        Store::open_limited(
+            path.as_ref(),
+            options,
+            Some(count),
+            parts::DirTrust::default(),
+        )
     }
 
     /// This read continued with the plain file `path` as one more part: what a reader would see
@@ -336,13 +341,19 @@ impl Store {
     /// Readers take no lock, and an earlier part may be rewritten in place while it is read (a
     /// scrub, §19.8): a read that finds one changed afterwards reads the store again, up to
     /// [`READS`] times, then is taken as torn ([`Store::incomplete`]).
-    fn open_limited(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
-        let mut store = Store::open_once(path, options.clone(), limit)?;
+    /// What was learnt of the directory (`dirs`) is kept from one read to the next.
+    fn open_limited(
+        path: &Path,
+        options: Options,
+        limit: Option<usize>,
+        dirs: parts::DirTrust,
+    ) -> Result<Store, Error> {
+        let mut store = Store::open_once(path, options.clone(), limit, dirs)?;
         for _ in 1..READS {
             if store.earlier_parts_kept() {
                 return Ok(store);
             }
-            store = Store::open_once(path, options.clone(), limit)?;
+            store = Store::open_once(path, options.clone(), limit, store.dirs)?;
         }
         if !store.earlier_parts_kept() {
             store.torn = true;
@@ -368,7 +379,12 @@ impl Store {
         })
     }
 
-    fn open_once(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
+    fn open_once(
+        path: &Path,
+        options: Options,
+        limit: Option<usize>,
+        dirs: parts::DirTrust,
+    ) -> Result<Store, Error> {
         let path = path.to_path_buf();
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
@@ -392,7 +408,7 @@ impl Store {
             follow: Follow::default(),
             torn: false,
             last: None,
-            dirs: parts::DirTrust::default(),
+            dirs,
         };
         store.load()?;
         Ok(store)
@@ -724,7 +740,7 @@ impl Store {
     }
 
     pub(crate) fn reload(&mut self) -> Result<Refreshed, Error> {
-        *self = Store::open_limited(&self.path, self.options.clone(), self.limit)?;
+        *self = Store::open_limited(&self.path, self.options.clone(), self.limit, self.dirs)?;
         Ok(Refreshed::Reloaded)
     }
 
@@ -845,16 +861,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
         assert!(!parts::keeps_dir_times(Path::new("/nowhere/at/all/s.tsvz")));
-        if !parts::keeps_dir_times(&p) {
-            eprintln!("skipped: the temporary directory is not on a local kernel file system");
+        if !parts::fine_times(&p) {
             return;
         }
         // A directory last changed long ago: its timestamp is trusted as it is.
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(dir.path())
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(long_ago))
-            .unwrap();
+        let _ahead = parts::RunAhead::by(60);
         let mut store = Store::open(&p, Options::default()).unwrap();
         let listings = || parts::LISTINGS.with(|n| n.get());
         let before = listings();
@@ -868,6 +879,39 @@ mod tests {
         write(dir.path(), "s.tsvz.1", b"b\t2\n");
         store.refresh().unwrap();
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn a_new_part_is_seen_though_the_directory_modification_time_was_set_back() {
+        // rsync -a, tar x, cp -p, touch -r set a directory's modification time back to what it
+        // was; its change time, which every name change sets, no program can.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        if !parts::fine_times(&p) {
+            return;
+        }
+        let _ahead = parts::RunAhead::by(60);
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        let listed = fs::metadata(dir.path()).unwrap().modified().unwrap();
+        write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        fs::File::open(dir.path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(listed))
+            .unwrap();
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 2, "the new part was read");
+    }
+
+    #[test]
+    fn a_reload_keeps_what_the_store_learnt_of_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        store.dirs = parts::DirTrust::not_kept();
+        let asked = || parts::ASKED.with(|n| n.get());
+        let before = asked();
+        store.reload().unwrap();
+        assert_eq!(asked(), before, "not asked again");
     }
 
     #[test]

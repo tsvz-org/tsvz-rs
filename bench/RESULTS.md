@@ -99,14 +99,14 @@ The writer now samples the store's directory just before its listing and, once i
 lock, lists the parts again only where that sample cannot vouch for the listing. Where the
 directory keeps its timestamp (`parts::DirTrust`: a local kernel file system, asked through the
 open directory, so that the answer and the timestamp are of one file system), the same device,
-inode and timestamp, in finer steps than whole seconds and at least 2 s old when sampled, mean
-the same names, as the store's own checks take them; elsewhere (mergerfs, network) the parts
-are listed again, as before. The store's checks and the writer share that one rule. The
-handler's writer thread asks the file system once, not at every batch: where it keeps the
-timestamp, again when another directory is at the path; where it does not, not again. A
-timestamp seen too recent is not looked at again before it may be old enough, by the writer or
-the store, so a fresh directory costs no stat either. A loose file's directory is never looked
-at.
+inode and change time (`ctime`: no program can set it back), in finer steps than whole seconds
+and at least 2 s old when sampled, mean the same names, as the store's own checks take them;
+elsewhere (mergerfs, network) the parts are listed again, as before. The store's checks and the
+writer share that one rule. The handler's writer thread does not ask the file system at every
+batch: only when the stamp is other than the last one trusted; where the file system does not
+keep the timestamp, not again. A timestamp seen too recent is not looked at again before it may
+be old enough, by the writer or the store, so a fresh directory costs no stat either. A loose
+file's directory is never looked at.
 
 `--warm 2.5` keeps the handler busy with `len` requests for 2.5 s before the timed ones, so
 that the directory is as in a store nothing changed in for 2 s. Without it the directory is as
@@ -116,8 +116,8 @@ mix requests, and of the `get` after each `set`, 12 pinned repetitions in one ru
 
 | Directory | v0.1.0 | 1c8c2aa | v0.1.2 | 0.1.3 |
 |---|---|---|---|---|
-| Unchanged for 2 s (`--warm 2.5`) | 9.7 µs, get 11.4 | 9.1, get 9.8 | 10.7, get 11.6 | **9.4, get 10.2** |
-| Changed within 2 s (as tsvzbench runs it) | 12.4 µs, get 14.9 | 11.7, get 13.9 | 13.5, get 15.9 | 13.3, get 15.6 |
+| Unchanged for 2 s (`--warm 2.5`) | 9.4 µs, get 10.2 | 8.8, get 9.6 | 10.7, get 11.5 | **9.3, get 10.1** |
+| Changed within 2 s (as tsvzbench runs it) | 11.6 µs, get 12.1 | 11.0, get 11.5 | 12.9, get 13.5 | 12.6, get 13.1 |
 
 A handler serving a store whose parts have not changed for 2 s writes with one listing a batch
 again. tsvzbench's `socket mix ×1` row stays about where 0.1.2 has it: there the directory is

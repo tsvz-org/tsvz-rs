@@ -87,7 +87,9 @@ def once(tb, args, tsvz, name, before, payloads):
         client = tb.Client(pointer[0])
         until = time.monotonic() + args.warm
         while time.monotonic() < until:
-            client.roundtrip(b'len\n')
+            status = tb.response_status(client.roundtrip(b'len\n'))
+            if status != 0:
+                sys.exit('%s: the warm-up: len answered status %d' % (name, status))
         _, responses, _, _ = tb.client_loop(client, before)
         problem = tb.check_responses(responses, [None] * len(responses))
         if problem:
@@ -131,6 +133,8 @@ def main():
         # NAME is a directory under --work-dir, removed before each repetition.
         if len(impl) != 2 or not impl[0] or os.sep in impl[0] or impl[0] in ('.', '..'):
             parser.error('%r: expected NAME=TSVZ, NAME a plain file name' % spec)
+    if len({name for name, _ in impls}) != len(impls):
+        parser.error('each NAME must be another: their results would mix')
     before = prelude(tb) if args.prelude else []
     payloads = mix(tb)
     results = {name: [] for name, _ in impls}

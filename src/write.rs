@@ -804,19 +804,10 @@ mod tests {
         );
     }
 
-    /// Date the directory `dir` of `store` a minute back; false (the test is skipped) where its
-    /// file system does not keep directory timestamps.
-    fn kept_and_dated_back(dir: &Path, store: &Path) -> bool {
-        if !parts::keeps_dir_times(store) {
-            eprintln!("skipped: the temporary directory is not on a local kernel file system");
-            return false;
-        }
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(dir)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(long_ago))
-            .unwrap();
-        true
+    /// Run this thread's clock a minute ahead, so that the directory of `store` looks last
+    /// changed a minute ago; None (the test is skipped) where its timestamp is not trusted.
+    fn kept_and_aged(store: &Path) -> Option<parts::RunAhead> {
+        parts::fine_times(store).then(|| parts::RunAhead::by(60))
     }
 
     fn listings() -> usize {
@@ -832,9 +823,9 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         let one = dir.path().join("s.tsvz.1");
         fs::write(&one, "b\t2\n").unwrap();
-        if !kept_and_dated_back(dir.path(), &p) {
+        let Some(_ahead) = kept_and_aged(&p) else {
             return;
-        }
+        };
         let before = listings();
         Writer::open(&p)
             .unwrap()
@@ -852,9 +843,9 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         let one = dir.path().join("s.tsvz.1");
         fs::write(&one, "b\t2\n").unwrap();
-        if !kept_and_dated_back(dir.path(), &p) {
+        let Some(_ahead) = kept_and_aged(&p) else {
             return;
-        }
+        };
         let before = listings();
         Writer::open(&p)
             .unwrap()
@@ -904,13 +895,14 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         let one = dir.path().join("s.tsvz.1");
         fs::write(&one, "b\t2\n").unwrap();
-        if !kept_and_dated_back(dir.path(), &p) {
+        let Some(_ahead) = kept_and_aged(&p) else {
             return;
-        }
+        };
         let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
         let guard = lock::lock(&held, &one).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
+            let _ahead = parts::RunAhead::by(60);
             Writer::open(&store)
                 .unwrap()
                 .append(&[Record::from_args("c", &["3".into()])])
