@@ -250,6 +250,12 @@ pub(crate) struct Follow {
 /// How many times a store is read when an earlier part changes under the read.
 const READS: usize = 3;
 
+#[cfg(test)]
+thread_local! {
+    /// How many more reads this thread takes as torn: for tests.
+    static TORN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What `Store::refresh` did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -372,6 +378,10 @@ impl Store {
 
     /// Whether every part but the last is as it was when it was opened.
     pub(crate) fn earlier_parts_kept(&self) -> bool {
+        #[cfg(test)]
+        if TORN.with(|t| t.replace(t.get().saturating_sub(1))) > 0 {
+            return false;
+        }
         let earlier = self.parts.len().saturating_sub(1);
         self.parts[..earlier].iter().enumerate().all(|(i, p)| {
             let now = std::fs::metadata(&p.path).ok().map(|m| Stamp::of(&m));
@@ -835,25 +845,51 @@ mod tests {
     }
 
     #[test]
-    fn a_new_part_is_seen_though_the_directory_timestamp_says_nothing_changed() {
+    fn a_directory_that_does_not_keep_its_timestamp_is_listed_at_every_check() {
         // A union file system (mergerfs) may create a file on a branch whose directory's
-        // timestamp is not the one shown: an unchanged timestamp proves nothing.
+        // timestamp is not the one shown: an unchanged timestamp proves nothing there.
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        let set_old = || {
-            fs::File::open(dir.path())
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(long_ago))
-                .unwrap();
-        };
-        set_old();
+        let _ahead = parts::RunAhead::by(60);
         let mut store = Store::open(&p, Options::default()).unwrap();
         store.dirs = parts::DirTrust::not_kept(); // as on mergerfs, NFS, SMB, …
-        write(dir.path(), "s.tsvz.1", b"b\t2\n");
-        set_old();
+        let listings = || parts::LISTINGS.with(|n| n.get());
+        let before = listings();
         store.refresh().unwrap();
-        assert_eq!(store.len(), 2, "the new part was read");
+        assert_eq!(listings() - before, 1);
+    }
+
+    #[test]
+    fn a_part_0_that_is_a_symbolic_link_is_listed_at_every_check() {
+        // It is listed by its target, which may appear elsewhere, the directory unchanged.
+        let root = tempfile::tempdir().unwrap();
+        let (d, o) = (root.path().join("d"), root.path().join("o"));
+        fs::create_dir(&d).unwrap();
+        fs::create_dir(&o).unwrap();
+        if !parts::fine_times(&d.join("other.tsvz")) {
+            return;
+        }
+        let p = d.join("s.tsvz");
+        std::os::unix::fs::symlink(o.join("real.tsvz"), &p).unwrap();
+        write(&d, "s.tsvz.1", b"b\t2\n");
+        let _ahead = parts::RunAhead::by(60);
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(store.len(), 1);
+        write(&o, "real.tsvz", b"a\t1\n");
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 2, "part 0 was read");
+    }
+
+    #[test]
+    fn a_read_done_again_keeps_what_the_store_learnt_of_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        let asked = || parts::ASKED.with(|n| n.get());
+        TORN.with(|t| t.set(2));
+        let before = asked();
+        Store::open(&p, Options::default()).unwrap();
+        assert_eq!(asked() - before, 1, "asked by the first read only");
     }
 
     #[test]

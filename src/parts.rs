@@ -142,7 +142,9 @@ const RACY_NS: i128 = 2_000_000_000;
 /// What identifies the directory of a store's parts between a listing and a later check: its
 /// device and inode (another file system mounted there changes them) and its change time, which
 /// every name made, renamed or removed in it sets and which, unlike its modification time, no
-/// program can set back (setting the modification time sets it to now).
+/// program sets back on Linux (setting the modification time sets it to now; on macOS
+/// setattrlist can set it). Within one clock tick a change may leave it as it was (tmpfs, f2fs):
+/// only a stamp at least 2 s old (`RACY_NS`) is trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirStamp {
     pub dev: u64,
@@ -209,16 +211,15 @@ impl Drop for RunAhead {
 /// Whether the directory of a store's parts keeps a timestamp that shows every change of its
 /// names, and that timestamp. Its file system is asked from the directory as it was opened, so
 /// that the answer and the timestamp are of one file system; and asked again whenever the
-/// directory's stamp is other than the last one trusted (another directory, another file system
-/// mounted there, which may even reuse the device and inode numbers: a moved stamp means a
-/// listing anyway). Where the timestamp is not kept, or kept in whole seconds, the directory is
-/// not looked at again: the answer stands for the life of this value. A loose file's directory
-/// is never looked at: it is never listed (§20.2.4).
+/// directory's stamp is other than the last one asked about (another directory, another file
+/// system mounted there, which may even reuse the device and inode numbers: a moved stamp means
+/// a listing anyway). Where the timestamp is not kept, or kept in whole seconds, or part 0 is a
+/// symbolic link (listed by its target, which the directory does not follow), the directory is
+/// not looked at again: the answer stands for the life of this value (a store keeps it across
+/// its reloads). A loose file's directory is never looked at: it is never listed (§20.2.4).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DirTrust {
     kept: Kept,
-    /// The stamp last asked about: a stamp other than it is asked about again.
-    last: Option<DirStamp>,
     /// Until when (ns since the epoch) the timestamp last seen too recent must still be so,
     /// changed since or not: the directory is not stat'ed before then.
     racy_until: i128,
@@ -229,7 +230,8 @@ enum Kept {
     #[default]
     Unasked,
     No,
-    Yes,
+    /// Kept, as the stamp last asked about showed: a stamp other than it is asked about again.
+    Yes(DirStamp),
 }
 
 impl DirTrust {
@@ -249,8 +251,8 @@ impl DirTrust {
         if self.kept == Kept::No || at < self.racy_until {
             return None;
         }
-        let now = match self.last {
-            Some(last) if self.kept == Kept::Yes => match DirStamp::of(store)? {
+        let now = match self.kept {
+            Kept::Yes(last) => match DirStamp::of(store)? {
                 now if now == last => now,
                 _ => self.ask(store)?,
             },
@@ -283,8 +285,7 @@ impl DirTrust {
     fn ask(&mut self, store: &Path) -> Option<DirStamp> {
         match ask(store) {
             Ok(Some(now)) => {
-                self.kept = Kept::Yes;
-                self.last = Some(now);
+                self.kept = Kept::Yes(now);
                 Some(now)
             }
             Ok(None) => {
@@ -301,8 +302,9 @@ impl DirTrust {
 /// file system (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs; APFS), which sets it at every name made,
 /// renamed or removed in it (POSIX). Never FUSE (mergerfs shows one branch's directory),
 /// network or overlay file systems, nor one this does not know; nor HFS+, whose whole seconds
-/// let a clock stepped back repeat a timestamp. There the directory is listed. An error when
-/// the directory cannot be opened as one (a FIFO there is not waited on).
+/// let a clock stepped back repeat a timestamp; nor where part 0 is a symbolic link, listed by
+/// its target. There the directory is listed. An error when the directory cannot be opened as
+/// one (a FIFO there is not waited on).
 fn ask(store: &Path) -> std::io::Result<Option<DirStamp>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -315,6 +317,9 @@ fn ask(store: &Path) -> std::io::Result<Option<DirStamp>> {
     // SAFETY: fstatfs reads the open descriptor and writes the struct it is given.
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut fs) } != 0 || !kept(&fs) {
+        return Ok(None);
+    }
+    if std::fs::symlink_metadata(store).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(None);
     }
     #[cfg(test)]
