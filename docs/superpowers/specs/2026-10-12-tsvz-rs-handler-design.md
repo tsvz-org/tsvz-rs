@@ -232,7 +232,8 @@ new parts and in-place rewrites (§21.8.1, §21.8.5).
   the writer thread counts batches that found their part not as the previous
   batch left it, and `submit` checks that the last part appended to is still as
   that batch left it and that the store has the same parts (by name; the
-  directory is listed every time: its timestamp proves nothing unchanged), each as
+  directory is listed, unless it is on a local kernel file system and its
+  timestamp is unchanged and not recent: see silent-choices), each as
   the store last read it (a stat of every part: another long-running writer may
   append to an earlier part of its own, §17.7). Requests that waited for the
   engine share that check: one that began after a request arrived (another
@@ -538,9 +539,9 @@ pub struct Response { pub status: i32, pub lines: Vec<String>, pub diagnostics: 
   refresh that only stats the parts when nothing changed; writes encoded once and
   appended in batches; responses written in one `write`.
 - If a workload misses the bar: profile it before release. Candidate: keeping
-  the active part open between batches. Not a candidate: skipping the directory
-  listing when its timestamp is unchanged, which many file systems (mergerfs,
-  network, coarse clocks) make unsafe.
+  the active part open between batches. Skipping the directory listing when its
+  timestamp is unchanged is done only on local kernel file systems, which keep it
+  (mergerfs, network and unknown ones are listed every time).
 
 ## 12. Docs, CI and release
 

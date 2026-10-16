@@ -303,7 +303,12 @@ impl Writer {
         // created: a part's name is never made anew once it has gone.
         // The error of a part found missing by every try so far, the same part each time.
         let mut missing: Option<Error> = None;
+        let trusted = parts::store_dir_times_trusted(&self.store);
         for at in 0..3 {
+            // The directory's timestamp before the listing: it tells, after the lock, that the
+            // names did not change only on a local file system, and when it was not too recent.
+            let dir = parts::dir_mtime(&self.store);
+            let sampled = (trusted && dir != 0 && !parts::racy(dir)).then_some(dir);
             let listed = parts::list(&self.store)?;
             let create = listed.is_empty();
             let part = match listed.into_iter().last() {
@@ -354,9 +359,9 @@ impl Writer {
                 Err(e) => return Err(io(e)),
             };
             let guard = lock::lock(&file, path).map_err(io)?;
-            // Still the active part: listed again (a directory's timestamp cannot tell, on a
-            // union file system whose parts sit on several branches).
-            let active = parts::active(&self.store)?.path == part.path;
+            // Still the active part: the directory's names are as listed, or listed again.
+            let same = sampled.is_some_and(|d| parts::dir_mtime(&self.store) == d);
+            let active = same || parts::active(&self.store)?.path == part.path;
             if !active || !names(path, &file) {
                 missing = None;
                 continue;

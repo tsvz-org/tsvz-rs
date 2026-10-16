@@ -126,6 +126,82 @@ pub fn active(store: &Path) -> Result<Part, Error> {
     }
 }
 
+/// The directory a store's parts are in.
+fn dir_of(store: &Path) -> &Path {
+    store
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// The timestamp of the directory of `store`, in nanoseconds; 0 when it cannot be read.
+pub(crate) fn dir_mtime(store: &Path) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir_of(store)).map_or(0, |m| {
+        m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128
+    })
+}
+
+/// Whether a directory timestamp is too recent to tell a change made within the same tick.
+pub(crate) fn racy(mtime: i128) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128);
+    now - mtime < 2_000_000_000
+}
+
+/// Whether the file system holding the directory of `store` keeps the directory's timestamp:
+/// a local kernel one, which sets it at every name made, renamed or removed in it (POSIX).
+/// Never FUSE (mergerfs shows one branch's directory), network or overlay file systems, nor
+/// one this does not know: there the directory is listed every time.
+pub fn store_dir_times_trusted(store: &Path) -> bool {
+    dir_times_trusted(dir_of(store))
+}
+
+/// [`store_dir_times_trusted`] for the directory `dir` itself.
+#[cfg(target_os = "linux")]
+pub fn dir_times_trusted(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    const EXT: i64 = 0xEF53;
+    const XFS: i64 = 0x5846_5342;
+    const BTRFS: i64 = 0x9123_683E;
+    const ZFS: i64 = 0x2FC1_2FC1;
+    const F2FS: i64 = 0xF2F5_2010;
+    const TMPFS: i64 = 0x0102_1994;
+    matches!(fs.f_type as i64, EXT | XFS | BTRFS | ZFS | F2FS | TMPFS)
+}
+
+/// [`store_dir_times_trusted`] for the directory `dir` itself.
+#[cfg(target_vendor = "apple")]
+pub fn dir_times_trusted(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    // SAFETY: f_fstypename is a NUL-terminated name within its array.
+    let name = unsafe { std::ffi::CStr::from_ptr(fs.f_fstypename.as_ptr()) };
+    matches!(name.to_bytes(), b"apfs" | b"hfs")
+}
+
+/// [`store_dir_times_trusted`] for the directory `dir` itself.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub fn dir_times_trusted(_dir: &Path) -> bool {
+    false
+}
+
 /// The unnumbered part 0 of `store`, the store's own path (§17.1).
 pub fn unnumbered(store: &Path) -> Result<Part, Error> {
     let text = store

@@ -235,6 +235,10 @@ pub(crate) const CHECK_BYTES: u64 = 4096;
 /// What `refresh` (Task 16) needs to follow the files.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Follow {
+    /// The directory's timestamp when the parts were last listed, and whether it was too
+    /// recent to tell a change within the same tick (used only where it is trusted).
+    pub dir_mtime: i128,
+    pub dir_racy: bool,
     pub stamps: Vec<Option<Stamp>>,
     /// Offset just after the last committed line of the last part (plain parts only).
     pub offset: u64,
@@ -296,6 +300,8 @@ pub struct Store {
     /// file, so none waits to be closed while this process holds a classic lock on it
     /// ([`Handle`]).
     last: Option<Handle>,
+    /// Its directory's timestamp shows every change of its names ([`parts::dir_times_trusted`]).
+    pub(crate) dir_trusted: bool,
 }
 
 impl Store {
@@ -365,6 +371,7 @@ impl Store {
 
     fn open_once(path: &Path, options: Options, limit: Option<usize>) -> Result<Store, Error> {
         let path = path.to_path_buf();
+        let dir_trusted = parts::store_dir_times_trusted(&path);
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
         if let (false, Some(d)) = (format.strict, options.delimiter) {
             if !name::usable_delimiter(d) {
@@ -387,6 +394,7 @@ impl Store {
             follow: Follow::default(),
             torn: false,
             last: None,
+            dir_trusted,
         };
         store.load()?;
         Ok(store)
@@ -408,7 +416,12 @@ impl Store {
                 return Err(unsupported(part));
             }
         }
-        self.follow = Follow::default();
+        let dir = parts::dir_mtime(&self.path);
+        self.follow = Follow {
+            dir_mtime: dir,
+            dir_racy: parts::racy(dir),
+            ..Follow::default()
+        };
         let last = list.len() - 1;
         for (i, part) in list.iter().enumerate() {
             self.replay.begin_part(&part.path, i == 0);
@@ -629,16 +642,27 @@ impl Store {
     /// the directory is as the last check found it and old enough for its timestamp to show a
     /// change; else they are listed, and the directory's timestamp recorded when they are.
     pub(crate) fn same_parts(&mut self) -> Result<bool, Error> {
-        // Listed every time: a directory's timestamp proves nothing unchanged (a union file
-        // system shows one branch's; coarse and network ones lag).
+        // Its timestamp is trusted only on a local kernel file system, which sets it at every
+        // name made, renamed or removed, and only when it was not too recent; elsewhere (a
+        // union file system shows one branch's; network ones lag) the directory is listed.
+        let dir = parts::dir_mtime(&self.path);
+        if self.dir_trusted && dir != 0 && dir == self.follow.dir_mtime && !self.follow.dir_racy {
+            return Ok(true);
+        }
         let mut now = parts::list(&self.path)?;
         if let Some(n) = self.limit {
             now.truncate(n);
         }
-        Ok(now
+        if now
             .iter()
             .map(|p| &p.path)
-            .eq(self.parts.iter().map(|p| &p.path)))
+            .ne(self.parts.iter().map(|p| &p.path))
+        {
+            return Ok(false);
+        }
+        self.follow.dir_mtime = dir;
+        self.follow.dir_racy = parts::racy(dir);
+        Ok(true)
     }
 
     /// Whether the read met a checksum marker of a known algorithm (§15).
@@ -812,10 +836,26 @@ mod tests {
         };
         set_old();
         let mut store = Store::open(&p, Options::default()).unwrap();
+        store.dir_trusted = false; // as on mergerfs, NFS, SMB, …
         write(dir.path(), "s.tsvz.1", b"b\t2\n");
         set_old();
         store.refresh().unwrap();
         assert_eq!(store.len(), 2, "the new part was read");
+    }
+
+    #[test]
+    fn a_local_file_system_keeps_directory_timestamps() {
+        // The tests run on a local kernel file system (tmpfs, ext4, APFS): there a directory's
+        // timestamp follows every new, renamed and removed name.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(parts::dir_times_trusted(dir.path()));
+        assert!(!parts::dir_times_trusted(&dir.path().join("nowhere")));
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        assert!(store.dir_trusted);
+        write(dir.path(), "s.tsvz.1", b"b\t2\n");
+        store.refresh().unwrap();
+        assert_eq!(store.len(), 2);
     }
 
     #[test]

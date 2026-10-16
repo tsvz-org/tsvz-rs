@@ -48,6 +48,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | `-v` with a handler | A routed command names the handler it used; `serve -v` reports each request's status | — |
 | Strict stores only (departs from TSVZ.py) | `serve` refuses a loose file and the CLI never forwards one: tsvz-rs and TSVZ.py read loose files by different rules, so a forwarded command could print what the other tool's files would not | — |
 | Loose files | Design section 5.6's simple rule; TSVZ.py uses its 3.39 rules instead (§20.2.4 allows both), which also cut a row longer than the first to its width | — |
+| When the parts are listed again | At every check of a store (a read through a handler, a write's check of other writers, the writer after taking the lock), except where the directory's timestamp is trusted: on a local kernel file system (ext2/3/4, XFS, btrfs, ZFS, f2fs, tmpfs on Linux; APFS, HFS+ on macOS), which sets it at every name made, renamed or removed, an unchanged timestamp at least 2 s old means the same names. Never on FUSE (mergerfs shows one branch's directory), network, overlay or unknown file systems | — |
 | `-V` | `tsvz-rs` and the crate version (`tsvz-rs 0.1.1`) | — |
 
 ## Where TSVZ.py departs from the spec
