@@ -3,7 +3,7 @@
 A fast implementation of [tsvz-spec-v1](https://tsvz.org) in Rust: the `tsvz` command-line
 tool, and the `tsvz` library crate it is built on. TSVZ stores are append-only key-value logs
 in plain TSV, CSV, NSV or PSV text; see the specification and the Python reference
-implementation, [TSVZ](https://github.com/yufei-pan/TSVZ).
+implementation, [TSVZ](https://github.com/tsvz-org/TSVZ).
 
 ## Install
 
