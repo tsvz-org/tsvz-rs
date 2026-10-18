@@ -899,9 +899,13 @@ fn snapshot_part(
         "delete" if s.damaged() => "rename", // a part whose damage was recovered is kept
         action => action,
     };
+    // One that other parts precede must also carry #_snapshot_# (a part a 0.1.3 scrub wrote does
+    // not), or readers would go on replaying them: such a part gets a marked copy, once.
+    let others = &prefix[..prefix.len() - 1];
+    let marked =
+        !s.format().strict || others.is_empty() || crate::store::is_snapshot_part(last, s.format());
     let size = std::fs::metadata(&last.path).map(|m| m.len());
-    if size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
-        let others = &prefix[..prefix.len() - 1];
+    if marked && size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
         if others.is_empty() || action == "keep" {
             return Ok(Snapshotted::Done(Outcome::Unchanged));
         }
@@ -2659,6 +2663,34 @@ mod tests {
                 "{others:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_snapshot_part_a_scrub_wrote_unmarked_gets_a_marked_copy_once() {
+        // 0.1.3 wrote no #_snapshot_#: the part reads as the prefix, but readers would go on
+        // replaying the parts before it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "#h\na\t1\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "a\nc\t3\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.8"), "z\t9\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let five = dir.path().join("s.tsvz.5");
+        let unmarked = fs::read_to_string(&five)
+            .unwrap()
+            .replacen("#_snapshot_#\n", "", 1);
+        fs::write(&five, unmarked).unwrap();
+        let before = rows(&p);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let added: Vec<String> = files(dir.path())
+            .into_iter()
+            .filter(|n| !["s.tsvz", "s.tsvz.2", "s.tsvz.5", "s.tsvz.8"].contains(&n.as_str()))
+            .collect();
+        assert_eq!(added.len(), 1, "{added:?}");
+        let copy = fs::read_to_string(dir.path().join(&added[0])).unwrap();
+        assert!(copy.starts_with("#h\n#_snapshot_#\n"), "{copy:?}");
+        assert_eq!(rows(&p), before);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged, "once");
     }
 
     #[test]

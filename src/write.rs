@@ -119,6 +119,20 @@ pub fn name_key<'k>(
     }
 }
 
+/// Whether `key` is `#_snapshot_#`, which a writer appending records never writes in a strict
+/// store: as the first line of a part it would make readers skip every part before it
+/// (§19.10.2, §19.10.3). A loose file has no markers (§5.2): there it is a comment, as TSVZ.py
+/// writes it.
+fn is_snapshot_marker(key: &[u8]) -> bool {
+    key.eq_ignore_ascii_case(b"#_snapshot_#")
+}
+
+fn snapshot_refused(key: &str) -> Error {
+    Error::Refused(format!(
+        "{key} is not written by a writer appending records: it marks a part that holds the store's whole state, written by a snapshot (§19.10.2); nothing was written"
+    ))
+}
+
 /// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file has no
 /// escaping, so a field holding its delimiter, `\n` or `\r` is refused.
 pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Result<(), Error> {
@@ -134,11 +148,8 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
             "{key:?} is not a marker key (#_name_#, §12.2); nothing was written"
         )));
     }
-    if marker && key.eq_ignore_ascii_case("#_snapshot_#") {
-        // As the first line of a part it would make readers skip every part before it (§19.10.3).
-        return Err(Error::Refused(format!(
-            "{key} is not written by a writer appending records: it marks a part that holds the store's whole state, written by a snapshot (§19.10.2); nothing was written"
-        )));
+    if marker && format.strict && is_snapshot_marker(key.as_bytes()) {
+        return Err(snapshot_refused(key));
     }
     if !format.strict {
         if !name::usable_delimiter(d) {
@@ -304,8 +315,20 @@ impl Writer {
         self.append_runs_at(&runs).map(|_| ())
     }
 
-    /// Append encoded records (each ending in `\n`) as one batch.
+    /// Append encoded records (each ending in `\n`) as one batch. A `#_snapshot_#` line in a
+    /// strict store is refused, as [`Writer::append`] refuses it.
     pub fn append_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
+        if self.format.strict {
+            let d = self.format.delimiter;
+            for line in payload.split(|&b| b == b'\n') {
+                let line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
+                let key = line.split(|&b| b == d).next().unwrap_or(line);
+                let key = key.strip_suffix(b"\r").unwrap_or(key);
+                if is_snapshot_marker(key) {
+                    return Err(snapshot_refused(&String::from_utf8_lossy(key)));
+                }
+            }
+        }
         self.append_runs_at(&[(payload, self.member_size as u64)])
             .map(|_| ())
     }
@@ -536,6 +559,48 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "a\t1\n",
             "nothing written"
+        );
+    }
+
+    #[test]
+    fn a_payload_never_writes_the_snapshot_marker_into_a_strict_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        std::fs::write(&p, "a\t1\n").unwrap();
+        for payload in [
+            &b"b\t2\n#_SNAPSHOT_#\r\n"[..],
+            b"#_snapshot_#\t\n",
+            b"\xef\xbb\xbf#_snapshot_#\n",
+        ] {
+            let e = Writer::open(&p)
+                .unwrap()
+                .append_payload(payload)
+                .unwrap_err();
+            assert!(e.to_string().contains("§19.10.2"), "{payload:?}: {e}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a\t1\n",
+            "nothing written"
+        );
+        Writer::open(&p)
+            .unwrap()
+            .append_payload(b"<#>_snapshot_#\tdata\n")
+            .unwrap();
+        // A loose file has no markers: there the line is a comment, as TSVZ.py writes it.
+        let loose = dir.path().join("l.tsv");
+        let marker = Record::Marker {
+            key: "#_snapshot_#".into(),
+            values: Vec::new(),
+        };
+        Writer::open(&loose).unwrap().append(&[marker]).unwrap();
+        Writer::open(&loose)
+            .unwrap()
+            .append_payload(b"#_snapshot_#\n")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&loose).unwrap(),
+            "#_snapshot_#\n#_snapshot_#\n"
         );
     }
 

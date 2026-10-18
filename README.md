@@ -71,6 +71,9 @@ for (key, row) in store.iter() {
 # Ok::<(), tsvz::Error>(())
 ```
 
+A read begins at the store's last snapshot part (§19.10.3); `Options { full_history: true,
+..Options::default() }` replays every part, as `verify` always does.
+
 Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
 available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
 process loses when it closes any other descriptor of the same file. The library opens a store's
