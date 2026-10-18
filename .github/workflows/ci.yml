@@ -39,7 +39,7 @@ jobs:
         env:
           TSVZ_TEST_CLASSIC_LOCKS: "1"
       - run: cargo build --release
-      - run: python3 TSVZ/tsvzconform.py --impl target/release/tsvz --class reader,writer,cli,handler --feature bzip2,xz,zstd,crc32,crc32c,sha256,blake3,file-first,handler,scrub-multipart
+      - run: python3 TSVZ/tsvzconform.py --impl target/release/tsvz --class reader,writer,cli,handler --feature bzip2,xz,zstd,crc32,crc32c,sha256,blake3,file-first,handler,scrub-multipart,snapshot-skip
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:200
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:100 --handler
       - run: python3 difftest/difftest.py --rust target/release/tsvz --tsvz TSVZ/TSVZ.py --seeds 0:100 --scrub

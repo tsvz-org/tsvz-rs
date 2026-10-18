@@ -33,7 +33,9 @@ part being rewritten, or, when no ordinal is free there, compacts them into the 
 place (§19.8); then it applies the store's `#_rotate_#` (`keep`, `rename` or `delete`) to the
 parts the snapshot holds. Writers keep appending to the active part throughout. `scrub`, and
 `clear` of a one-part store, refuse parts that declare a spec version newer than the one tsvz
-implements (§6.3, §19.4, §19.8).
+implements (§6.3, §19.4, §19.8). A snapshot part that other parts precede begins with
+`#_snapshot_#` (§19.10), and a read begins at the last such part instead of replaying the parts
+before it; `verify` still replays every part.
 
 ## Handler
 
@@ -81,11 +83,11 @@ Build without the command line and C libraries with
 ## Conformance and compatibility
 
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
-every codec, every digest and multi-part scrub claimed, and is checked against TSVZ.py on random
-stores, with and without its handler. Rust and Python writers can share a store: they take the
-same file locks. Where the specification leaves a choice open, tsvz-rs does what TSVZ.py does;
-[docs/silent-choices.md](docs/silent-choices.md) lists those choices. Benchmarks against TSVZ.py
-are in [bench/RESULTS.md](bench/RESULTS.md).
+every codec, every digest, multi-part scrub and snapshot skipping claimed, and is checked
+against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
+share a store: they take the same file locks. Where the specification leaves a choice open,
+tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
+choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
 ## License
 

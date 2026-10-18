@@ -210,6 +210,22 @@ fn restating_snapshot(s: &Store, deleted: &[String]) -> String {
     out
 }
 
+/// `content`, for a part that other parts precede, begun with `#_snapshot_#` after its header
+/// comment (§19.10.2): it reads alone as those parts and it do, and a reader that implements
+/// §19.10 begins there instead of replaying them (§19.10.3). The scrub's guards check that it
+/// reads so, both alone and after them. A loose file has no markers (§5.2).
+fn marked(s: &Store, content: String) -> String {
+    if !s.format().strict {
+        return content;
+    }
+    let at = s.header().map_or(0, |h| h.len() + 1);
+    let mut out = String::with_capacity(content.len() + 13);
+    out.push_str(&content[..at]);
+    out.push_str("#_snapshot_#\n");
+    out.push_str(&content[at..]);
+    out
+}
+
 /// The spec version newer than this tsvz implements that a `#_version_#` line of the read
 /// declared, as words; None when every one is implemented (§6.3).
 fn newer_version(s: &Store) -> Option<String> {
@@ -439,12 +455,14 @@ fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
 }
 
 /// A whole read for a rewrite: never past a part it cannot read, since what it writes would
-/// lose that part's rows.
+/// lose that part's rows, and every part replayed, those before a snapshot part too (§19.10.3):
+/// what is written must read the same to a reader that replays them.
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
         verify: false,
         skip_unreadable: false,
+        full_history: true,
         ..options.clone()
     }
 }
@@ -709,13 +727,15 @@ fn attempt(
         }
         Some(earlier)
     };
+    // With no part before it (a one-part store, or part 0), there is nothing to skip: the
+    // content is TSVZ.py's, unmarked.
     let content = match &earlier {
         None => snapshot(&s),
         Some(earlier) => match read!(
             live_after_any_prefix(store, options, others, earlier),
             Step::Again
         ) {
-            Some(deleted) => restating_snapshot(&s, &deleted),
+            Some(deleted) => marked(&s, restating_snapshot(&s, &deleted)),
             None => return Ok(Step::Again(None)), // the parts changed under the read
         },
     };
@@ -848,17 +868,20 @@ fn snapshot_part(
     before: &[Stamp],
 ) -> Result<Snapshotted, Error> {
     let last = &prefix[prefix.len() - 1];
-    let content = if s.markers().rotate == "keep" {
-        snapshot(s)
-    } else {
-        match read!(
-            live_after_any_prefix(store, options, prefix, s),
-            Snapshotted::Again
-        ) {
-            Some(deleted) => restating_snapshot(s, &deleted),
-            None => return Ok(Snapshotted::Again(None)),
-        }
-    };
+    let content = marked(
+        s,
+        if s.markers().rotate == "keep" {
+            snapshot(s)
+        } else {
+            match read!(
+                live_after_any_prefix(store, options, prefix, s),
+                Snapshotted::Again
+            ) {
+                Some(deleted) => restating_snapshot(s, &deleted),
+                None => return Ok(Snapshotted::Again(None)),
+            }
+        },
+    );
     let bytes = match last.codec {
         Some(c) if !content.is_empty() => {
             codec::encode_members(c, content.as_bytes(), s.markers().member_size as usize)
@@ -2572,6 +2595,70 @@ mod tests {
         fs::write(dir.path().join("s.tsvz.2"), "z\t9\n").unwrap();
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
         assert_eq!(files(dir.path()), ["s.tsvz", "s.tsvz.1", "s.tsvz.2"]);
+    }
+
+    #[test]
+    fn a_snapshot_part_that_other_parts_precede_begins_with_the_snapshot_marker() {
+        // §19.10.2, after the header comment: a reader that implements §19.10 begins there and
+        // reads as one that replays every part does (§19.10.3).
+        let full = Options {
+            full_history: true,
+            ..opts()
+        };
+        let read = |p: &Path, o: &Options| trimmed_rows(&Store::open(p, o.clone()).unwrap());
+        for (rotate, part0) in [
+            ("keep", "#h\na\t1\nb\t2\n"),
+            ("rename", "#h\n#_rotate_#\trename\na\t1\nb\t2\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, part0).unwrap();
+            fs::write(dir.path().join("s.tsvz.2"), "a\nc\t3\n").unwrap();
+            fs::write(dir.path().join("s.tsvz.8"), "z\t9\n").unwrap();
+            let before = read(&p, &full);
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written, "{rotate}");
+            let snapshot = fs::read_to_string(dir.path().join("s.tsvz.5")).unwrap();
+            assert!(
+                snapshot.starts_with("#h\n#_snapshot_#\n#_version_#\t1\n"),
+                "{rotate}: {snapshot:?}"
+            );
+            assert_eq!(read(&p, &opts()), before, "{rotate}");
+            assert_eq!(read(&p, &full), before, "{rotate}");
+            if rotate == "keep" {
+                assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged, "run again");
+            }
+        }
+        // Compacted in place into the last of the parts before the active one (no ordinal is free
+        // between .1 and .2), which part 0 precedes: marked too.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "a\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.2"), "z\t9\n").unwrap();
+        let before = read(&p, &full);
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let compacted = fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap();
+        assert!(
+            compacted.starts_with("#_snapshot_#\n#_version_#\t1\n"),
+            "{compacted:?}"
+        );
+        assert_eq!(read(&p, &opts()), before);
+        assert_eq!(read(&p, &full), before);
+        // With no part before the one compacted (a one-part store, or part 0): TSVZ.py's
+        // content, unmarked.
+        for others in [&[][..], &["s.tsvz.1"][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("s.tsvz");
+            fs::write(&p, "#h\na\t1\na\t2\n").unwrap();
+            for name in others {
+                fs::write(dir.path().join(name), "z\t9\n").unwrap();
+            }
+            assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+            assert!(
+                !fs::read_to_string(&p).unwrap().contains("#_snapshot_#"),
+                "{others:?}"
+            );
+        }
     }
 
     #[test]
