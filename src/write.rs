@@ -134,6 +134,12 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
             "{key:?} is not a marker key (#_name_#, §12.2); nothing was written"
         )));
     }
+    if marker && key.eq_ignore_ascii_case("#_snapshot_#") {
+        // As the first line of a part it would make readers skip every part before it (§19.10.3).
+        return Err(Error::Refused(format!(
+            "{key} is not written by a writer appending records: it marks a part that holds the store's whole state, written by a snapshot (§19.10.2); nothing was written"
+        )));
+    }
     if !format.strict {
         if !name::usable_delimiter(d) {
             return Err(Error::Refused(format!(
@@ -508,6 +514,27 @@ mod tests {
         }
         assert!(
             !p.exists() || std::fs::read(&p).unwrap().is_empty(),
+            "nothing written"
+        );
+    }
+
+    #[test]
+    fn a_writer_never_writes_the_snapshot_marker() {
+        // As the first line of a new part, it would make readers skip the parts before it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        std::fs::write(&p, "a\t1\n").unwrap();
+        for key in ["#_snapshot_#", "#_SNAPSHOT_#"] {
+            let marker = Record::Marker {
+                key: key.into(),
+                values: Vec::new(),
+            };
+            let e = Writer::open(&p).unwrap().append(&[marker]).unwrap_err();
+            assert!(e.to_string().contains("§19.10.2"), "{key:?}: {e}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a\t1\n",
             "nothing written"
         );
     }
