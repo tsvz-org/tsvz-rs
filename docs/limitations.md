@@ -12,9 +12,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   since byte 0 is inside its whole-file lock: slower, not wrong). On macOS `flock` and POSIX locks exclude each
   other (TSVZ's macOS CI job checked it, 2026-11-04, against `lockf`), so it holds there too.
 - Why: tsvz-rs follows TSVZ.py; the change is a lock-layer change of its own:
-  - `Handle::open_read` callers take READ: byte 0 shared on Linux. On macOS that works only after a move to
+  - `Handle::open_read` callers take READ: byte 0 shared on Linux, through the gate (byte 2 shared, let go of once
+    byte 0 is held). On macOS that works only after a move to
     `flock`, because a shared POSIX lock would replace the process's own write lock.
-  - `maint.rs` rewrites take byte 1, then the whole file; appends move to byte 1, so they do not wait for Python
+  - `maint.rs` rewrites take byte 1, the gate (byte 2), then the whole file; appends move to byte 1, so they do not wait for Python
     readers.
   - Optional: `flock` on macOS would let the `Handle` table and its deferred closes go.
   - Tests: extend `tests/interop.rs` with "a Python READ waits for a Rust rewrite" and "a Rust reader waits for a
