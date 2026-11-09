@@ -22,3 +22,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     Python rewrite".
 - Revisit when: someone shares a file between tsvz-rs and another writer that rewrites it.
 - Approved: 2026-11-04, the user chose "Deferred in tsvz-rs (Recommended)".
+
+### A lone key is a deletion to tsvz-rs at one column, a row to TSVZ.py, so keys list in another order after a TSVZ.py rewrite
+- Kind: deferred
+- What the operator sees: where TSVZ.py and 3.39 read a key with no value as a row at one column, tsvz-rs reads it as a
+  deletion. TSVZ.py's rewrites (a commit, a scrub, a rewrite, a delete and a rewrite, a delete and its commit) keep a file the
+  same for TSVZ.py's readers, but tsvz-rs can then list the keys in another order, with no key or cell lost. Examples, run
+  with the tsvz-rs 0.1.3 binary and TSVZ.py 5.10:
+  - A commit: `d\tX\tW\na\nd\t\ne\t1\nd\t\n` in a `TSVZed` given header `q`, `del t['a']` and its commit write
+    `d\tX\tW\nd\ne\t1\nd\t\n`. TSVZ.py lists d, e; tsvz-rs lists e, d.
+  - A scrub: `id\nb\t1\tX\tX\na\na\t2\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n` with no header and defaults
+    `['#_defaults_#', '', '']` writes `id\nb\t1\tX\tX\na\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n`. tsvz-rs lists b, a, d
+    before it and b, d, a after; TSVZ.py lists b, a, d both times.
+- Why: the two read a lone key at one column differently, and TSVZ.py's compaction orders lines for its own reading.
+- Revisit when: the next tsvz-rs version. The plan: read a lone key as a row at one column, as TSVZ.py does.
+- Noted: 2026-11-09, found in the TSVZ 5.10 re-review (round 3); a deferral under the user's standing rule that deferrals are noted, not asked.
