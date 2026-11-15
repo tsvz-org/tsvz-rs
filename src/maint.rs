@@ -421,11 +421,7 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         let _ = std::fs::remove_file(&target);
         return Err(Error::io(&target, e));
     }
-    if let Some(dir) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
+    sync_dir(&target);
     if let Some(w) = &options.warnings {
         w(&Warning {
             part: path.to_path_buf(),
@@ -1044,11 +1040,6 @@ fn fill_snapshot(
     file.sync_all().map_err(io)
 }
 
-/// The variant extension of a store path as it is spelled (`tsvz`, `CSV`, …).
-fn variant_ext(store: &Path) -> String {
-    stem_and_ext(store).1
-}
-
 /// A store path's name without its codec suffix, split at its variant extension: `s.tsvz.gz`
 /// → (`s`, `tsvz`).
 fn stem_and_ext(store: &Path) -> (String, String) {
@@ -1074,7 +1065,7 @@ fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, 
             part.display(),
             local_timestamp(),
             std::process::id(),
-            variant_ext(store)
+            stem_and_ext(store).1
         ));
         // Taken (another host's scrub, same second and pid): the next number.
         match OpenOptions::new()
@@ -1373,11 +1364,7 @@ fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Err
 }
 
 fn sync_dir(path: &Path) {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if let Ok(d) = File::open(dir) {
+    if let Ok(d) = File::open(parts::dir_of(path)) {
         let _ = d.sync_all();
     }
 }

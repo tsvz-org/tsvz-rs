@@ -8,10 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::handler::engine::Engine;
+use crate::handler::engine::{Engine, lock};
 use crate::handler::pointer::{self, Take};
 use crate::handler::protocol::{self, LINE_LIMIT, Response, read_line, read_response};
 use crate::{Error, WarnFn, name};
@@ -35,10 +35,6 @@ pub struct Config {
     pub info: InfoFn,
     /// Report every request and its status.
     pub verbose: bool,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {

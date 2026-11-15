@@ -4,17 +4,6 @@ use std::borrow::Cow;
 
 use crate::name::Codec;
 
-/// How the member at the start of some bytes decoded (§16.6 rule 1).
-#[derive(Debug, PartialEq, Eq)]
-pub enum Member {
-    /// Decoded to its end and passed its check; `end` is its length in bytes.
-    Complete { out: Vec<u8>, end: usize },
-    /// The bytes ended before the member did.
-    Short,
-    /// The bytes are not a valid member.
-    Bad,
-}
-
 /// A damaged member's bytes decoded on their own (§16.6 rule 2).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Alone {
@@ -351,16 +340,6 @@ fn member_into(codec: Codec, data: &[u8], out: &mut Vec<u8>) -> Judged {
     }
 }
 
-/// Decode the member at the start of `data` (§16.6 rule 1).
-pub fn member(codec: Codec, data: &[u8]) -> Member {
-    let mut out = Vec::new();
-    match member_into(codec, data, &mut out) {
-        Judged::Bad => Member::Bad,
-        Judged::Complete(end) => Member::Complete { out, end },
-        Judged::Short => Member::Short,
-    }
-}
-
 /// Decode a damaged member's bytes on their own (§16.6 rule 2). They are fed in large steps;
 /// when a step fails, they are decoded again with that step fed a byte at a time, so nothing
 /// decoded before the failing byte is lost with the call that fails (the runner's oracle feeds
@@ -608,6 +587,27 @@ pub fn encode_members(codec: Codec, payload: &[u8], member_size: usize) -> Optio
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// How the member at the start of some bytes decoded (§16.6 rule 1).
+    #[derive(Debug, PartialEq, Eq)]
+    enum Member {
+        /// Decoded to its end and passed its check; `end` is its length in bytes.
+        Complete { out: Vec<u8>, end: usize },
+        /// The bytes ended before the member did.
+        Short,
+        /// The bytes are not a valid member.
+        Bad,
+    }
+
+    /// Decode the member at the start of `data` (§16.6 rule 1).
+    fn member(codec: Codec, data: &[u8]) -> Member {
+        let mut out = Vec::new();
+        match member_into(codec, data, &mut out) {
+            Judged::Bad => Member::Bad,
+            Judged::Complete(end) => Member::Complete { out, end },
+            Judged::Short => Member::Short,
+        }
+    }
 
     /// A member built by the codec crates' own encoders, so decoding is tested independently of Task 6.
     fn fixture(codec: Codec, data: &[u8]) -> Vec<u8> {

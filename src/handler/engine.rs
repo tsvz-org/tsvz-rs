@@ -27,7 +27,8 @@ pub const NO_STORE: &str = "no such store";
 /// The message of a read that skipped a part or stopped at damaged data (§21.8.5).
 pub const INCOMPLETE: &str = "could not read every part of the store";
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+/// A mutex's guard, though a thread panicked holding it.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
