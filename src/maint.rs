@@ -213,11 +213,8 @@ fn restating_snapshot(s: &Store, deleted: &[String]) -> String {
 /// `content`, for a part that other parts precede, begun with `#_snapshot_#` after its header
 /// comment (§19.10.2): it reads alone as those parts and it do, and a reader that implements
 /// §19.10 begins there instead of replaying them (§19.10.3). The scrub's guards check that it
-/// reads so, both alone and after them. A loose file has no markers (§5.2).
+/// reads so, both alone and after them.
 fn marked(s: &Store, content: String) -> String {
-    if !s.format().strict {
-        return content;
-    }
     let at = s.header().map_or(0, |h| h.len() + 1);
     let mut out = String::with_capacity(content.len() + 13);
     out.push_str(&content[..at]);
@@ -902,8 +899,7 @@ fn snapshot_part(
     // One that other parts precede must also carry #_snapshot_# (a part a 0.1.3 scrub wrote does
     // not), or readers would go on replaying them: such a part gets a marked copy, once.
     let others = &prefix[..prefix.len() - 1];
-    let marked =
-        !s.format().strict || others.is_empty() || crate::store::is_snapshot_part(last, s.format());
+    let marked = others.is_empty() || crate::store::is_snapshot_part(last, s.format());
     let size = std::fs::metadata(&last.path).map(|m| m.len());
     if marked && size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
         if others.is_empty() || action == "keep" {

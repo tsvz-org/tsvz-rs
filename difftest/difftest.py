@@ -284,15 +284,6 @@ def same_reads(rust, python, store, scrubbed, delimiter):
     return problems
 
 
-# Differences where TSVZ.py, not tsvz-rs, departs from the spec: (reason, test). Remove an entry
-# once TSVZ.py is fixed. Each is listed in docs/silent-choices.md.
-KNOWN = []  # none as of TSVZ.py 4.6
-
-
-def known(op, rs, py):
-    return next((reason for reason, test in KNOWN if test(op, rs, py)), None)
-
-
 def main():
     parser = argparse.ArgumentParser(description='Differential test of tsvz-rs against TSVZ.py.')
     here = os.path.dirname(os.path.abspath(__file__))
@@ -313,7 +304,6 @@ def main():
     keep = args.keep or None
     failed = 0
     refused = {}
-    seen = {}
     ops = [['read'], ['len'], ['keys'], ['verify'], ['parts'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp'],
            ['read', '-d', 'comma']]
     for seed in range(start, end):
@@ -333,10 +323,7 @@ def main():
                     a, b = ask_tty(rust, store, op[1:]), ask_tty(python, store, op[1:])
                 else:
                     a, b = ask(rust, store, op), ask(python, store, op)
-                same = a == b
-                if not same and known(op, a, b):
-                    seen[known(op, a, b)] = seen.get(known(op, a, b), 0) + 1
-                elif not same:
+                if a != b:
                     problems.append('  %s: tsvz-rs %s %r\n  %s  TSVZ.py %s %r' % (' '.join(op), a[0], a[1][:300], ' ' * len(' '.join(op)), b[0], b[1][:300]))
             if handler is not None:
                 unserve(rust, store, handler)
@@ -358,8 +345,6 @@ def main():
                 print('seed %d disagrees (files in %s):\n%s' % (seed, target, '\n'.join(problems)))
         finally:
             shutil.rmtree(directory, ignore_errors=True)
-    for reason, count in seen.items():
-        print('known TSVZ.py difference, %d times: %s' % (count, reason))
     if args.scrub:
         print('%d scrubs refused (not compared)' % sum(refused.values()))
         for why, count in sorted(refused.items(), key=lambda r: -r[1]):
