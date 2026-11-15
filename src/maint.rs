@@ -8,6 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::escape;
+use crate::loose;
 use crate::name::Codec;
 use crate::parts::{self, Stamp};
 use crate::replay::{DEFAULT_MEMBER_SIZE, Markers, Policy, SPEC_VERSION};
@@ -98,7 +99,8 @@ fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
 /// The snapshot content of §19.2.3 for a store read whole, as TSVZ.py writes it: the header
 /// comment, the markers, then one fully resolved row per live key, padded with empty cells to
 /// the width of the final defaults; the compensating layout of §19.4 when a row would not read
-/// back the same. A loose file keeps its header comment and its rows.
+/// back the same. For a loose file: its header comment and its rows, which is not what `scrub`
+/// writes there (it keeps the file's lines in their places, `#_defaults_#` lines included).
 pub fn snapshot(s: &Store) -> String {
     let f = s.format();
     let d = f.delimiter;
@@ -456,6 +458,7 @@ fn whole(options: &Options) -> Options {
         verify: false,
         skip_unreadable: false,
         full_history: true,
+        lines: true,
         ..options.clone()
     }
 }
@@ -721,14 +724,16 @@ fn attempt(
         Some(earlier)
     };
     // With no part before it (a one-part store, or part 0), there is nothing to skip: the
-    // content is TSVZ.py's, unmarked.
-    let content = match &earlier {
-        None => snapshot(&s),
-        Some(earlier) => match read!(
+    // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), and
+    // the bytes after its last newline, which TSVZ.py reads as a line.
+    let content = match (&earlier, s.loose_lines()) {
+        (_, Some((lines, tail))) => [loose::scrub(&lines), tail.to_vec()].concat(),
+        (None, None) => snapshot(&s).into_bytes(),
+        (Some(earlier), None) => match read!(
             live_after_any_prefix(store, options, others, earlier),
             Step::Again
         ) {
-            Some(deleted) => marked(&s, restating_snapshot(&s, &deleted)),
+            Some(deleted) => marked(&s, restating_snapshot(&s, &deleted)).into_bytes(),
             None => return Ok(Step::Again(None)), // the parts changed under the read
         },
     };
@@ -736,7 +741,7 @@ fn attempt(
     // rewrites in place without one, as TSVZ.py does, where the file system overwrites in
     // place: the rewrite reserves its length first, so it still changes nothing when even
     // that does not fit. A copy-on-write one gives no such promise: refused there.
-    let recovery = match write_recovery(store, &target.path, content.as_bytes()) {
+    let recovery = match write_recovery(store, &target.path, &content) {
         Ok(path) => Some(path),
         Err(e) if !multi && no_room(&e) && overwrites_in_place(&target.path) => {
             if let Some(w) = &options.warnings {
@@ -786,7 +791,7 @@ fn attempt(
     };
     let written = rewrite(
         &target.path,
-        content.as_bytes(),
+        &content,
         before[before.len() - 1],
         target.codec,
         s.markers().member_size,
@@ -1478,24 +1483,23 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 store.display()
             )));
         }
-        let mut content = String::new();
-        if let Some(h) = s.header() {
-            content.push_str(h);
-            content.push('\n');
-        }
-        if s.format().strict {
-            preamble(
-                &mut content,
-                s.markers(),
-                s.format().delimiter,
-                false,
-                false,
-            );
-        }
+        let content = match s.loose_lines() {
+            Some((lines, _)) => loose::cleared(&lines),
+            None => {
+                let mut content = String::new();
+                if let Some(h) = s.header() {
+                    content.push_str(h);
+                    content.push('\n');
+                }
+                let d = s.format().delimiter;
+                preamble(&mut content, s.markers(), d, false, false);
+                content.into_bytes()
+            }
+        };
         let part = &s.parts()[0];
         match rewrite(
             &part.path,
-            content.as_bytes(),
+            &content,
             before,
             part.codec,
             s.markers().member_size,
@@ -1508,6 +1512,78 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
     }
     Err(Error::Refused(format!(
         "{}: clear skipped: the store kept changing while it was being cleared; nothing was written",
+        store.display()
+    )))
+}
+
+/// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`):
+/// a key alone for each live one, appended, as TSVZ.py writes it; in a one-column file, where a
+/// key alone is a row (to TSVZ.py too) and no line can delete, a rewrite without their lines
+/// ([`loose::without`]). A key that is not live is not written: in a file with no keyed line yet
+/// it would set one column, and be a row. A missing file is created (§20.2.2).
+#[cfg(feature = "cli")]
+pub(crate) fn delete_loose(
+    store: &Path,
+    options: &Options,
+    keys: &[String],
+) -> Result<Outcome, Error> {
+    for _ in 0..ATTEMPTS {
+        let Some(part) = parts::list(store)?.into_iter().next() else {
+            Writer::open(store)?
+                .warnings(options.warnings.clone())
+                .delimiter(options.delimiter)
+                .append(&[])?;
+            return Ok(Outcome::Written);
+        };
+        let before = stamp(&part.path)?;
+        let s = Store::open(store, whole(options))?;
+        if s.incomplete() {
+            return Err(Error::Refused(format!(
+                "{}: delete skipped: the file could not be read whole; nothing was written",
+                store.display()
+            )));
+        }
+        let mut live: Vec<&str> = Vec::new();
+        for key in keys {
+            if s.get(key).is_some() && !live.contains(&key.as_str()) {
+                live.push(key);
+            }
+        }
+        if live.is_empty() {
+            return Ok(Outcome::Unchanged);
+        }
+        let (lines, tail) = s
+            .loose_lines()
+            .expect("a loose file read whole keeps its lines");
+        let Some(content) = loose::without(&lines, &live.iter().copied().collect()) else {
+            let tombstones: Vec<crate::write::Record> = live
+                .iter()
+                .map(|k| crate::write::Record::Tombstone { key: k.to_string() })
+                .collect();
+            Writer::open(store)?
+                .warnings(options.warnings.clone())
+                .delimiter(options.delimiter)
+                .append(&tombstones)?;
+            return Ok(Outcome::Written);
+        };
+        if s.damaged() {
+            backup(&part.path, options)?;
+        }
+        let content = [content, tail.to_vec()].concat();
+        match rewrite(
+            &part.path,
+            &content,
+            before,
+            part.codec,
+            DEFAULT_MEMBER_SIZE,
+            None,
+        )? {
+            None => continue, // another writer committed after the read
+            Some(_) => return Ok(Outcome::Written),
+        }
+    }
+    Err(Error::Refused(format!(
+        "{}: delete skipped: the file kept changing while it was being rewritten; nothing was written",
         store.display()
     )))
 }

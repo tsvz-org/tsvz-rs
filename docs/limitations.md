@@ -23,17 +23,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone shares a file between tsvz-rs and another writer that rewrites it.
 - Approved: 2026-11-04, the user chose "Deferred in tsvz-rs (Recommended)".
 
-### A lone key is a deletion to tsvz-rs at one column, a row to TSVZ.py, so keys list in another order after a TSVZ.py rewrite
+### A loose file's unterminated last line is ignored, and cut before an append
 - Kind: deferred
-- What the operator sees: where TSVZ.py and 3.39 read a key with no value as a row at one column, tsvz-rs reads it as a
-  deletion. TSVZ.py's rewrites (a commit, a scrub, a rewrite, a delete and a rewrite, a delete and its commit) keep a file the
-  same for TSVZ.py's readers, but tsvz-rs can then list the keys in another order, with no key or cell lost. Examples, run
-  with the tsvz-rs 0.1.3 binary and TSVZ.py 5.10:
-  - A commit: `d\tX\tW\na\nd\t\ne\t1\nd\t\n` in a `TSVZed` given header `q`, `del t['a']` and its commit write
-    `d\tX\tW\nd\ne\t1\nd\t\n`. TSVZ.py lists d, e; tsvz-rs lists e, d.
-  - A scrub: `id\nb\t1\tX\tX\na\na\t2\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n` with no header and defaults
-    `['#_defaults_#', '', '']` writes `id\nb\t1\tX\tX\na\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n`. tsvz-rs lists b, a, d
-    before it and b, d, a after; TSVZ.py lists b, a, d both times.
-- Why: the two read a lone key at one column differently, and TSVZ.py's compaction orders lines for its own reading.
-- Revisit when: the next tsvz-rs version. The plan: read a lone key as a row at one column, as TSVZ.py does.
-- Noted: 2026-11-09, found in the TSVZ 5.10 re-review (round 3); a deferral under the user's standing rule that deferrals are noted, not asked.
+- What the operator sees: a `.tsv` whose last line has no newline (a file saved by an editor or
+  written with `printf`) shows that line in TSVZ.py, which reads it as a row and adds a newline
+  before it appends. tsvz-rs reads it as an uncommitted tail, as §4.3 says of a strict store: `read`
+  skips it with a warning, and `set` or `delete` cut it first ("cut N uncommitted bytes"), so that
+  row is lost. A loose `scrub` keeps it as it is; a loose `clear`, and a delete that rewrites a
+  one-column file, keep it too, so TSVZ.py still reads a key tsvz-rs no longer lists.
+- Why: tsvz-rs applies the strict-store tail rule to loose files; changing it touches how a store
+  follows appends (`Store::refresh` holds the tail until a newline completes it). Found in 0.1.4's
+  differential runs against TSVZ.py 5.18: every remaining disagreement was such a file.
+- Revisit when: the next tsvz-rs version. The plan: read a loose file's tail as a line, and write a
+  newline before an append instead of cutting it, as TSVZ.py does.
+- Noted: 2026-11-15, in the 0.1.4 build; a deferral under the user's standing rule that deferrals
+  are noted, not asked.

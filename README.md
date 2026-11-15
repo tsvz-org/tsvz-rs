@@ -33,6 +33,11 @@ applies the store's `#_rotate_#`; writers keep appending throughout. A read begi
 snapshot part (§19.10); `verify` replays every part. `scrub` and `clear` refuse parts that
 declare a spec version newer than tsvz implements (§6.3).
 
+Loose files (`.tsv .csv .nsv .psv`, §20.2.4) list the keys TSVZ.py's command line lists, but
+for an unterminated last line, which tsvz-rs ignores; tsvz-rs reads `#_defaults_#` lines as
+comments and leaves cells as written. `scrub` keeps the lines TSVZ.py reads in their places, and
+`clear` the `#_defaults_#` lines ([docs/silent-choices.md](docs/silent-choices.md)).
+
 ## Handler
 
 `tsvz serve STORE` runs a write handler (§21) in the foreground: one process keeps the store
@@ -87,6 +92,17 @@ against TSVZ.py on random stores, with and without its handler. Rust and Python 
 share a store: they take the same file locks. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.1.4 from 0.1.3
+
+Nothing changes for strict stores (`.tsvz .csvz .nsvz .psvz`). In loose files:
+
+- A key alone is a row when the file's first keyed line has one column; `delete`, `pop` and
+  `popitem` there rewrite the file without the key.
+- A row whose cells are all blank is a deletion, as in TSVZ.py: `tsvz set f.tsv k ''` deletes `k`,
+  and a file holding `k<TAB>` reads without `k`.
+- `scrub` keeps the file's lines in their places, `#_defaults_#` lines included, and `clear` keeps
+  the `#_defaults_#` lines.
 
 ## License
 

@@ -417,6 +417,63 @@ fn loose_files_by_the_simple_rule() {
 }
 
 #[test]
+fn a_one_column_loose_file_holds_keys_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // As TSVZ.py reads it: the first keyed line sets the column count; at one column a key
+    // alone is a row, and nothing can delete, so a delete rewrites the file.
+    fs::write(dir.join("hosts.tsv"), "#hosts\nh1\nh2\nh3\nh2\n").unwrap();
+    assert_eq!(records(dir, &["keys", "hosts.tsv"]).1, "h1\nh2\nh3\n");
+    assert_eq!(records(dir, &["delete", "hosts.tsv", "h2", "h9"]).0, 0);
+    assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh1\nh3\n");
+    assert_eq!(
+        records(dir, &["pop", "hosts.tsv", "h1"]),
+        (0, "h1\n".into(), String::new())
+    );
+    assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\n");
+    assert_eq!(records(dir, &["set", "hosts.tsv", "h4"]).0, 0);
+    assert_eq!(records(dir, &["scrub", "hosts.tsv"]).0, 0);
+    assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\nh4\n");
+    // A delete writes nothing for a key that is not there: in a file with no keyed line yet,
+    // a key alone would make it one column, and a row.
+    assert_eq!(records(dir, &["delete", "new.tsv", "k"]).0, 0);
+    assert_eq!(file(dir, "new.tsv"), "");
+    assert_eq!(records(dir, &["keys", "new.tsv"]).1, "");
+}
+
+#[test]
+fn a_loose_row_of_blank_cells_is_a_deletion_but_at_one_column() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("t.tsv"), "a\t1\nb\t2\nb\t\t \n").unwrap();
+    assert_eq!(records(dir, &["keys", "t.tsv"]).1, "a\n");
+    assert_eq!(records(dir, &["set", "t.tsv", "a", ""]).0, 0);
+    assert_eq!(records(dir, &["len", "t.tsv"]).1, "0\n");
+    fs::write(dir.join("one.tsv"), "a\nb\t\n").unwrap();
+    assert_eq!(records(dir, &["read", "one.tsv"]).1, "a\nb\t\n");
+}
+
+#[test]
+fn a_loose_scrub_and_clear_keep_what_tsvz_py_reads() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // #_defaults_# lines stay in place (TSVZ.py fills the empty cells after them); a key's
+    // last line takes its first one's place only where no such line lies between them.
+    let text = "#h\tx\ty\n#_defaults_#\tP\tQ\na\t1\t\nb\t\t2\n#c\na\t3\t\n#_defaults_#\tR\nb\t\t4\nc\t\t\n";
+    fs::write(dir.join("t.tsv"), text).unwrap();
+    assert_eq!(records(dir, &["scrub", "t.tsv"]).0, 0);
+    assert_eq!(
+        file(dir, "t.tsv"),
+        "#h\tx\ty\n#_defaults_#\tP\tQ\na\t3\t\nb\t\t2\n#_defaults_#\tR\nb\t\t4\n"
+    );
+    assert_eq!(records(dir, &["clear", "t.tsv"]).0, 0);
+    assert_eq!(
+        file(dir, "t.tsv"),
+        "#h\tx\ty\n#_defaults_#\tP\tQ\n#_defaults_#\tR\n"
+    );
+}
+
+#[test]
 fn the_delimiter_option() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();

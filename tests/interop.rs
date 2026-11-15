@@ -371,3 +371,178 @@ fn neither_tool_serves_a_store_the_other_serves() {
     assert_eq!(rust(&["stop", s], b"").status.code(), Some(0));
     assert_eq!(handler.finish().0, Some(0));
 }
+
+/// What `op` of each tool prints for the loose file `file`: (tsvz-rs, TSVZ.py).
+fn both(py: &Path, op: &str, file: &Path) -> (String, String) {
+    let f = file.to_str().unwrap();
+    let text = |o: Output| String::from_utf8_lossy(&o.stdout).into_owned();
+    (text(rust(&[op, f], b"")), text(python(py, &[op, f], b"")))
+}
+
+/// Rows of records output with the empty cells a reader pads them with removed (§3.6).
+fn trimmed(out: &str) -> Vec<Vec<u8>> {
+    rows(out.as_bytes(), b'\t')
+}
+
+/// Loose files written as TSVZ.py writes and reads them (header lines, `#_defaults_#` lines,
+/// deletions as wide as the file, one-column files), and the limitations entry's examples.
+const LOOSE: &[&str] = &[
+    "a\nb\nc\n",
+    "#h\na\nb\na\n",
+    "a\nb\t1\nc\n",
+    "#h\tx\ty\na\t1\t\nb\t\t2\na\t\t\n",
+    "#h\tx\ty\n#_defaults_#\tP\tQ\na\t1\t\nb\t\t2\n#c\na\t3\t\n#_defaults_#\tR\nb\t\t4\nc\t\t\n",
+    // The entry's second example, as TSVZ.py 5.10's scrub wrote it, then before that scrub.
+    "id\nb\t1\tX\tX\na\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n",
+    "id\nb\t1\tX\tX\na\na\t2\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n",
+    // Its first example, after and before a TSVZed commit.
+    "d\tX\tW\nd\ne\t1\nd\t\n",
+    "d\tX\tW\na\nd\t\ne\t1\nd\t\n",
+    "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
+    "#h\nk\t1\nk\t \t\nk\nz\t2\n",
+    "\na\t1\nb\t2\na\t3\n",
+];
+
+/// A loose file drawn from `seed`: keys a to d, with values, blank cells, keys alone, comments,
+/// empty lines, empty keys and `#_defaults_#` lines; one in three keeps only the keys.
+fn random_loose(seed: u64) -> String {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut next = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let shapes = [
+        "K",
+        "K\t1",
+        "K\t",
+        "K\t\t",
+        "K\tX\tY",
+        "K\t\tZ",
+        "#c",
+        "#_defaults_#\tP\t\tQ",
+        "#_defaults_#",
+        "",
+        "\tx",
+        "K\t2",
+        "K\t \t",
+    ];
+    let one = next(3) == 0;
+    let mut text = ["", "#h\n", "\n", ""][next(4) as usize].to_string();
+    for _ in 0..1 + next(11) {
+        let key = ["a", "b", "c", "d"][next(4) as usize];
+        let line = shapes[next(shapes.len() as u64) as usize].replace('K', key);
+        let line = match line.split_once('\t') {
+            Some((k, _)) if one && !line.starts_with('#') => k.to_string(),
+            _ => line,
+        };
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text
+}
+
+#[test]
+fn loose_files_list_the_keys_tsvz_py_lists() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.tsv");
+    for text in LOOSE {
+        std::fs::write(&file, text).unwrap();
+        let (rs, py_keys) = both(&py, "keys", &file);
+        assert_eq!(rs, py_keys, "{text:?}");
+        if !text.contains("#_defaults_#") {
+            let (rs, py_rows) = both(&py, "read", &file);
+            assert_eq!(trimmed(&rs), trimmed(&py_rows), "{text:?}");
+        }
+    }
+}
+
+#[test]
+fn a_loose_scrub_changes_nothing_tsvz_py_reads() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.tsv");
+    let texts = LOOSE
+        .iter()
+        .map(|t| t.to_string())
+        .chain((0..60).map(random_loose));
+    for text in texts {
+        std::fs::write(&file, &text).unwrap();
+        let (rs, py_rows) = both(&py, "read", &file);
+        let scrubbed = rust(&["scrub", file.to_str().unwrap()], b"");
+        assert!(scrubbed.status.success(), "{text:?}");
+        let (rs_after, py_after) = both(&py, "read", &file);
+        let after = std::fs::read_to_string(&file).unwrap();
+        // TSVZ.py reads exactly the same rows, its defaults applied; tsvz-rs the same rows,
+        // however it pads them.
+        assert_eq!(py_after, py_rows, "{text:?} scrubbed to {after:?}");
+        assert_eq!(
+            trimmed(&rs_after),
+            trimmed(&rs),
+            "{text:?} scrubbed to {after:?}"
+        );
+    }
+    // TSVZ.py's own scrub of the entry's second example: tsvz-rs lists the keys it listed.
+    std::fs::write(&file, LOOSE[6]).unwrap();
+    let before = both(&py, "keys", &file);
+    assert!(
+        python(&py, &["scrub", file.to_str().unwrap()], b"")
+            .status
+            .success()
+    );
+    assert_eq!(both(&py, "keys", &file), before);
+    assert_eq!(before.0, "id\nb\na\nd\n");
+}
+
+#[test]
+fn rows_written_after_a_loose_clear_read_to_tsvz_py_as_before() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let text = "#h\n#_defaults_#\tP\t\tQ\na\t1\t\t\n#_defaults_#\n#_defaults_#\tR\t\tS\nb\t2\t\t\n";
+    let (kept, cleared) = (dir.path().join("kept.tsv"), dir.path().join("cleared.tsv"));
+    for f in [&kept, &cleared] {
+        std::fs::write(f, text).unwrap();
+    }
+    assert!(
+        rust(&["clear", cleared.to_str().unwrap()], b"")
+            .status
+            .success()
+    );
+    assert_eq!(both(&py, "keys", &cleared), (String::new(), String::new()));
+    for f in [&kept, &cleared] {
+        let probe = rust(&["set", f.to_str().unwrap(), "z", "", "q", ""], b"");
+        assert!(probe.status.success());
+    }
+    let z = |f: &Path| {
+        let out = python(&py, &["get", f.to_str().unwrap(), "z"], b"");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(z(&cleared), z(&kept));
+    assert_eq!(z(&kept), "z\tR\tq\tS\n");
+}
+
+#[test]
+fn a_delete_in_a_one_column_loose_file_reads_alike() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.tsv");
+    for (text, key, keys) in [
+        ("#h\na\nb\t1\nc\nb\n", "b", "a\nc\n"),
+        ("a\nb\t1\nc\n", "a", "b\nc\n"),
+        ("a\nb\nc\n", "c", "a\nb\n"),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        assert!(
+            rust(&["delete", file.to_str().unwrap(), key], b"")
+                .status
+                .success()
+        );
+        assert_eq!(
+            both(&py, "keys", &file),
+            (keys.into(), keys.into()),
+            "{text:?}"
+        );
+    }
+}

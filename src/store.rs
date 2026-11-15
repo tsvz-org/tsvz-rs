@@ -49,6 +49,8 @@ pub struct Options {
     /// Replay every part, also those before the last snapshot part, which a read otherwise
     /// skips (§19.10.3); `verify` always does (§19.10.4). Off by default.
     pub full_history: bool,
+    /// Keep a loose file's lines, for a rewrite that keeps them ([`crate::loose`]).
+    pub(crate) lines: bool,
 }
 
 /// One part as `parts` lists it (§20.2).
@@ -451,6 +453,8 @@ pub struct Store {
     last: Option<Handle>,
     /// Whether its directory's timestamp shows every change of its names.
     pub(crate) dirs: parts::DirTrust,
+    /// The bytes after a loose file's last newline, kept with its lines.
+    tail: Vec<u8>,
 }
 
 impl Store {
@@ -552,8 +556,13 @@ impl Store {
             }
             format.delimiter = d;
         }
+        let mut replay = Replay::new(format, options.verify, options.warnings.clone());
+        if options.lines && !format.strict {
+            replay.lines = Some(Vec::new());
+        }
         let mut store = Store {
-            replay: Replay::new(format, options.verify, options.warnings.clone()),
+            replay,
+            tail: Vec::new(),
             table: Table::new(&options.scope, format),
             path,
             format,
@@ -696,6 +705,9 @@ impl Store {
             return Ok(());
         }
         self.replay.tail(framer.tail().len());
+        if self.replay.lines.is_some() {
+            self.tail = framer.tail().to_vec();
+        }
         if last && part.codec.is_none() {
             self.follow.offset = framer.committed();
             self.follow.line = framer.number();
@@ -872,6 +884,14 @@ impl Store {
         &self.replay.mismatches
     }
 
+    /// A loose file's lines and the bytes after its last newline, when the store was opened to
+    /// keep them.
+    pub(crate) fn loose_lines(&self) -> Option<(crate::loose::Lines<'_>, &[u8])> {
+        let lines = self.replay.lines.as_deref()?;
+        let lines = crate::loose::Lines::new(lines, self.format.delimiter, self.replay.bom);
+        Some((lines, &self.tail))
+    }
+
     pub fn header(&self) -> Option<&str> {
         self.replay.header.as_deref()
     }
@@ -966,6 +986,9 @@ impl Store {
             && framer.tail() != self.follow.tail.as_slice()
         {
             self.replay.tail(framer.tail().len());
+            if self.replay.lines.is_some() {
+                self.tail = framer.tail().to_vec();
+            }
         }
         let mut check = std::mem::take(&mut self.follow.check);
         check.extend_from_slice(&data[..committed.min(data.len())]);

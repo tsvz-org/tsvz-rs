@@ -454,6 +454,7 @@ impl Engine {
             })),
             skip_unreadable: true,
             full_history: false,
+            ..Options::default()
         }
     }
 

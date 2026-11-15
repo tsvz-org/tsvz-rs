@@ -24,6 +24,7 @@ pub mod frame;
 pub mod handler;
 #[doc(hidden)]
 pub mod lock;
+mod loose;
 pub mod maint;
 #[doc(hidden)]
 pub mod name;

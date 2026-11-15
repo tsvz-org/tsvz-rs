@@ -178,6 +178,15 @@ pub struct Replay {
     /// set by the first data row, as TSVZ.py sets it, to the count of the defaults then active
     /// when there are any, else to that row's written cells. None before any data row.
     pub width: Option<usize>,
+    /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
+    /// line.
+    pub one_column: Option<bool>,
+    /// A loose file's committed lines, without their `\n`, kept for a rewrite that keeps them
+    /// ([`crate::loose`]); None unless asked for.
+    pub lines: Option<Vec<Vec<u8>>>,
+    /// Whether a loose file began with a byte-order mark, which the framer drops (§4.7) and
+    /// TSVZ.py reads as part of line 1.
+    pub bom: bool,
     first_line: bool,
     part: PathBuf,
     warn: Option<WarnFn>,
@@ -295,6 +304,9 @@ impl Replay {
             newest: 1,
             header: None,
             width: None,
+            one_column: None,
+            lines: None,
+            bom: false,
             first_line: false,
             part: PathBuf::new(),
             warn,
@@ -376,6 +388,10 @@ impl Replay {
         if self.format.strict {
             self.strict_line(&text, line, first, sink);
         } else {
+            self.bom |= first && line.offset == 3;
+            if let Some(lines) = &mut self.lines {
+                lines.push(body.to_vec());
+            }
             self.loose_line(&text, first, sink);
         }
         true
@@ -486,7 +502,7 @@ impl Replay {
             sink.delete(&key); // a tombstone (§7.6, §7.8)
             return;
         };
-        self.set_width(rest);
+        self.set_width(Some(rest));
         let binding = self.binding();
         let mut cells = Cells::default();
         if sink.wants_cells(&key) {
@@ -500,36 +516,46 @@ impl Replay {
         sink.put(&key, cells, &binding);
     }
 
-    /// Set the width at the first data row, whose value fields are `rest` (see `width`).
-    fn set_width(&mut self, rest: &str) {
+    /// Set the width at the first data row, whose value fields are `rest` (none for a loose key
+    /// alone, see `width`).
+    fn set_width(&mut self, rest: Option<&str>) {
         if self.width.is_none() {
-            let written = memchr::memchr_iter(self.format.delimiter, rest.as_bytes()).count() + 1;
+            let written = rest.map_or(0, |r| {
+                memchr::memchr_iter(self.format.delimiter, r.as_bytes()).count() + 1
+            });
             let defaults = self.markers.defaults.len();
             self.width = Some(if defaults > 0 { defaults } else { written });
         }
     }
 
-    /// A loose file: lines split on the delimiter, no markers, escaping or stripping (§5.2).
+    /// A loose file: lines split on the delimiter, no markers, escaping or stripping (§5.2). A key
+    /// alone, or with only blank cells, is a deletion, but a row in a one-column file, as TSVZ.py
+    /// reads it ([`crate::loose`]).
     fn loose_line(&mut self, text: &str, first: bool, sink: &mut dyn Sink) {
+        let d = self.format.delimiter;
+        // TSVZ.py reads a byte-order mark as part of line 1, which is then keyed.
+        if self.one_column.is_none() && ((first && self.bom) || crate::loose::keyed(text, d)) {
+            self.one_column = Some(!text.as_bytes().contains(&d));
+        }
         if text.starts_with('#') {
             if first {
                 self.header = Some(text.to_string());
             }
             return;
         }
-        let (key, rest) = split_first(text, self.format.delimiter);
+        let (key, rest) = split_first(text, d);
         if key.is_empty() {
             return;
         }
-        let Some(rest) = rest else {
+        if crate::loose::deletes(rest, d, self.one_column == Some(true)) {
             sink.delete(key);
             return;
-        };
+        }
         self.set_width(rest);
         let binding = self.binding();
         let mut cells = Cells::default();
-        if sink.wants_cells(key) {
-            for field in rest.split(self.format.delimiter as char) {
+        if let (true, Some(rest)) = (sink.wants_cells(key), rest) {
+            for field in rest.split(d as char) {
                 cells.push(field);
             }
         }
@@ -801,14 +827,34 @@ mod tests {
                 strict: false,
             },
             false,
-            b"#h,dr\nk,x<lt>,y \n#_defaults_#,d\nb\nk2, \n",
+            b"#h,dr\nk,x<lt>,y \n#_defaults_#,d\nb\nk2, \nk3,\n",
         );
         assert_eq!(r.header.as_deref(), Some("#h,dr"));
         assert!(r.markers.defaults.is_empty());
+        assert_eq!(table(&rows), vec![row("k", &["x<lt>", "y "])]);
+    }
+
+    #[test]
+    fn a_loose_key_alone_is_a_row_in_a_one_column_file() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        let (r, rows, _) = run(loose, false, b"#h\na\nb\t1\nc\t\na\nd\t \n");
+        assert_eq!(r.width, Some(0));
+        let cells = table(&rows);
         assert_eq!(
-            table(&rows),
-            vec![row("k", &["x<lt>", "y "]), row("k2", &[" "])]
+            cells,
+            vec![
+                row("a", &[]),
+                row("b", &["1"]),
+                row("c", &[""]),
+                row("d", &[" "])
+            ]
         );
+        // The first keyed line, a #_defaults_# line included, sets the column count.
+        let (_, rows, _) = run(loose, false, b"#_defaults_#\tP\na\nb\t1\nb\t\n");
+        assert!(table(&rows).is_empty());
     }
 
     #[test]
