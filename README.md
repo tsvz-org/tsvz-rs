@@ -27,15 +27,11 @@ tsvz --help
 
 Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz, zstd) and split
 into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
-one-part store in place; in a multi-part store it writes the parts before the active one as a
-new part between them and the active one (§19.2), linked in whole so that readers never see a
-part being rewritten, or, when no ordinal is free there, compacts them into the last of them in
-place (§19.8); then it applies the store's `#_rotate_#` (`keep`, `rename` or `delete`) to the
-parts the snapshot holds. Writers keep appending to the active part throughout. `scrub`, and
-`clear` of a one-part store, refuse parts that declare a spec version newer than the one tsvz
-implements (§6.3, §19.4, §19.8). A snapshot part that other parts precede begins with
-`#_snapshot_#` (§19.10), and a read begins at the last such part instead of replaying the parts
-before it; `verify` still replays every part.
+one-part store in place. In a multi-part store it writes the parts before the active one as a
+new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
+applies the store's `#_rotate_#`; writers keep appending throughout. A read begins at the last
+snapshot part (§19.10); `verify` replays every part. `scrub` and `clear` refuse parts that
+declare a spec version newer than tsvz implements (§6.3).
 
 ## Handler
 
