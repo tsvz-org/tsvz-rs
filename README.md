@@ -30,14 +30,14 @@ into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scru
 one-part store in place. In a multi-part store it writes the parts before the active one as a
 new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
 applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
-as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to 0.1.5. `scrub` and
+as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to the next version. `scrub` and
 `clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
 Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
 except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
 unterminated last line, reads `#_defaults_#` lines as comments (it fills no empty cell from
-them), strips and decodes no key or cell, and keeps the empty cells at the end of a row longer
-than the file's column count. A rewrite writes each line it keeps as the file has it, but for a
+them), keeps the whitespace at the end of a key or a cell and decodes neither, and keeps the empty
+cells at the end of a row longer than the file's column count. A rewrite writes each line it keeps as the file has it, but for a
 byte-order mark an unterminated first line loses: `scrub` keeps the lines a read depends on (a
 key's last line may take the place of its first, where nothing TSVZ.py reads changes), and `clear`
 the `#_defaults_#` lines in force ([docs/silent-choices.md](docs/silent-choices.md)). One more
@@ -101,8 +101,10 @@ choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 In strict stores (`.tsvz .csvz .nsvz .psvz`) a read replays every part, as before; a multi-part
 `scrub` writes snapshot parts that begin with `#_snapshot_#` (and makes one marked copy of a part
 a 0.1.3 scrub wrote), and a writer now refuses `#_snapshot_#` (§19.10.2; 0.1.3 accepted it and
-wrote it as a record). Upgrade every host that scrubs the same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a new snapshot part each time
-(0.1.3 does not expect the marker line), and the next 0.1.4 scrub adds a marked copy of it.
+wrote it as a record). Upgrade every host that scrubs the same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a
+new snapshot part each time while an ordinal is free (0.1.3 does not expect the marker line), and
+the next 0.1.4 scrub adds a marked copy of it; with none free, the 0.1.3 scrub compacts in place
+and the next 0.1.4 scrub marks that part in place.
 
 In loose files:
 
@@ -117,12 +119,12 @@ In loose files:
   dropped it); the NULs at the start of a line are dropped; a key that only begins with
   `#_defaults_#` is a key.
 - `scrub` keeps each line it keeps as the file has it, `#_defaults_#` lines included, and an
-  unterminated last line (0.1.3's `scrub` dropped it); `clear` keeps the `#_defaults_#` lines in force, so that rows written later read with the
-  defaults they had (a file of one column keeps none: rows written there later read without
-  them).
+  unterminated last line (0.1.3's `scrub` dropped it); `clear` keeps the `#_defaults_#` lines in
+  force, so that rows written later read to TSVZ.py with the defaults they had (a file of one
+  column keeps none: rows written there later read without them).
 
-The library's documented API does not change (two `#[doc(hidden)]` items do: `codec::member` and
-`codec::Member` are gone).
+The library's documented API does not change (two items of the `#[doc(hidden)]` module `codec` do:
+`codec::member` and `codec::Member` are gone).
 
 ## License
 

@@ -283,9 +283,10 @@ fn unsupported(part: &parts::Part) -> Error {
 }
 
 /// The page a part's first member is decoded from to look at its first lines, and the least the
-/// doubling reads after it take. A gzip, xz or zstd member gives its first lines from its first
-/// bytes, and a first line that is no comment settles a part, so 4 KiB judges nearly every part,
-/// and a larger page only decodes more of each.
+/// doubling reads after it take. A gzip or xz member gives its first lines from its first 4 KiB
+/// (a zstd member from its first 56 KiB, a bzip2 one from a whole block, 184 KiB of input in a
+/// probe of 0.8 MB of text), and a first line that is no comment settles a part, so 4 KiB judges
+/// nearly every gzip or xz part, and a larger page only decodes more of each.
 const SNAPSHOT_HINT: u64 = 1 << 12;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
@@ -326,7 +327,9 @@ impl SnapshotLines {
 /// snapshot part, judged only from members that passed their checks, as TSVZ.py reads a part.
 /// None when those end before the verdict: with `more`, a last member that runs past `data` is
 /// only the end of what was read so far. A member cut short or corrupt before the verdict, in
-/// the middle of `data` or at the end of the part, makes it no snapshot part.
+/// the middle of `data` or at the end of the part, makes it no snapshot part; so does a member
+/// that holds another member's magic bytes in its stored data, when `data` is a prefix of the
+/// part (the whole part decodes as that one member: docs/limitations.md).
 fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
     let mut lines = SnapshotLines::new(delimiter);
     let mut framer = Framer::new();
@@ -420,7 +423,9 @@ fn first_lines_say_no(
 /// one a piece at a time: a "no" comes as soon as its lines show it, whether or not their member
 /// passes its check later, and a "yes" only from first lines that come out of members that passed
 /// their checks (bzip2 gives nothing before a whole block, up to 900 kB of text). A part whose
-/// start cannot be read, or holds damage before the marker, is not one (§19.10.3).
+/// start cannot be read, or holds damage before the marker, is not one (§19.10.3); a member that
+/// holds another member's magic bytes in its stored data looks damaged here, from the part's first
+/// bytes only (docs/limitations.md).
 pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
     let Ok(file) = Handle::open_read(&part.path) else {
         return false;

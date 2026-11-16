@@ -815,7 +815,8 @@ fn a_loose_delete_reads_a_compressed_file_whole_and_says_a_damaged_member_once()
     assert_eq!(records(dir, &["delete", "ok.tsv.gz", "key0000005"]).0, 0);
     assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000005"]).0, 3);
     assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000006"]).0, 0);
-    // A header that a member holds alone, as a `clear` leaves a file, and rows in a damaged member.
+    // A header that a member holds alone, as a `clear` and a later write leave a file, and rows in a
+    // damaged member.
     let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
     let rows = &text[text.find('\n').unwrap() + 1..];
     let mut second = gz(rows);

@@ -3,10 +3,13 @@
 //! `_processLine`). Both drop the NULs at the start of a line, take the column count from the
 //! first keyed line ([`keyed`]), and read a line whose cells after the key are none or all blank
 //! as a deletion ([`deletes`]), but in a one-column file, where it is a row. Line 1 begins with
-//! its byte-order mark, which is part of its key. tsvz-rs reads every `#` line as a comment except
-//! a key that begins with `#_defaults_#`; TSVZ.py reads a `#_defaults_#` line as defaults for the
-//! rows after it; and only TSVZ.py strips each cell's trailing whitespace and decodes `<sep>` and
-//! `<LF>`, and skips a line whose key is only whitespace, which tsvz-rs reads as a row.
+//! its byte-order mark, which is part of its key. tsvz-rs reads every `#` line as a comment,
+//! except a line whose key only begins with `#_defaults_#` (a longer key, such as `#_defaults_#x`,
+//! is a key); TSVZ.py reads a line whose key is exactly `#_defaults_#` as defaults for the rows
+//! after it; and only TSVZ.py strips each cell's trailing whitespace and decodes `<sep>` and
+//! `<LF>`, and skips a line whose key is only whitespace, which tsvz-rs reads as a row when a
+//! value follows it (or in a one-column file) and as a deletion of that key when it is alone or
+//! its cells are blank.
 //!
 //! A rewrite keeps each line it keeps as the file has it, `\r` included (a byte-order mark an
 //! unterminated first line loses is the one exception), and changes what a reader reads only
@@ -92,8 +95,10 @@ enum Kind {
     Row,
     /// A deletion to both ([`deletes`]).
     Delete,
-    /// A key the two read differently (TSVZ.py strips its trailing whitespace and decodes
-    /// `<…>` tokens): the file is then rewritten without changing any line.
+    /// A key the two may read differently (TSVZ.py strips its trailing whitespace and decodes
+    /// `<…>` tokens), or a line with a CR or a NUL that is no delimiter, which both read alike
+    /// as far as tried: the check is a cautious one. The file is then rewritten without
+    /// changing any line.
     Odd,
 }
 
@@ -289,7 +294,9 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
 /// no line is one of those, so that the file stays as it is (also a compressed one, whose bytes
 /// a rewrite would change).
 /// When the line that set the column count goes and the next keyed line has more cells, the first
-/// remaining key, alone, takes its place, so that the file keeps one column, as in TSVZ.py.
+/// remaining key, alone, takes its place, so that the file keeps one column, as in TSVZ.py,
+/// which takes the first later key that holds no value instead (`a`, `b<TAB>1`, `c`, after the
+/// delete of `a`: TSVZ.py's file begins `c`, tsvz-rs's `b`, which keeps the keys in their order).
 #[cfg(feature = "cli")]
 pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Option<Vec<u8>>> {
     if !lines.one {
@@ -385,8 +392,10 @@ mod tests {
     fn a_scrub_keeps_lines_in_their_places() {
         for (input, output) in [
             // As TSVZ.py 5.18's scrub writes them: line 1 stays; a key's value line moves into
-            // the place of its first line only where that keeps the column count, and never
-            // across a #_defaults_# line.
+            // the place of its first line only where that keeps the column count. tsvz-rs never
+            // moves one across a #_defaults_# line, where TSVZ.py does when what it reads stays
+            // (`#h`, `a<TAB>1`, `#_defaults_#<TAB>P`, `a<TAB>2` becomes `#h`, `a<TAB>2`,
+            // `#_defaults_#<TAB>P`), so it writes more there.
             ("a\t1\nb\t2\na\t3\n", "a\t1\nb\t2\na\t3\n"),
             ("#h\na\t1\nb\t2\na\t3\n", "#h\na\t3\nb\t2\n"),
             ("#h\na\t1\nb\t2\na\t3\t4\n", "#h\na\t1\nb\t2\na\t3\t4\n"),
@@ -571,7 +580,8 @@ mod tests {
         };
         assert_eq!(gone("#h\na\nb\nc\n", &["b"]), "#h\na\nc\n");
         assert_eq!(gone("a\nb\nc\n", &["a", "c"]), "b\n");
-        // The line that set one column goes: the first remaining key, alone, takes its place.
+        // The line that set one column goes: the first remaining key, alone, takes its place (TSVZ.py
+        // takes `c`, the first later key that holds no value, and so moves it to the front).
         assert_eq!(gone("a\nb\t1\nc\n", &["a"]), "b\nb\t1\nc\n");
         assert_eq!(
             gone("a\n#_defaults_#\tP\nb\n", &["a"]),

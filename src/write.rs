@@ -462,8 +462,9 @@ impl Writer {
         ))
     }
 
-    /// An uncommitted tail would join the first appended record: cut it first, as TSVZ.py does
-    /// for a store (a loose file, TSVZ.py ends its last line instead: docs/limitations.md).
+    /// An uncommitted tail would join the first appended record, so it is cut first: TSVZ.py
+    /// does that in a store, but in a loose file it ends the last line instead, and the cut here
+    /// loses that row (docs/limitations.md).
     fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<()> {
         let size = file.metadata()?.len();
         if size == 0 {

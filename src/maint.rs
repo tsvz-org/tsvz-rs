@@ -1518,8 +1518,9 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
 #[cfg(feature = "cli")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LooseDelete {
-    /// Tombstones appended (this many): each key asked as TSVZ.py reads it and, where that
-    /// differs, as given.
+    /// Tombstones appended (this many): each key asked as TSVZ.py names it, when it has a name,
+    /// and, where that differs, as given; with no keyed line yet, only a key of only whitespace,
+    /// which has no name, as given.
     Appended(usize),
     /// The file rewritten without the lines of the keys asked.
     Rewrote,
@@ -1589,8 +1590,9 @@ pub(crate) fn delete_loose(
             say();
             // More than one column: a tombstone for each key. No keyed line yet: a key alone would
             // set one column and be a row, so none, but for a key with nothing left of it, which
-            // TSVZ.py skips (it sets no column count), and tsvz-rs reads as a row, so that a
-            // `popitem` loop ends in a file that holds only such rows.
+            // TSVZ.py skips (it sets no column count) and tsvz-rs reads as a row: its tombstone
+            // deletes that row, so that a `popitem` loop drains a file that holds only such rows
+            // (without it the row stays, and `popitem` returns it again).
             let all = one == Some(false);
             let tombstones: Vec<crate::write::Record> = asked
                 .iter()

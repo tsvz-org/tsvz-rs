@@ -37,7 +37,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   after `delete a`, reads two columns to TSVZ.py (`b<TAB>1`), where its own delete writes `b`, a
   newline and `b<TAB>1` (one column), and a key alone written later is then a deletion to it. A
   byte-order mark in front of the line, in a file with no other line, is dropped by a scrub. A
-  loose `clear` drops it with the rows, and so a line 1 that is a comment and has no newline.
+  loose `clear` drops an unterminated last line with the rows, as 0.1.3's did, a comment or not.
 - Why: tsvz-rs applies the strict-store tail rule to loose files; changing it touches how a store
   follows appends (`Store::refresh` holds the tail until a newline completes it). Found in 0.1.4's
   differential runs against TSVZ.py 5.18; the other differences are in the entry below.
@@ -55,8 +55,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - a bare `#_defaults_#` line in a one-column file is a row to TSVZ.py, and no row to tsvz-rs;
   - a key is not stripped of the whitespace at its end or decoded (`<sep>`, `<LF>`): `a ` and `a` are two keys
     to tsvz-rs, and one to TSVZ.py; nor is a cell, which keeps its trailing whitespace (a CR among it);
-  - a line whose key is only whitespace is a row to tsvz-rs, and none to TSVZ.py (`delete` writes such a key as
-    given, so that `popitem` drains a file that holds one);
+  - a line whose key is only whitespace is a row to tsvz-rs when it holds a value (or in a one-column file), and
+    a deletion of that key when it is alone or its cells are blank; TSVZ.py skips every such line (`delete`
+    writes such a key as given, so that `popitem` drains a file that holds one);
   - TSVZ.py cuts every CR before a line's newline, tsvz-rs one (it keeps the rest in the last cell);
   - a row longer than the file's column count keeps the empty cells at its end, which TSVZ.py cuts (`a<TAB>1`,
     then `b<TAB>2<TAB><TAB>`: TSVZ.py reads `b<TAB>2`, tsvz-rs `b<TAB>2<TAB><TAB>`).
@@ -87,18 +88,25 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: a read of a multi-part strict store replays every part, as in 0.1.3, however much of
   the store lies before its last snapshot part. TSVZ.py begins at that part and skips the ones before it
-  (§19.10.3 lets a reader do so, it does not oblige it). On a store that follows §19.10.2 the result is the
-  same, and only the time differs: 20 gzip parts of history before a snapshot part read in 0.19 s, where a read
-  that begins at the snapshot part takes 0.02 s. On a store whose snapshot part does not restate the parts
-  before it, which a producer must not write, tsvz-rs reads every part and TSVZ.py only from the snapshot part.
+  (§19.10.3 lets a reader do so, it does not oblige it). On a store that follows §19.10.2 the rows are the
+  same, and the time differs: a `get` on 20 gzip parts of history (50,000 keys written 20 times), a snapshot
+  part in 1 MiB members and a small active part takes 0.18 s (0.1.3: 0.18 s), where a read that begins at the
+  snapshot part takes 0.02 s. Two cases differ in more than time:
+  - a part before the snapshot part that is damaged under `#_on_corruption_# stop`: tsvz-rs, as §4.10 says,
+    reads nothing after the damage, in that part or a later one, snapshot part included, and TSVZ.py, which
+    begins at the snapshot part, reads it and does not see the damage; under `recover`, both read the same
+    rows, and only tsvz-rs warns that the damaged part's recovered bytes are not verified;
+  - a snapshot part that does not restate the parts before it, which a producer must not write: tsvz-rs reads
+    every part and TSVZ.py only from the snapshot part.
   A `scrub` writes the marker and finds a part marked.
 - Why: finding the part before the read took a look at the start of every part, apart from the read. In
-  0.1.4's reviews that look cost a second decode (bzip2 parts 1.3 to 1.9 times 0.1.3's time; a snapshot part of
-  one 64 MB member 1.6 times with gzip and 2.5 times with xz), and leaving bzip2 out of it made the answer on
-  such a store depend on the codec.
+  0.1.4's reviews that look cost a second decode of each part's start (most on bzip2 parts and on a snapshot
+  part of one large member), and leaving bzip2 out of it made the answer on such a store depend on the codec.
 - Revisit when: the next tsvz-rs version. The plan: the read judges a part from its first lines as it decodes
   them, one rule for every codec, and a look before the read only chooses where to begin, from each part's
-  first page; the read of that part confirms it, or the store is read again from part 0.
+  first page; the read of that part confirms it, or the store is read again from part 0. It must also choose,
+  for the first case, between §4.10 and TSVZ.py's start (§19.10.3 says the result is the same, which does not
+  hold there).
 - Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
 
@@ -141,8 +149,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: a multi-part `scrub` finds a part marked by its first lines. It can take a gzip part
   that begins with `#_snapshot_#` for no snapshot part: a stored (uncompressed) member that holds the gzip magic
-  bytes `1f 8b 08` in its first 4 KiB, which the look takes for the start of a next member after a damaged one
-  (the second review's probe: 1 of 800 random gzip parts, none of 800 each in xz, zstd and bzip2). The scrub then
+  bytes `1f 8b 08` in its first 4 KiB. The look has only the start of the part, and takes the magic for the start
+  of a next member after a cut one, where the read decodes the whole part as one member (the second review's
+  probe: 1 of 800 random gzip parts, none of 800 each in xz, zstd and bzip2). The scrub then
   writes one more marked copy of the part, as 0.1.3's scrub always wrote one, and a later scrub finds that copy
   marked. A read is unaffected. A part whose first line is very long is also decoded to the end of that line
   before the look says "no": a first line of 2 MB in an 18.7 KB gzip member was read whole.
