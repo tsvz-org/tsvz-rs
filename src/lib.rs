@@ -49,9 +49,6 @@ pub mod cli;
 
 /// The public types may grow before a 1.0: outside this crate an enum cannot be matched without
 /// a wildcard arm, nor a struct built by a struct expression or destructured without `..`.
-/// (`Options` has no snippet: it has private fields, so no code outside the crate can build it
-/// by a struct expression whatever its attributes say, and a snippet would fail for that reason,
-/// not for `#[non_exhaustive]`.)
 ///
 /// ```compile_fail
 /// fn f(e: tsvz::Error) -> u8 {
@@ -94,6 +91,9 @@ pub mod cli;
 ///     use tsvz::Codec::*;
 ///     match c { Gzip => 0, Bzip2 => 1, Xz => 2, Zstd => 3 }
 /// }
+/// ```
+/// ```compile_fail,E0639
+/// let o = tsvz::Options { verify: true, ..tsvz::Options::default() };
 /// ```
 /// ```compile_fail
 /// let r = tsvz::handler::Response { status: 0, ..Default::default() };

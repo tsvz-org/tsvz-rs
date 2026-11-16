@@ -1520,7 +1520,8 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
 #[cfg(feature = "cli")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LooseDelete {
-    /// A key alone, appended for each key asked (this many).
+    /// Tombstones appended (this many): each key asked as TSVZ.py reads it and, where that
+    /// differs, as given.
     Appended(usize),
     /// The file rewritten without the lines of the keys asked.
     Rewrote,

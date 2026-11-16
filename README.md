@@ -38,10 +38,10 @@ Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line
 except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
 unterminated last line, reads `#_defaults_#` lines as comments (it fills no empty cell from
 them), strips and decodes no key or cell, and keeps the empty cells at the end of a row longer
-than the file's column count. A rewrite changes no line it keeps, but for a byte-order mark an
-unterminated first line loses: `scrub` keeps the lines a read depends on (a key's last line may
-take the place of its first, where nothing TSVZ.py reads changes), and `clear` the
-`#_defaults_#` lines in force ([docs/silent-choices.md](docs/silent-choices.md)). One more
+than the file's column count. A rewrite writes each line it keeps as the file has it, but for a
+byte-order mark an unterminated first line loses: `scrub` keeps the lines a read depends on (a
+key's last line may take the place of its first, where nothing TSVZ.py reads changes), and `clear`
+the `#_defaults_#` lines in force ([docs/silent-choices.md](docs/silent-choices.md)). One more
 limit an operator can meet: a `delete` of a loose file that runs at the very moment of a
 `clear` of it can leave the key as a row.
 
@@ -122,8 +122,8 @@ In loose files:
 - Line 1's byte-order mark is part of its key, as TSVZ.py reads it (`keys` lists it, where 0.1.3
   dropped it); the NULs at the start of a line are dropped; a key that only begins with
   `#_defaults_#` is a key.
-- `scrub` keeps each line it keeps as the file has it, `#_defaults_#` lines included, and
-  `clear` keeps the `#_defaults_#` lines in force, so that rows written later read with the
+- `scrub` keeps each line it keeps as the file has it, `#_defaults_#` lines included, and an
+  unterminated last line (0.1.3's `scrub` dropped it); `clear` keeps the `#_defaults_#` lines in force, so that rows written later read with the
   defaults they had (a file of one column keeps none: rows written there later read without
   them).
 

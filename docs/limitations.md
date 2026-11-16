@@ -37,7 +37,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   after `delete a`, reads two columns to TSVZ.py (`b<TAB>1`), where its own delete writes `b`, a
   newline and `b<TAB>1` (one column), and a key alone written later is then a deletion to it. A
   byte-order mark in front of the line, in a file with no other line, is dropped by a scrub. A
-  loose `clear` drops it with the rows.
+  loose `clear` drops it with the rows, and so a line 1 that is a comment and has no newline.
 - Why: tsvz-rs applies the strict-store tail rule to loose files; changing it touches how a store
   follows appends (`Store::refresh` holds the tail until a newline completes it). Found in 0.1.4's
   differential runs against TSVZ.py 5.18; the other differences are in the entry below.
@@ -46,15 +46,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-15, in the 0.1.4 build; a deferral under the user's standing rule that deferrals
   are noted, not asked.
 
-### Loose reads still differ from TSVZ.py's in five ways
+### Loose reads still differ from TSVZ.py's in six ways
 - Kind: deferred
 - What the operator sees: in a loose file, `tsvz read`, `get` and `keys` differ from TSVZ.py's command line in
-  five ways, none of them new in 0.1.4:
+  six ways, none of them new in 0.1.4:
   - the values of a `#_defaults_#` line are not filled into the empty cells of the rows after it (tsvz-rs reads
     the line as a comment);
   - a bare `#_defaults_#` line in a one-column file is a row to TSVZ.py, and no row to tsvz-rs;
   - a key is not stripped of the whitespace at its end or decoded (`<sep>`, `<LF>`): `a ` and `a` are two keys
     to tsvz-rs, and one to TSVZ.py; nor is a cell, which keeps its trailing whitespace (a CR among it);
+  - a line whose key is only whitespace is a row to tsvz-rs, and none to TSVZ.py (`delete` writes such a key as
+    given, so that `popitem` drains a file that holds one);
   - TSVZ.py cuts every CR before a line's newline, tsvz-rs one (it keeps the rest in the last cell);
   - a row longer than the file's column count keeps the empty cells at its end, which TSVZ.py cuts (`a<TAB>1`,
     then `b<TAB>2<TAB><TAB>`: TSVZ.py reads `b<TAB>2`, tsvz-rs `b<TAB>2<TAB><TAB>`).

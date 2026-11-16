@@ -423,8 +423,9 @@ const LOOSE: &[&str] = &[
     "#h\n#_defaults_#x\na\nb\n#_defaults_#x\t2\n",
 ];
 
-/// Loose files that are rewritten alike, but not read alike (docs/limitations.md): a key with
-/// whitespace at its end is a key of another name to TSVZ.py.
+/// Loose files that the two read differently (docs/limitations.md: a key with whitespace at its
+/// end, or a run of CRs, reads another way to TSVZ.py), and whose scrub changes what neither
+/// reads.
 const REWRITTEN: &[&str] = &[
     "#h\na \t1\nb\t2\na\t3\n",
     "a \nb\na\nb \n",

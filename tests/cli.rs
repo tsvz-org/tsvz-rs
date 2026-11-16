@@ -478,11 +478,8 @@ fn a_loose_delete_decides_from_the_column_count_alone() {
         assert_eq!(file(dir, name), text);
     }
     // One column: the lines of the keys go, whether or not the key as given has whitespace at
-    // its end; a key that is not there changes nothing.
+    // its end.
     fs::write(dir.join("o.tsv"), "#h\na\nb \nc\nb\n").unwrap();
-    let (code, _, err) = records(dir, &["-v", "delete", "o.tsv", "zz"]);
-    assert_eq!((code, err.as_str()), (0, ""), "nothing was rewritten");
-    assert_eq!(file(dir, "o.tsv"), "#h\na\nb \nc\nb\n");
     assert_eq!(records(dir, &["delete", "o.tsv", "b\t"]).0, 0);
     assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
     // A reset of the defaults there would be a row, to TSVZ.py too: none is written.
@@ -514,8 +511,14 @@ fn a_loose_delete_writes_a_blank_key_as_given_and_says_what_the_head_says_once()
     fs::write(dir.join("o.tsv"), "a\n \nb\n").unwrap();
     assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
     assert_eq!(file(dir, "o.tsv"), "a\nb\n");
-    // What the read of the head warns of is said once, though a file of one column is read
-    // again from the start.
+}
+
+/// What the read of the head warns of is said once, though a file of one column is read again
+/// from the start.
+#[test]
+fn a_loose_delete_says_what_the_head_warns_of_once() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
     let warned = |name: &str, bytes: &[u8]| {
         fs::write(dir.join(name), bytes).unwrap();
         records(dir, &["delete", name, "zz"])
@@ -727,7 +730,7 @@ fn many_small_compressed_members_read_in_bounded_memory() {
 /// A loose `scrub` and `clear` work on the lines they keep and read no row. On this file (11.7
 /// MiB, the shape of a 228 MiB one measured the same way, 2026-11-16) the test build peaked at
 /// 3.0 and 5.8 times its size for `clear` and `scrub`; with every row also built, at 8.2 and 11.5
-/// times (9bc86e0). So 7 and 9 times are between the two.
+/// times. So 7 and 9 times are between the two.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_loose_scrub_and_clear_read_no_row() {
@@ -741,14 +744,15 @@ fn a_loose_scrub_and_clear_read_no_row() {
         text.push_str(&format!("key{i:07}\t{x:016x}\t{x:016x}\tsome text here\n"));
     }
     let size = text.len() as i64 / 1024;
+    let mut over = Vec::new();
     for (op, times) in [("clear", 7), ("scrub", 9)] {
         fs::write(dir.join("big.tsv"), &text).unwrap();
         let (_, kib) = peak_rss_kib(dir, &[op, "big.tsv"]);
-        assert!(
-            kib < times * size,
-            "a loose {op} of {size} KiB peaked at {kib} KiB"
-        );
+        if kib >= times * size {
+            over.push(format!("a loose {op} of {size} KiB peaked at {kib} KiB"));
+        }
     }
+    assert!(over.is_empty(), "{over:?}");
 }
 
 /// A delete of a compressed loose file of more than one column reads only as far as the file's
@@ -798,9 +802,13 @@ fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() 
 /// A delete of a key that is not there changes nothing: a compressed file of one column too,
 /// whose bytes a rewrite would change (here it holds two members, which one member replaces).
 #[test]
-fn a_compressed_one_column_delete_that_removes_no_line_writes_and_says_nothing() {
+fn a_one_column_delete_that_removes_no_line_writes_and_says_nothing() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
+    fs::write(dir.join("o.tsv"), "#h\na\nb \nc\nb\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "o.tsv", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""), "nothing was rewritten");
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nb \nc\nb\n");
     let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
     let bytes = [gz("#h\na\n"), gz("b\n")].concat();
     fs::write(dir.join("c.tsv.gz"), &bytes).unwrap();
