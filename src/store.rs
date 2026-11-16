@@ -348,17 +348,19 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
     }
 }
 
-/// The lines of the first member of a part, decoded a page at a time from `reader` and given to
-/// `on_line` as they come out, until it returns false, the member ends or a data error stops
-/// it. The output is used before the member's check, so what it says is only a first look. `data`
-/// gets the bytes read.
-fn first_member_lines(
+/// The lines at the start of a compressed part, decoded a page at a time from `reader`, member
+/// after member (a line can span members; gzip's zero padding between them is skipped), and
+/// given to `on_line` as they come out, until it returns false, the part ends or a data error
+/// stops it. What a page decodes before an error is dropped with it. The output is used before
+/// its member's check, so what it says is only a first look. `data` gets the bytes read.
+fn first_lines(
     codec: Codec,
     reader: &mut impl Read,
-    data: &mut Vec<u8>,
+    mut data: Option<&mut Vec<u8>>,
     on_line: &mut dyn FnMut(&Line<'_>) -> bool,
 ) {
     let mut decoder = codec::Decoder::new(codec);
+    let mut between = false; // a member ended: what follows begins another
     let mut framer = Framer::new();
     let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT as usize], Vec::new());
     loop {
@@ -366,37 +368,60 @@ fn first_member_lines(
             Ok(n) if n > 0 => n,
             _ => return,
         };
-        data.extend_from_slice(&page[..n]);
-        out.clear();
-        let Ok((_, ended)) = decoder.feed(&page[..n], &mut out) else {
-            return;
-        };
-        if !framer.push(&out, on_line) || ended {
-            return;
+        if let Some(data) = data.as_deref_mut() {
+            data.extend_from_slice(&page[..n]);
+        }
+        let mut input = &page[..n];
+        while !input.is_empty() {
+            if between {
+                if codec == Codec::Gzip {
+                    let zeros = input.iter().take_while(|&&b| b == 0).count();
+                    input = &input[zeros..];
+                    if input.is_empty() {
+                        break;
+                    }
+                }
+                decoder = codec::Decoder::new(codec);
+                between = false;
+            }
+            out.clear();
+            let Ok((used, ended)) = decoder.feed(input, &mut out) else {
+                return;
+            };
+            if !framer.push(&out, on_line) {
+                return;
+            }
+            if !ended {
+                break;
+            }
+            between = true;
+            input = &input[used.max(1)..]; // as `for_each_item` steps past a member
         }
     }
 }
 
-/// Whether the first member of a part says "no" (§19.10.1) before it is whole. A "no" stands
-/// whether the member later passes its check or not, as a damaged member before the verdict also
-/// makes it no snapshot part, so a part that is none is settled by the first block bzip2 gives,
-/// not by the doubling reads below. `data` gets the bytes read, for those to start from. A "yes",
-/// a data error and a member that ends before the verdict are left to them: only members that
-/// passed their checks can say yes.
-fn first_member_says_no(
+/// Whether the first lines of a part say "no" (§19.10.1) before the part is whole. A "no" stands
+/// whether the member that holds it later passes its check or not, as a damaged member before the
+/// verdict also makes it no snapshot part, so a part that is none is settled by the first block
+/// bzip2 gives, not by the doubling reads below. `data` gets the bytes read, for those to start
+/// from. A "yes" and a data error are left to them: only members that passed their checks can
+/// say yes.
+fn first_lines_say_no(
     codec: Codec,
     reader: &mut impl Read,
     delimiter: u8,
     data: &mut Vec<u8>,
 ) -> bool {
     let mut lines = SnapshotLines::new(delimiter);
-    first_member_lines(codec, reader, data, &mut |l| lines.line(l));
+    first_lines(codec, reader, Some(data), &mut |l| lines.line(l));
     lines.verdict == Some(false)
 }
 
-/// The column count of a compressed loose file's first keyed line (`Replay::one_column`), from
-/// its first member, a page at a time: a delete's head read stops there, as an uncompressed one
-/// does. None when that member ends first (and the part is read whole instead).
+/// The column count of a compressed loose file's first keyed line (`Replay::one_column`), a page
+/// at a time, member after member: a delete's head read stops there, as an uncompressed one does.
+/// It answers only from clean input: a data error before that line, or a part with no keyed line,
+/// gives None and says nothing, and the part is then read whole, which says every warning once.
+/// Its one difference from that read is that it stops early.
 fn compressed_head(
     codec: Codec,
     reader: &mut impl Read,
@@ -404,8 +429,7 @@ fn compressed_head(
     format: Format,
     warnings: Option<WarnFn>,
 ) -> Option<bool> {
-    // Held: a head that gives no answer is followed by a read of the whole part, which says
-    // every warning again.
+    // Held: a head that gives no answer says nothing.
     let held: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
     let hold: WarnFn = {
         let held = held.clone();
@@ -415,9 +439,7 @@ fn compressed_head(
     replay.head = true;
     replay.begin_part(path, true);
     let mut table = Table::new(&Scope::Keys(Vec::new()), format);
-    first_member_lines(codec, reader, &mut Vec::new(), &mut |l| {
-        replay.line(l, &mut table)
-    });
+    first_lines(codec, reader, None, &mut |l| replay.line(l, &mut table));
     if replay.one_column.is_some() {
         for w in held.lock().unwrap().iter() {
             warnings.iter().for_each(|f| f(w));
@@ -442,7 +464,7 @@ pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
         Some(c) if !c.supported() => false,
         Some(c) => {
             let mut data = Vec::new();
-            if first_member_says_no(c, &mut reader, d, &mut data) {
+            if first_lines_say_no(c, &mut reader, d, &mut data) {
                 return false;
             }
             // at least one byte more, so that `more` says whether the part goes on past `data`
@@ -1535,7 +1557,7 @@ mod tests {
                     rest: &member,
                     read: 0,
                 };
-                let no = first_member_says_no(codec, &mut reader, b'\t', &mut Vec::new());
+                let no = first_lines_say_no(codec, &mut reader, b'\t', &mut Vec::new());
                 (no, reader.read, member.len())
             };
             // A first line that is not a comment, or a second that is not the marker: no part
@@ -1553,6 +1575,82 @@ mod tests {
             for head in ["#_snapshot_#\n", "#h\n#_snapshot_#\n"] {
                 let (no, ..) = says(&noise(head, 100_000));
                 assert!(!no, "{codec:?} {head:?}");
+            }
+        }
+    }
+
+    /// The head read of a compressed loose file over `bytes` (as one `codec` file): its answer,
+    /// how many bytes it read and what it warned of.
+    fn head_of(codec: Codec, bytes: &[u8]) -> (Option<bool>, usize, Vec<Warning>) {
+        let path = Path::new("h.tsv");
+        let said: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
+        let warn: WarnFn = {
+            let said = said.clone();
+            Arc::new(move |w: &Warning| said.lock().unwrap().push(w.clone()))
+        };
+        let mut reader = Counting {
+            rest: bytes,
+            read: 0,
+        };
+        let format = name::format_of(path).unwrap();
+        let one = compressed_head(codec, &mut reader, path, format, Some(warn));
+        let said = said.lock().unwrap().clone();
+        (one, reader.read, said)
+    }
+
+    /// A compressed loose file's head read (a delete's look at its first keyed line) goes on into
+    /// the next member, and answers only from clean input: on anything else it says nothing and
+    /// the part is read whole.
+    #[test]
+    fn a_compressed_head_goes_on_past_a_member_and_answers_only_from_clean_input() {
+        use crate::codec::encode_member;
+        for codec in [Codec::Gzip, Codec::Bzip2, Codec::Xz, Codec::Zstd] {
+            if !codec.supported() {
+                continue;
+            }
+            let member = |t: &[u8]| encode_member(codec, t).unwrap();
+            // A header alone, then the rows, as a `clear` and the sets after it leave a file: the
+            // first keyed line is in the second member, and the read stops there.
+            let rows = noise("", 100_000);
+            let file = [member(b"#h\n"), member(rows.as_bytes())].concat();
+            let (one, read, said) = head_of(codec, &file);
+            assert_eq!(one, Some(false), "{codec:?}");
+            assert!(
+                read * 2 < file.len(),
+                "{codec:?}: {read} of {} bytes",
+                file.len()
+            );
+            assert!(said.is_empty(), "{codec:?}");
+            // Members of comments, a line that spans two members, one column.
+            let file = [member(b"#a\n"), member(b"#b\n"), member(b"k\n")].concat();
+            assert_eq!(head_of(codec, &file).0, Some(true), "{codec:?}");
+            let file = [member(b"k"), member(b"\t1\n")].concat();
+            assert_eq!(head_of(codec, &file).0, Some(false), "{codec:?}");
+            // A warning of what was read is said, once, with the answer ...
+            let file = [member(b"#\xff\n"), member(b"k\t1\n")].concat();
+            let (one, _, said) = head_of(codec, &file);
+            assert_eq!((one, said.len()), (Some(false), 1), "{codec:?}");
+            assert_eq!(said[0].part, Path::new("h.tsv"), "{codec:?}");
+            // ... and nothing without one: no keyed line, bytes that no member begins with, a
+            // member cut short, and one of the wrong codec.
+            for (what, file) in [
+                ("none", [member(b"#\xff\n"), member(b"#g\n")].concat()),
+                (
+                    "garbage",
+                    [member(b"#\xff\n"), b"not a member".to_vec()].concat(),
+                ),
+                (
+                    "cut",
+                    [member(b"#\xff\n"), member(b"k\t1\n")[..6].to_vec()].concat(),
+                ),
+            ] {
+                let (one, _, said) = head_of(codec, &file);
+                assert_eq!((one, said.len()), (None, 0), "{codec:?} {what}");
+            }
+            // gzip pads members with zeros.
+            if codec == Codec::Gzip {
+                let file = [member(b"#a\n"), vec![0; 5000], member(b"k\t1\n")].concat();
+                assert_eq!(head_of(codec, &file).0, Some(false));
             }
         }
     }

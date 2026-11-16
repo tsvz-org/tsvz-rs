@@ -756,10 +756,11 @@ fn a_loose_scrub_and_clear_read_no_row() {
 }
 
 /// A delete of a compressed loose file of more than one column reads only as far as the file's
-/// first keyed line, a page of the first member at a time, as one of a plain file does: on a
+/// first keyed line, a page at a time, member after member, as one of a plain file does: on a
 /// 228 MiB file of one 89 MiB gzip member it took 0.00 s and 15 MB in 0.1.3, 0.5 s and 576 MB
 /// with the member decoded whole. The member here is damaged in its middle: a read of all of it
-/// says so, and one that stops at the first keyed line never gets there.
+/// says so, and one that stops at the first keyed line never gets there. So is the member after
+/// a header that a member holds alone, as a `clear` leaves a file.
 #[test]
 fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() {
     let d = tempfile::tempdir().unwrap();
@@ -788,8 +789,24 @@ fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() 
     assert_eq!(records(dir, &["delete", "ok.tsv.gz", "key0000005"]).0, 0);
     assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000005"]).0, 3);
     assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000006"]).0, 0);
-    // A first member with no keyed line ends the look at it: the file is read whole.
     let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    let rows = &text[text.find('\n').unwrap() + 1..];
+    let mut second = gz(rows);
+    let middle = second.len() / 2;
+    second[middle] ^= 0xff;
+    fs::write(
+        dir.join("hdr.tsv.gz"),
+        [gz("#key\tv1\tv2\tv3\n"), second].concat(),
+    )
+    .unwrap();
+    assert!(
+        records(dir, &["len", "hdr.tsv.gz"]).2.contains("corrupt"),
+        "a read of the whole damaged member says so"
+    );
+    let (code, _, err) = records(dir, &["delete", "hdr.tsv.gz", "key0000005"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    // A first member with no keyed line: the look goes on into the next, and the file is read
+    // whole only for a one-column rewrite.
     fs::write(
         dir.join("two.tsv.gz"),
         [gz("#h\n"), gz("a\t1\nb\t2\n")].concat(),
