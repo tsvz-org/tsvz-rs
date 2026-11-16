@@ -121,8 +121,8 @@ pub fn name_key<'k>(
 
 /// Whether `key` is `#_snapshot_#`, which a writer appending records never writes in a strict
 /// store: as the first line of a part it would make readers skip every part before it
-/// (§19.10.2, §19.10.3). A loose file does not honor markers (§5.2): there it is a comment, as
-/// TSVZ.py writes it.
+/// (§19.10.2, §19.10.3). A loose file carries no marker semantics (§19.10.2): there it is a
+/// comment, as TSVZ.py writes it.
 fn is_snapshot_marker(key: &[u8]) -> bool {
     key.eq_ignore_ascii_case(b"#_snapshot_#")
 }
@@ -199,7 +199,7 @@ pub(crate) fn marker_effect(r: &Record) -> Option<(String, crate::Markers)> {
 
 /// `records` encoded for `format` as runs, each with the member size in force where it starts
 /// (§16.7): `member_size`, then from the record after each valid `#_member_size_#` marker on,
-/// the size it sets, as a reader replays them (a loose file does not honor markers).
+/// the size it sets, as a reader replays them (a loose file carries no marker semantics, §19.10.2).
 pub(crate) fn runs(
     records: &[Record],
     format: Format,
@@ -607,7 +607,8 @@ mod tests {
             .append_payload(b"b,2\n")
             .unwrap();
         assert_eq!(std::fs::read_to_string(&csv).unwrap(), "a,1\nb,2\n");
-        // A loose file does not honor markers: there the line is a comment, as TSVZ.py writes it.
+        // A loose file carries no marker semantics (§19.10.2): there the line is a comment, as
+        // TSVZ.py writes it.
         let loose = dir.path().join("l.tsv");
         let marker = Record::Marker {
             key: "#_snapshot_#".into(),

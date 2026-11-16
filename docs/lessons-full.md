@@ -22,7 +22,8 @@ entries go last, in the same commit as the change:
   mark is part of its key.
 - Why we had to change: tsvz-rs's `scrub` and `clear` of a TSVZ.py-managed `.tsv` dropped its
   `#_defaults_#` lines and a one-column file's keys, and tsvz-rs listed keys TSVZed had deleted
-  (TSVZed writes a deletion as `key<TAB><TAB>…`). Fixing both was asked for in 0.1.4 (2026-11-14).
+  (TSVZ.py writes a deletion as a bare key with its `delete`, and as `key<TAB>` with `set key ''`).
+  Fixing both was asked for in 0.1.4 (2026-11-14).
 - Original design was wrong because: it read "their data semantics are implementation-defined"
   (§20.2.4) as room for a simpler rule of its own, on files that another program writes and reads
   by its rules. Each tool's rewrite then changed what the other read: tsvz-rs's scrub lost TSVZ.py's

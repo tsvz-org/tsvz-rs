@@ -7,10 +7,10 @@ a byte-order mark, a torn tail), split over one to three parts, some of them com
 (gzip, bzip2, xz, and zstd when this Python has it) with members cut short, corrupted or, for
 gzip, padded. Both tools then answer the same reads, compared byte for byte: tsvz-rs pads
 rows to the store's width as TSVZ.py does (§3.6 lets a reader pad). `read`, `verify` and
-`parts` are also run on a pseudo-terminal of fixed width, and their tables compared exactly
-(design section 7.3), and `read` with a `-d` that the strict extension overrides (§20.7.1).
-Loose files are left out: tsvz-rs reads them by design section 5.6's rule, TSVZ.py by its
-3.39 rules (§20.2.4 allows both; docs/silent-choices.md).
+`parts` are also run on a pseudo-terminal of fixed width, and their tables compared exactly,
+and `read` with a `-d` that the strict extension overrides (§20.7.1).
+Loose files are left out: both read them by TSVZ.py's 3.39 rules (§20.2.4 leaves the data
+semantics to the implementation), but for the differences docs/limitations.md names.
 
 With --scrub, each seed's store is also scrubbed by tsvz-rs, in place for one part and by a
 snapshot of the parts before the active one for several (§19.2), on a copy: TSVZ.py, and

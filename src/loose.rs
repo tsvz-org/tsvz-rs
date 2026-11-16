@@ -3,12 +3,14 @@
 //! `_processLine`). Both drop the NULs at the start of a line, take the column count from the
 //! first keyed line ([`keyed`]), and read a line whose cells after the key are none or all blank
 //! as a deletion ([`deletes`]), but in a one-column file, where it is a row. Line 1 begins with
-//! its byte-order mark, which is part of its key. tsvz-rs reads every `#` line as a comment,
-//! TSVZ.py a `#_defaults_#` line as defaults for the rows after it, and only TSVZ.py strips each
-//! cell's trailing whitespace and decodes `<…>` tokens.
+//! its byte-order mark, which is part of its key. tsvz-rs reads every `#` line as a comment, but
+//! a key that begins with `#_defaults_#`, TSVZ.py a `#_defaults_#` line as defaults for the rows
+//! after it, and only TSVZ.py strips each cell's trailing whitespace and decodes `<sep>` and
+//! `<LF>`.
 //!
-//! A rewrite keeps each line it keeps as the file has it, `\r` included, and changes what a
-//! reader reads only where both readers read the result alike: [`scrub`] (which moves a key's
+//! A rewrite keeps each line it keeps as the file has it, `\r` included (a byte-order mark an
+//! unterminated first line loses is the one exception), and changes what a reader reads only
+//! where both readers read the result alike: [`scrub`] (which moves a key's
 //! last line into its first line's place where that is so), [`cleared`] and, in a one-column
 //! file, where no line can delete, [`without`] (which puts a key's line in the place of a width
 //! line that goes).

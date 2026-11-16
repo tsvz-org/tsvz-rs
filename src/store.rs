@@ -299,12 +299,12 @@ fn snapshot_start(list: &[parts::Part], format: Format) -> usize {
         .unwrap_or(0)
 }
 
-/// Compressed bytes of a part read first to look for the marker, doubled until it is judged. A
-/// gzip, xz or zstd member gives its first lines from its first bytes, and a first line that is
-/// no comment settles a part, so 4 KiB judges nearly every part. Measured on 200 gzip parts of
-/// one member each, a `get` took 0.51 s with 64 KiB, 0.41 s with 16 KiB and 0.39 s with 4 KiB
-/// (0.1.3, which asked nothing of a part, 0.40 s). bzip2 gives nothing before a whole block (900
-/// kB of text at most, its published block size) and takes a few doublings, whatever this is.
+/// The page a part's first member is decoded from to look for the marker, and the least the
+/// doubling reads after it take. A gzip, xz or zstd member gives its first lines from its first
+/// bytes, and a first line that is no comment settles a part, so 4 KiB judges nearly every part,
+/// and a larger page only decodes more of each. Measured on 200 gzip parts of one member each
+/// (bench/snapshot_look.py, 2026-11-16), a `get` took 0.40 s with 4 KiB, as in 0.1.3, which asked
+/// nothing of a part, and 0.47 s with 64 KiB.
 const SNAPSHOT_HINT: u64 = 1 << 12;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
@@ -998,7 +998,7 @@ impl Store {
         &self.parts
     }
 
-    /// Catch up with the files (design section 3.7, TSVZ.py's `sync`): replay what was appended
+    /// Catch up with the files (TSVZ.py's `sync`): replay what was appended
     /// to the last part since the last read; read the whole store again when anything else
     /// changed — the part list, an earlier part, a compressed last part, a stopped read, or an
     /// in-place rewrite (the bytes before the old read offset no longer match).
@@ -1494,8 +1494,8 @@ mod tests {
         );
         let p = dir.path().join("case.tsvz");
         assert_eq!(keys(&Store::open(&p, Options::default()).unwrap()), ["b"]);
-        // A loose file does not honor markers (§5.2), and is one file whatever its siblings
-        // are named: the line is a comment, and skips nothing.
+        // A loose file carries no marker semantics (§19.10.2), and is one file whatever its
+        // siblings are named: the line is a comment, and skips nothing.
         let p = write(dir.path(), "loose.tsv", b"a\t1\n#_snapshot_#\nb\t2\n");
         assert_eq!(
             keys(&Store::open(&p, Options::default()).unwrap()),
