@@ -377,8 +377,13 @@ impl Replay {
         // A loose file's line 1 begins with its byte-order mark, as TSVZ.py reads it (§5.2: the
         // data semantics of a loose file are implementation-defined); the framer drops it (§4.7).
         let marked: Vec<u8>;
-        if !self.format.strict && first && line.offset == 3 {
-            marked = [&b"\xef\xbb\xbf"[..], body].concat();
+        let mark: &[u8] = if !self.format.strict && first && line.offset == 3 {
+            b"\xef\xbb\xbf"
+        } else {
+            b""
+        };
+        if !mark.is_empty() {
+            marked = [mark, body].concat();
             body = &marked;
         }
         let text = String::from_utf8_lossy(body);
@@ -395,7 +400,8 @@ impl Replay {
             self.strict_line(&text, line, first, sink);
         } else {
             if let Some(lines) = &mut self.lines {
-                lines.push(body.to_vec());
+                // As the file has it, but for its `\n`: a rewrite keeps the lines it keeps.
+                lines.push([mark, &line.raw[..line.raw.len() - 1]].concat());
             }
             self.loose_line(&text, first, sink);
             return !(self.head && self.one_column.is_some());
@@ -916,6 +922,23 @@ mod tests {
             table(&rows),
             vec![row("#_defaults_#x", &["1"]), row("a", &["", "q"])]
         );
+    }
+
+    #[test]
+    fn a_loose_files_lines_are_kept_as_the_file_has_them() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        let mut replay = Replay::new(loose, false, None);
+        replay.lines = Some(Vec::new());
+        replay.begin_part(Path::new("s.tsv"), true);
+        let mut rows = Rows::default();
+        Framer::new().push(b"\xef\xbb\xbfa\t1\r\n#c\r\r\n\nb\t2\n", &mut |l| {
+            replay.line(l, &mut rows)
+        });
+        let kept: Vec<&[u8]> = replay.lines.iter().flatten().map(|l| &l[..]).collect();
+        assert_eq!(kept, [&b"\xef\xbb\xbfa\t1\r"[..], b"#c\r\r", b"", b"b\t2"]);
     }
 
     #[test]

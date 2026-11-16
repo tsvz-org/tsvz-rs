@@ -515,6 +515,21 @@ fn a_loose_scrub_and_clear_keep_what_tsvz_py_reads() {
 }
 
 #[test]
+fn a_loose_rewrite_keeps_the_lines_it_keeps_as_they_are() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // CRLF lines stay CRLF, in a scrub, a delete and a clear alike.
+    fs::write(dir.join("a.tsv"), "#h\r\na\t1\r\nb\t2\r\n\r\na\t3\r\n").unwrap();
+    assert_eq!(records(dir, &["scrub", "a.tsv"]).0, 0);
+    assert_eq!(file(dir, "a.tsv"), "#h\r\na\t3\r\nb\t2\r\n");
+    fs::write(dir.join("o.tsv"), "#h\r\na\r\nb\r\nc\r\n").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", "b"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\r\na\r\nc\r\n");
+    assert_eq!(records(dir, &["clear", "a.tsv"]).0, 0);
+    assert_eq!(file(dir, "a.tsv"), "#h\r\n");
+}
+
+#[test]
 fn the_delimiter_option() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();

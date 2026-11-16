@@ -412,6 +412,9 @@ const LOOSE: &[&str] = &[
     "\0\0\na\nb\n",
     "\0a\t1\na\t2\n",
     "#h\n\0\0\na\t1\n\0b\t\n\0\t3\n",
+    // CRLF lines.
+    "#h\r\na\t1\r\nb\r\nb\t2\r\na\t3\r\n",
+    "a\r\nb\r\n\r\na\r\n",
     // Only a first cell that is `#_defaults_#` makes a defaults line, to TSVZ.py.
     "#_defaults_#x\t1\na\t\tq\n",
     "#h\n#_defaults_#x\na\nb\n#_defaults_#x\t2\n",

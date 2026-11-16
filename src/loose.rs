@@ -111,9 +111,10 @@ pub(crate) struct Lines<'a> {
 
 impl<'a> Lines<'a> {
     pub(crate) fn new(raw: &'a [Vec<u8>], d: u8) -> Lines<'a> {
+        // A line as the framer reads it: one `\r` before the `\n` is no part of it.
         let text: Vec<String> = raw
             .iter()
-            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned())
             .collect();
         let width_line = text.iter().position(|t| keyed(t, d));
         let one = width_line.is_some_and(|i| !text[i].as_bytes().contains(&d));
@@ -327,6 +328,11 @@ mod tests {
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
             ),
+            // Every line it keeps is as it was, its `\r` too.
+            (
+                "#h\r\na\t1\r\n\r\nb\t2\r\na\t3\r\n",
+                "#h\r\na\t3\r\nb\t2\r\n",
+            ),
             // A key that only begins with `#_defaults_#` is a key.
             (
                 "#h\n#_defaults_#x\t1\n#_defaults_#x\t2\n",
@@ -349,6 +355,10 @@ mod tests {
             ("#h\n#_defaults_#\tP\na\t1\n", "#h\n#_defaults_#\tP\n"),
             ("\na\t1\n", "\n"),
             ("a\t1\n#_defaults_#\tP\n", "#_defaults_#\tP\n"),
+            (
+                "#h\r\na\t1\r\n#_defaults_#\tP\r\n",
+                "#h\r\n#_defaults_#\tP\r\n",
+            ),
             // A #_defaults_# line that holds no value resets the defaults, but at one column,
             // where it is a row: it goes, with what it reset.
             (
@@ -378,6 +388,7 @@ mod tests {
             gone("a\n#_defaults_#\tP\nb\n", &["a"]),
             "b\n#_defaults_#\tP\nb\n"
         );
+        assert_eq!(gone("a\r\nb\r\nc\r\n", &["b"]), "a\r\nc\r\n");
         // A byte-order mark is part of line 1's key, as TSVZ.py reads it: `a` is another key
         // than `\u{feff}a`, and the mark goes with its line, never onto another.
         assert_eq!(gone("\u{feff}a\nb\n", &["a"]), "\u{feff}a\nb\n");
