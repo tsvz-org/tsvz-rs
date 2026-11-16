@@ -455,30 +455,33 @@ mod tests {
         );
     }
 
-    /// 200,000 lines of 50,000 keys, about four lines each and far apart, as the file a scrub is
-    /// for (keys written many times). A scan of the lines between each key's first and last
-    /// took 55 s here in a debug build, and 1.4 s in a release build (0.1.3: 0.06 s, linear);
-    /// counted once, the scrub takes 0.2 s. 5 s lies between, 25 times either side.
+    /// 400,000 keys, each written twice: a block of them, then the block again, so that every
+    /// key's first and last line lie 400,000 lines apart. A scan of the lines between them, per
+    /// key, took 50 s in a release build here (2026-11-16; the old test, 200,000 lines of 50,000
+    /// keys in random order, took 1.4 s with the scan and so passed in a release build); counted
+    /// once, the scrub takes 1.4 s in a debug build and 0.4 s in a release one. The scrub runs on a
+    /// thread, so that a scan fails the test after 10 s, 7 times the debug scrub and a fifth of
+    /// the release scan, and not when it ends (it takes minutes in a debug build).
     #[test]
     fn a_scrub_takes_time_in_the_length_of_the_file_whatever_the_keys_repeat() {
-        let (count, keys) = (200_000u64, 50_000u64);
-        let mut text = String::from("#h\tv\n");
-        let mut x = 1u64;
-        for i in 0..count {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            text.push_str(&format!("k{}\t{i}\n", (x >> 33) % keys));
-        }
-        let raw = lines(&text);
-        let start = std::time::Instant::now();
-        let out = scrub(&Lines::new(&raw, b'\t'));
-        let took = start.elapsed();
-        assert!(out.len() < text.len());
-        assert!(
-            took < std::time::Duration::from_secs(5),
-            "a scrub of {count} lines of {keys} keys took {took:?}"
-        );
+        let keys = 400_000u64;
+        let (done, took) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::from("#h\tv\n");
+            for round in 0..2 {
+                for k in 0..keys {
+                    text.push_str(&format!("k{k}\t{round}\n"));
+                }
+            }
+            let raw = lines(&text);
+            let start = std::time::Instant::now();
+            let out = scrub(&Lines::new(&raw, b'\t'));
+            let _ = done.send((start.elapsed(), out.len() < text.len()));
+        });
+        let (time, smaller) = took
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a scrub of 800,000 lines of 400,000 keys took more than 10 s");
+        assert!(smaller, "the scrub took {time:?}");
     }
 
     #[test]
