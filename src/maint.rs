@@ -450,14 +450,12 @@ fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
 }
 
 /// A whole read for a rewrite: never past a part it cannot read, since what it writes would
-/// lose that part's rows, and every part replayed, those before a snapshot part too (§19.10.3):
-/// what is written must read the same to a reader that replays them.
+/// lose that part's rows.
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
         verify: false,
         skip_unreadable: false,
-        full_history: true,
         lines: true,
         ..options.clone()
     }
@@ -2725,12 +2723,21 @@ mod tests {
     #[test]
     fn a_snapshot_part_that_other_parts_precede_begins_with_the_snapshot_marker() {
         // §19.10.2, after the header comment: a reader that implements §19.10 begins there and
-        // reads as one that replays every part does (§19.10.3).
-        let full = Options {
-            full_history: true,
-            ..opts()
+        // reads as one that replays every part does (§19.10.3). `from` is what such a reader
+        // reads: the snapshot part (as part 0) and the parts after it.
+        let read = |p: &Path| trimmed_rows(&Store::open(p, opts()).unwrap());
+        let from = |dir: &Path, snapshot: &str, after: &[&str]| {
+            let copy = tempfile::tempdir().unwrap();
+            fs::copy(dir.join(snapshot), copy.path().join("s.tsvz")).unwrap();
+            for (i, name) in after.iter().enumerate() {
+                fs::copy(
+                    dir.join(name),
+                    copy.path().join(format!("s.tsvz.{}", i + 1)),
+                )
+                .unwrap();
+            }
+            read(&copy.path().join("s.tsvz"))
         };
-        let read = |p: &Path, o: &Options| trimmed_rows(&Store::open(p, o.clone()).unwrap());
         for (rotate, part0) in [
             ("keep", "#h\na\t1\nb\t2\n"),
             ("rename", "#h\n#_rotate_#\trename\na\t1\nb\t2\n"),
@@ -2740,15 +2747,19 @@ mod tests {
             fs::write(&p, part0).unwrap();
             fs::write(dir.path().join("s.tsvz.2"), "a\nc\t3\n").unwrap();
             fs::write(dir.path().join("s.tsvz.8"), "z\t9\n").unwrap();
-            let before = read(&p, &full);
+            let before = read(&p);
             assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written, "{rotate}");
             let snapshot = fs::read_to_string(dir.path().join("s.tsvz.5")).unwrap();
             assert!(
                 snapshot.starts_with("#h\n#_snapshot_#\n#_version_#\t1\n"),
                 "{rotate}: {snapshot:?}"
             );
-            assert_eq!(read(&p, &opts()), before, "{rotate}");
-            assert_eq!(read(&p, &full), before, "{rotate}");
+            assert_eq!(read(&p), before, "{rotate}");
+            assert_eq!(
+                from(dir.path(), "s.tsvz.5", &["s.tsvz.8"]),
+                before,
+                "{rotate}"
+            );
             if rotate == "keep" {
                 assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged, "run again");
             }
@@ -2760,15 +2771,15 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         fs::write(dir.path().join("s.tsvz.1"), "a\nb\t2\n").unwrap();
         fs::write(dir.path().join("s.tsvz.2"), "z\t9\n").unwrap();
-        let before = read(&p, &full);
+        let before = read(&p);
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
         let compacted = fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap();
         assert!(
             compacted.starts_with("#_snapshot_#\n#_version_#\t1\n"),
             "{compacted:?}"
         );
-        assert_eq!(read(&p, &opts()), before);
-        assert_eq!(read(&p, &full), before);
+        assert_eq!(read(&p), before);
+        assert_eq!(from(dir.path(), "s.tsvz.1", &["s.tsvz.2"]), before);
         // With no part before the one compacted (a one-part store, or part 0): TSVZ.py's
         // content, unmarked.
         for others in [&[][..], &["s.tsvz.1"][..]] {
@@ -2787,10 +2798,10 @@ mod tests {
     }
 
     #[test]
-    fn a_scrub_replays_every_part_also_those_a_snapshot_part_makes_readers_skip() {
+    fn a_scrub_keeps_the_rows_of_every_part_also_those_before_a_snapshot_part() {
         // The snapshot part restates nothing of part 0, against §19.10.2: a reader that begins
-        // at it never sees `a`, but one that replays every part does (§19.10.3), and what a
-        // scrub writes must read the same to both.
+        // at it never sees `a`, but one that replays every part does (§19.10.3, as tsvz-rs
+        // does), and what a scrub writes must read the same to both.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();

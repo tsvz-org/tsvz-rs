@@ -29,10 +29,9 @@ Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz,
 into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
 one-part store in place. In a multi-part store it writes the parts before the active one as a
 new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
-applies the store's `#_rotate_#`; writers keep appending throughout. A read begins at the last
-snapshot part (§19.10), but for a bzip2 part, which is read like any other (the result is the
-same); `verify` replays every part. `scrub` and `clear` refuse parts that
-declare a spec version newer than tsvz implements (§6.3).
+applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
+as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to 0.1.5. `scrub` and
+`clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
 Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
 except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
@@ -79,10 +78,6 @@ for (key, row) in store.iter() {
 # Ok::<(), tsvz::Error>(())
 ```
 
-A read begins at the store's last snapshot part (§19.10.3, a bzip2 part excepted); an `Options` whose `full_history`
-is set (`let mut o = Options::default(); o.full_history = true;`) replays every part, as
-`verify` always does.
-
 Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
 available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
 process loses when it closes any other descriptor of the same file. The library opens a store's
@@ -95,7 +90,7 @@ Build without the command line and C libraries with
 ## Conformance and compatibility
 
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
-every codec, every digest, multi-part scrub and snapshot skipping claimed, and is checked
+every codec, every digest and multi-part scrub claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
 share a store: they take the same file locks. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
@@ -103,11 +98,10 @@ choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
 ## Upgrading to 0.1.4 from 0.1.3
 
-In strict stores (`.tsvz .csvz .nsvz .psvz`) a read begins at the last snapshot part (§19.10.3),
-a multi-part `scrub` writes snapshot parts that begin with `#_snapshot_#` (and makes one marked
-copy of a part a 0.1.3 scrub wrote), and a writer now refuses `#_snapshot_#` (§19.10.2; 0.1.3
-accepted it and wrote it as a record). A store with no snapshot part reads as before. Upgrade every host that scrubs the
-same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a new snapshot part each time
+In strict stores (`.tsvz .csvz .nsvz .psvz`) a read replays every part, as before; a multi-part
+`scrub` writes snapshot parts that begin with `#_snapshot_#` (and makes one marked copy of a part
+a 0.1.3 scrub wrote), and a writer now refuses `#_snapshot_#` (§19.10.2; 0.1.3 accepted it and
+wrote it as a record). Upgrade every host that scrubs the same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a new snapshot part each time
 (0.1.3 does not expect the marker line), and the next 0.1.4 scrub adds a marked copy of it.
 
 In loose files:
@@ -127,9 +121,8 @@ In loose files:
   defaults they had (a file of one column keeps none: rows written there later read without
   them).
 
-The library gains `Options::full_history`; nothing else in its documented API changes (two
-`#[doc(hidden)]` items do: `codec::member` and `codec::Member` are gone, and `replay::Replay`
-has two more public fields).
+The library's documented API does not change (two `#[doc(hidden)]` items do: `codec::member` and
+`codec::Member` are gone, and `replay::Replay` has two more public fields).
 
 ## License
 

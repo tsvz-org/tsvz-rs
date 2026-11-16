@@ -83,18 +83,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that
   deferrals are noted, not asked.
 
-### A bzip2 part is never the part a read begins at
+### A read replays every part, also those before a snapshot part
 - Kind: deferred
-- What the operator sees: a read of a multi-part store whose parts are bzip2 replays every part, also those
-  before a snapshot part, which a read of gzip, xz or zstd parts skips (§19.10.3 lets a reader begin at a
-  snapshot part, it does not oblige it); the result is the same, and the speed is 0.1.3's, which began no read
-  at a snapshot part. A `scrub` still writes the marker, and finds a part marked.
-- Why: telling a snapshot part needs its first lines, and bzip2 gives nothing before a whole block (up to 900 kB
-  of text), so the look at each part, from the last, decodes a block that the read then decodes again. Measured
-  on 40 parts of 3.6 MB with no snapshot part, `tsvz get` took 2.3 s with the look and 1.8 s in 0.1.3, and on
-  400 parts of 360 kB, each under one block, 2.8 s against 1.5 s (2026-11-16); gzip, xz and zstd parts, whose
-  first lines come out of their first bytes, read as fast as in 0.1.3.
-- Revisit when: the next tsvz-rs version. The plan: decode each part once, by handing what the look decoded to
-  the read, or by recognising a snapshot part as the read reaches it; bzip2 parts are then judged again.
-- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
+- What the operator sees: a read of a multi-part strict store replays every part, as in 0.1.3, however much of
+  the store lies before its last snapshot part. TSVZ.py begins at that part and skips the ones before it
+  (§19.10.3 lets a reader do so, it does not oblige it). On a store that follows §19.10.2 the result is the
+  same, and only the time differs: 20 gzip parts of history before a snapshot part read in 0.19 s, where a read
+  that begins at the snapshot part takes 0.02 s. On a store whose snapshot part does not restate the parts
+  before it, which a producer must not write, tsvz-rs reads every part and TSVZ.py only from the snapshot part.
+  A `scrub` writes the marker and finds a part marked.
+- Why: finding the part before the read took a look at the start of every part, apart from the read. In
+  0.1.4's reviews that look cost a second decode (bzip2 parts 1.3 to 1.9 times 0.1.3's time; a snapshot part of
+  one 64 MB member 1.6 times with gzip and 2.5 times with xz), and leaving bzip2 out of it made the answer on
+  such a store depend on the codec.
+- Revisit when: the next tsvz-rs version. The plan: the read judges a part from its first lines as it decodes
+  them, one rule for every codec, and a look before the read only chooses where to begin, from each part's
+  first page; the read of that part confirms it, or the store is read again from part 0.
+- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
+  noted, not asked.
