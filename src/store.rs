@@ -372,37 +372,69 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
     }
 }
 
-/// Whether the first member of a part, fed to a decoder one page at a time from `reader`, says
-/// "no" (§19.10.1) before it is whole. A "no" stands whether the member later passes its check
-/// or not, as a damaged member before the verdict also makes it no snapshot part, so a part
-/// that is none is settled by the first block bzip2 gives, not by the doubling reads below.
-/// `data` gets the bytes read, for those to start from. A "yes", a data error and a member that
-/// ends before the verdict are left to them: only members that passed their checks can say yes.
+/// The lines of the first member of a part, decoded a page at a time from `reader` and given to
+/// `on_line` as they come out, until it returns false, the member ends or a data error stops
+/// it. The output is used before the member's check, so what it says is only a first look. `data`
+/// gets the bytes read.
+fn first_member_lines(
+    codec: Codec,
+    reader: &mut impl Read,
+    data: &mut Vec<u8>,
+    on_line: &mut dyn FnMut(&Line<'_>) -> bool,
+) {
+    let mut decoder = codec::Decoder::new(codec);
+    let mut framer = Framer::new();
+    let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT as usize], Vec::new());
+    loop {
+        let n = match reader.read(&mut page) {
+            Ok(n) if n > 0 => n,
+            _ => return,
+        };
+        data.extend_from_slice(&page[..n]);
+        out.clear();
+        let Ok((_, ended)) = decoder.feed(&page[..n], &mut out) else {
+            return;
+        };
+        if !framer.push(&out, on_line) || ended {
+            return;
+        }
+    }
+}
+
+/// Whether the first member of a part says "no" (§19.10.1) before it is whole. A "no" stands
+/// whether the member later passes its check or not, as a damaged member before the verdict also
+/// makes it no snapshot part, so a part that is none is settled by the first block bzip2 gives,
+/// not by the doubling reads below. `data` gets the bytes read, for those to start from. A "yes",
+/// a data error and a member that ends before the verdict are left to them: only members that
+/// passed their checks can say yes.
 fn first_member_says_no(
     codec: Codec,
     reader: &mut impl Read,
     delimiter: u8,
     data: &mut Vec<u8>,
 ) -> bool {
-    let mut decoder = codec::Decoder::new(codec);
-    let (mut lines, mut framer) = (SnapshotLines::new(delimiter), Framer::new());
-    let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT as usize], Vec::new());
-    while lines.verdict.is_none() {
-        let n = match reader.read(&mut page) {
-            Ok(n) if n > 0 => n,
-            _ => break,
-        };
-        data.extend_from_slice(&page[..n]);
-        out.clear();
-        let Ok((_, ended)) = decoder.feed(&page[..n], &mut out) else {
-            break;
-        };
-        framer.push(&out, &mut |l| lines.line(l));
-        if ended {
-            break;
-        }
-    }
+    let mut lines = SnapshotLines::new(delimiter);
+    first_member_lines(codec, reader, data, &mut |l| lines.line(l));
     lines.verdict == Some(false)
+}
+
+/// The column count of a compressed loose file's first keyed line (`Replay::one_column`), from
+/// its first member, a page at a time: a delete's head read stops there, as an uncompressed one
+/// does. None when that member ends first (and the part is read whole instead).
+fn compressed_head(
+    codec: Codec,
+    reader: &mut impl Read,
+    format: Format,
+    warnings: Option<WarnFn>,
+) -> Option<bool> {
+    let mut replay = Replay::new(format, false, warnings);
+    replay.head = true;
+    replay.begin_part(Path::new(""), true);
+    let mut table = Table::new(&Scope::Keys(Vec::new()), format);
+    first_member_lines(codec, reader, &mut Vec::new(), &mut |l| {
+        replay.line(l, &mut table)
+    });
+    replay.one_column
 }
 
 /// Whether `part` is a snapshot part (§19.10.1): its first committed line, or its second after a
@@ -720,6 +752,16 @@ impl Store {
         let mut framer = Framer::new();
         match part.codec {
             Some(codec) => {
+                if replay.head {
+                    let warnings = self.options.warnings.clone();
+                    if let Some(one) = compressed_head(codec, &mut reader, self.format, warnings) {
+                        replay.one_column = Some(one);
+                        return Ok(());
+                    }
+                    reader
+                        .seek(SeekFrom::Start(0))
+                        .map_err(|e| Error::io(&part.path, e))?;
+                }
                 let mut data = Vec::new();
                 reader
                     .read_to_end(&mut data)

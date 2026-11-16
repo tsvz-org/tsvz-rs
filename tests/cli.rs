@@ -643,6 +643,50 @@ fn a_loose_scrub_and_clear_read_no_row() {
     }
 }
 
+/// A delete of a compressed loose file of more than one column reads only as far as the file's
+/// first keyed line, a page of the first member at a time, as one of a plain file does: on a
+/// 228 MiB file of one 89 MiB gzip member it took 0.00 s and 15 MB in 0.1.3, 0.5 s and 576 MB
+/// with the member decoded whole. The member here is damaged in its middle: a read of all of it
+/// says so, and one that stops at the first keyed line never gets there.
+#[test]
+fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let mut text = String::from("#key\tv1\tv2\tv3\n");
+    for i in 0..20_000u64 {
+        let x = i
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        text.push_str(&format!("key{i:07}\t{x:016x}\t{x:016x}\tsome text here\n"));
+    }
+    let mut member = tsvz::codec::encode_member(tsvz::name::Codec::Gzip, text.as_bytes()).unwrap();
+    assert!(member.len() > 1 << 16, "{} bytes", member.len());
+    let whole = member.clone();
+    fs::write(dir.join("ok.tsv.gz"), &whole).unwrap();
+    let middle = member.len() / 2;
+    member[middle] ^= 0xff;
+    fs::write(dir.join("big.tsv.gz"), &member).unwrap();
+    assert!(
+        records(dir, &["len", "big.tsv.gz"]).2.contains("corrupt"),
+        "a read of the whole damaged member says so"
+    );
+    let (code, _, err) = records(dir, &["delete", "big.tsv.gz", "key0000005"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    // The same delete of the undamaged file: the key is gone, and the others are not.
+    assert_eq!(records(dir, &["delete", "ok.tsv.gz", "key0000005"]).0, 0);
+    assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000005"]).0, 3);
+    assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000006"]).0, 0);
+    // A first member with no keyed line ends the look at it: the file is read whole.
+    let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    fs::write(
+        dir.join("two.tsv.gz"),
+        [gz("#h\n"), gz("a\t1\nb\t2\n")].concat(),
+    )
+    .unwrap();
+    assert_eq!(records(dir, &["delete", "two.tsv.gz", "a"]).0, 0);
+    assert_eq!(records(dir, &["keys", "two.tsv.gz"]).1, "b\n");
+}
+
 #[test]
 fn clear_and_scrub_refuse_a_path_that_names_one_part() {
     let d = tempfile::tempdir().unwrap();
