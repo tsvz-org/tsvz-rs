@@ -791,3 +791,35 @@ fn a_loose_clear_keeps_the_column_count_its_defaults_were_read_at() {
         assert_eq!(bare(&kept), one, "{text:?}");
     }
 }
+
+#[test]
+fn a_loose_delete_leaves_the_rows_tsvz_py_read_but_the_key() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.tsv");
+    // In a file of one column a `#_defaults_#` line with no value is a row to TSVZ.py, and so
+    // is a bare one: they stay rows when the key that set the column count goes.
+    for (text, key) in [
+        ("c\n#_defaults_#\t\n", "c"),
+        ("c\n#_defaults_#\tP\n#_defaults_#\n", "c"),
+        ("b\nb\t\t\t\n#_defaults_#\t\t\n", "b"),
+        ("x\n#_defaults_#\tP\n", "x"),
+        ("a\nb\t1\nc\n#_defaults_#x\t1\n", "a"),
+        ("#h\na\nb\n#_defaults_#\tP\nc\n", "b"),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let before = py_keys_sorted(&py, &file);
+        assert!(
+            rust(&["delete", file.to_str().unwrap(), key], b"")
+                .status
+                .success()
+        );
+        let want: Vec<String> = before.into_iter().filter(|k| k != key).collect();
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            py_keys_sorted(&py, &file),
+            want,
+            "{text:?} {key:?}: {after:?}"
+        );
+    }
+}

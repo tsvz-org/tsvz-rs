@@ -279,10 +279,21 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>
         let keyed_at = |i: usize| keep[i] && keyed(&lines.text[i], d);
         let next = (w + 1..n).find(|&i| keyed_at(i));
         let row = (w + 1..n).find(|&i| keyed_at(i) && !is_defaults(&lines.text[i], d));
-        if let (Some(next), Some(row)) = (next, row) {
+        // With no key left, a `#_defaults_#` line that holds no value, which TSVZ.py reads as a
+        // row here, is kept a row by a bare one in front of it; one that holds a value alone is
+        // no row, and the file then has the count of that line.
+        let valueless = |i: usize| {
+            is_defaults(&lines.text[i], d) && deletes(first_field(&lines.text[i], d).1, d, false)
+        };
+        let stand_in = match row {
+            Some(row) => lines.raw[row].split(|&b| b == d).next(),
+            None if (w + 1..n).any(|i| keep[i] && valueless(i)) => Some(DEFAULTS.as_bytes()),
+            None => None,
+        };
+        if let (Some(next), Some(stand_in)) = (next, stand_in) {
             if lines.fields(next) > 0 {
                 keep[w] = true;
-                put[w] = lines.raw[row].split(|&b| b == d).next();
+                put[w] = Some(stand_in);
             }
         }
     }
@@ -446,5 +457,13 @@ mod tests {
             "#_defaults_#x\n#_defaults_#x\t1\n#c\n"
         );
         assert_eq!(gone("c\n#_defaults_#x\n", &["#_defaults_#x"]), "c\n");
+        // No key left to take its place: a `#_defaults_#` line with no value is a row to TSVZ.py
+        // at one column, and a bare one before it keeps it one; one with a value is no row.
+        assert_eq!(
+            gone("c\n#_defaults_#\tP\n#_defaults_#\t\n", &["c"]),
+            "#_defaults_#\n#_defaults_#\tP\n#_defaults_#\t\n"
+        );
+        assert_eq!(gone("c\n#_defaults_#\n", &["c"]), "#_defaults_#\n");
+        assert_eq!(gone("x\n#_defaults_#\tP\n", &["x"]), "#_defaults_#\tP\n");
     }
 }
