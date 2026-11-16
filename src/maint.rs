@@ -1533,9 +1533,10 @@ pub(crate) enum LooseDelete {
 /// whitespace at its end, unless nothing is left of it) and, where that differs, as given; one
 /// column, where a key alone is a row and no line can delete, a rewrite without the lines of the
 /// keys ([`loose::without`]); no keyed line yet, nothing, since a key alone would set one column
-/// and be a row (but a key of only whitespace, which sets none, is written as given). Only the
-/// first keyed line is read, and the whole file only at one column. A missing file is created
-/// (§20.2.2).
+/// and be a row (but a key of only whitespace, which sets none, is written as given). A plain
+/// file is read only as far as its first keyed line, and a compressed one into memory whole (docs/
+/// limitations.md); the whole file is read for a rewrite, at one column only. A missing file is
+/// created (§20.2.2).
 #[cfg(feature = "cli")]
 pub(crate) fn delete_loose(
     store: &Path,

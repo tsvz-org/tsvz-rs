@@ -49,7 +49,7 @@ pub struct Options {
     /// Keep a loose file's lines, for a rewrite that keeps them ([`crate::loose`]).
     pub(crate) lines: bool,
     /// Read a loose file only as far as its first keyed line, which sets its column count
-    /// ([`Store::one_column`]).
+    /// ([`Store::one_column`]). A compressed part is read into memory whole first.
     pub(crate) head: bool,
 }
 
@@ -356,7 +356,7 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
 fn first_lines(
     codec: Codec,
     reader: &mut impl Read,
-    mut data: Option<&mut Vec<u8>>,
+    data: &mut Vec<u8>,
     on_line: &mut dyn FnMut(&Line<'_>) -> bool,
 ) {
     let mut decoder = codec::Decoder::new(codec);
@@ -368,9 +368,7 @@ fn first_lines(
             Ok(n) if n > 0 => n,
             _ => return,
         };
-        if let Some(data) = data.as_deref_mut() {
-            data.extend_from_slice(&page[..n]);
-        }
+        data.extend_from_slice(&page[..n]);
         let mut input = &page[..n];
         while !input.is_empty() {
             if between {
@@ -413,39 +411,8 @@ fn first_lines_say_no(
     data: &mut Vec<u8>,
 ) -> bool {
     let mut lines = SnapshotLines::new(delimiter);
-    first_lines(codec, reader, Some(data), &mut |l| lines.line(l));
+    first_lines(codec, reader, data, &mut |l| lines.line(l));
     lines.verdict == Some(false)
-}
-
-/// The column count of a compressed loose file's first keyed line (`Replay::one_column`), a page
-/// at a time, member after member: a delete's head read stops there, as an uncompressed one does.
-/// It answers only from clean input: a data error before that line, or a part with no keyed line,
-/// gives None and says nothing, and the part is then read whole, which says every warning once.
-/// Its one difference from that read is that it stops early.
-fn compressed_head(
-    codec: Codec,
-    reader: &mut impl Read,
-    path: &Path,
-    format: Format,
-    warnings: Option<WarnFn>,
-) -> Option<bool> {
-    // Held: a head that gives no answer says nothing.
-    let held: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
-    let hold: WarnFn = {
-        let held = held.clone();
-        Arc::new(move |w: &Warning| held.lock().unwrap().push(w.clone()))
-    };
-    let mut replay = Replay::new(format, false, Some(hold));
-    replay.head = true;
-    replay.begin_part(path, true);
-    let mut table = Table::new(&Scope::Keys(Vec::new()), format);
-    first_lines(codec, reader, None, &mut |l| replay.line(l, &mut table));
-    if replay.one_column.is_some() {
-        for w in held.lock().unwrap().iter() {
-            warnings.iter().for_each(|f| f(w));
-        }
-    }
-    replay.one_column
 }
 
 /// Whether `part` is a snapshot part (§19.10.1): its first committed line, or its second after a
@@ -747,19 +714,6 @@ impl Store {
         let mut framer = Framer::new();
         match part.codec {
             Some(codec) => {
-                if replay.head {
-                    let warnings = self.options.warnings.clone();
-                    let path = &part.path;
-                    if let Some(one) =
-                        compressed_head(codec, &mut reader, path, self.format, warnings)
-                    {
-                        replay.one_column = Some(one);
-                        return Ok(());
-                    }
-                    reader
-                        .seek(SeekFrom::Start(0))
-                        .map_err(|e| Error::io(&part.path, e))?;
-                }
                 let mut data = Vec::new();
                 reader
                     .read_to_end(&mut data)
@@ -1575,82 +1529,6 @@ mod tests {
             for head in ["#_snapshot_#\n", "#h\n#_snapshot_#\n"] {
                 let (no, ..) = says(&noise(head, 100_000));
                 assert!(!no, "{codec:?} {head:?}");
-            }
-        }
-    }
-
-    /// The head read of a compressed loose file over `bytes` (as one `codec` file): its answer,
-    /// how many bytes it read and what it warned of.
-    fn head_of(codec: Codec, bytes: &[u8]) -> (Option<bool>, usize, Vec<Warning>) {
-        let path = Path::new("h.tsv");
-        let said: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
-        let warn: WarnFn = {
-            let said = said.clone();
-            Arc::new(move |w: &Warning| said.lock().unwrap().push(w.clone()))
-        };
-        let mut reader = Counting {
-            rest: bytes,
-            read: 0,
-        };
-        let format = name::format_of(path).unwrap();
-        let one = compressed_head(codec, &mut reader, path, format, Some(warn));
-        let said = said.lock().unwrap().clone();
-        (one, reader.read, said)
-    }
-
-    /// A compressed loose file's head read (a delete's look at its first keyed line) goes on into
-    /// the next member, and answers only from clean input: on anything else it says nothing and
-    /// the part is read whole.
-    #[test]
-    fn a_compressed_head_goes_on_past_a_member_and_answers_only_from_clean_input() {
-        use crate::codec::encode_member;
-        for codec in [Codec::Gzip, Codec::Bzip2, Codec::Xz, Codec::Zstd] {
-            if !codec.supported() {
-                continue;
-            }
-            let member = |t: &[u8]| encode_member(codec, t).unwrap();
-            // A header alone, then the rows, as a `clear` and the sets after it leave a file: the
-            // first keyed line is in the second member, and the read stops there.
-            let rows = noise("", 100_000);
-            let file = [member(b"#h\n"), member(rows.as_bytes())].concat();
-            let (one, read, said) = head_of(codec, &file);
-            assert_eq!(one, Some(false), "{codec:?}");
-            assert!(
-                read * 2 < file.len(),
-                "{codec:?}: {read} of {} bytes",
-                file.len()
-            );
-            assert!(said.is_empty(), "{codec:?}");
-            // Members of comments, a line that spans two members, one column.
-            let file = [member(b"#a\n"), member(b"#b\n"), member(b"k\n")].concat();
-            assert_eq!(head_of(codec, &file).0, Some(true), "{codec:?}");
-            let file = [member(b"k"), member(b"\t1\n")].concat();
-            assert_eq!(head_of(codec, &file).0, Some(false), "{codec:?}");
-            // A warning of what was read is said, once, with the answer ...
-            let file = [member(b"#\xff\n"), member(b"k\t1\n")].concat();
-            let (one, _, said) = head_of(codec, &file);
-            assert_eq!((one, said.len()), (Some(false), 1), "{codec:?}");
-            assert_eq!(said[0].part, Path::new("h.tsv"), "{codec:?}");
-            // ... and nothing without one: no keyed line, bytes that no member begins with, a
-            // member cut short, and one of the wrong codec.
-            for (what, file) in [
-                ("none", [member(b"#\xff\n"), member(b"#g\n")].concat()),
-                (
-                    "garbage",
-                    [member(b"#\xff\n"), b"not a member".to_vec()].concat(),
-                ),
-                (
-                    "cut",
-                    [member(b"#\xff\n"), member(b"k\t1\n")[..6].to_vec()].concat(),
-                ),
-            ] {
-                let (one, _, said) = head_of(codec, &file);
-                assert_eq!((one, said.len()), (None, 0), "{codec:?} {what}");
-            }
-            // gzip pads members with zeros.
-            if codec == Codec::Gzip {
-                let file = [member(b"#a\n"), vec![0; 5000], member(b"k\t1\n")].concat();
-                assert_eq!(head_of(codec, &file).0, Some(false));
             }
         }
     }

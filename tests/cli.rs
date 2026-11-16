@@ -777,14 +777,12 @@ fn a_loose_scrub_and_clear_read_no_row() {
     assert!(over.is_empty(), "{over:?}");
 }
 
-/// A delete of a compressed loose file of more than one column reads only as far as the file's
-/// first keyed line, a page at a time, member after member, as one of a plain file does: on a
-/// 228 MiB file of one 89 MiB gzip member it took 0.00 s and 15 MB in 0.1.3, 0.5 s and 576 MB
-/// with the member decoded whole. The member here is damaged in its middle: a read of all of it
-/// says so, and one that stops at the first keyed line never gets there. So is the member after
-/// a header that a member holds alone, as a `clear` leaves a file.
+/// A delete of a compressed loose file of more than one column reads the whole file, as a `get`
+/// does (docs/limitations.md): the damage of a member is found and said, once, with the file's
+/// name, also past its first keyed line. A first member with no keyed line, or only a header, is
+/// no matter: the read goes on into the next.
 #[test]
-fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() {
+fn a_loose_delete_reads_a_compressed_file_whole_and_says_a_damaged_member_once() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     let mut text = String::from("#key\tv1\tv2\tv3\n");
@@ -805,12 +803,19 @@ fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() 
         records(dir, &["len", "big.tsv.gz"]).2.contains("corrupt"),
         "a read of the whole damaged member says so"
     );
-    let (code, _, err) = records(dir, &["delete", "big.tsv.gz", "key0000005"]);
-    assert_eq!((code, err.as_str()), (0, ""));
+    let says_once = |name: &str| {
+        let (code, _, err) = records(dir, &["delete", name, "key0000005"]);
+        assert_eq!(code, 0, "{name}: {err}");
+        assert_eq!(err.lines().count(), 1, "{name}: {err}");
+        assert!(err.contains(&format!("{name}: ")), "{name}: {err}");
+        assert!(err.contains("corrupt"), "{name}: {err}");
+    };
+    says_once("big.tsv.gz");
     // The same delete of the undamaged file: the key is gone, and the others are not.
     assert_eq!(records(dir, &["delete", "ok.tsv.gz", "key0000005"]).0, 0);
     assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000005"]).0, 3);
     assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000006"]).0, 0);
+    // A header that a member holds alone, as a `clear` leaves a file, and rows in a damaged member.
     let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
     let rows = &text[text.find('\n').unwrap() + 1..];
     let mut second = gz(rows);
@@ -821,14 +826,8 @@ fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() 
         [gz("#key\tv1\tv2\tv3\n"), second].concat(),
     )
     .unwrap();
-    assert!(
-        records(dir, &["len", "hdr.tsv.gz"]).2.contains("corrupt"),
-        "a read of the whole damaged member says so"
-    );
-    let (code, _, err) = records(dir, &["delete", "hdr.tsv.gz", "key0000005"]);
-    assert_eq!((code, err.as_str()), (0, ""));
-    // A first member with no keyed line: the look goes on into the next, and the file is read
-    // whole only for a one-column rewrite.
+    says_once("hdr.tsv.gz");
+    // A first member with no keyed line: the read goes on into the next.
     fs::write(
         dir.join("two.tsv.gz"),
         [gz("#h\n"), gz("a\t1\nb\t2\n")].concat(),
@@ -836,6 +835,122 @@ fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() 
     .unwrap();
     assert_eq!(records(dir, &["delete", "two.tsv.gz", "a"]).0, 0);
     assert_eq!(records(dir, &["keys", "two.tsv.gz"]).1, "b\n");
+}
+
+/// A compressed loose delete decides from the file as the whole read sees it, also when a member
+/// that holds only comment lines is cut short and members of rows follow (rr014c R1). A look at
+/// the first lines alone fed the cut member's decoder the next member's bytes, and took the
+/// garbage that came out for a keyed line: at two columns it said one, and the delete failed with
+/// "the file kept changing"; at one column it said two, and the delete wrote a key alone, a row
+/// there, so a `popitem` loop never ended. The tiny files are code2's: a gzip member of random
+/// text cut inside its data and a member `z`, and the same in zstd.
+#[test]
+fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_read_does() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &[u8]| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t).unwrap();
+    // 600 comment lines of random words (a few with a tab), so that the member is a few KiB of
+    // dynamic Huffman codes, cut at 63 points: about one in ten of them made the garbage reach a
+    // keyed line.
+    let mut x = 0x1234_5678_9abc_def1u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let words = [
+        "alpha", "beta", "gamma", "delta", "x", "yy", "zzz", "key", "\t", "0", "17",
+    ];
+    let mut comments = String::new();
+    for _ in 0..600 {
+        comments.push('#');
+        for _ in 0..3 + next() % 12 {
+            comments.push_str(words[(next() % words.len() as u64) as usize]);
+            comments.push(' ');
+        }
+        comments.push('\n');
+    }
+    let member = gz(comments.as_bytes());
+    for one in [false, true] {
+        let rows: String = (0..200)
+            .map(|i| match one {
+                true => format!("k{i}x{}\n", next() % 1000),
+                false => format!("k{i}\t{:016x}\n", next()),
+            })
+            .collect();
+        let tail = gz(rows.as_bytes());
+        let name = "c.tsv.gz";
+        for i in 1..64 {
+            let cut = member.len() * i / 64;
+            fs::write(dir.join(name), [&member[..cut], &tail[..]].concat()).unwrap();
+            let why = format!("one column {one}, cut at {cut} of {} bytes", member.len());
+            let keys = records(dir, &["keys", name]).1;
+            assert_eq!(keys.lines().count(), 200, "{why}");
+            let key = keys.lines().nth(7).unwrap().to_string();
+            assert!(key.starts_with("k7"), "{why}: {key}");
+            let (code, _, err) = records(dir, &["delete", name, &key]);
+            assert_eq!(code, 0, "{why}: {err}");
+            assert_eq!(err.matches("cut short").count(), 1, "{why}: {err}");
+            assert_eq!(
+                records(dir, &["has", name, &key]).0,
+                3,
+                "{why}: still there"
+            );
+            let keys = records(dir, &["keys", name]).1;
+            assert_eq!(keys.lines().count(), 199, "{why}: a key alone is now a row");
+            // A `popitem` loop ends: it empties the file in as many calls as it has keys.
+            if one && i % 16 == 0 {
+                for n in 0..199 {
+                    let (code, out, _) = records(dir, &["popitem", name]);
+                    assert_eq!(code, 0, "{why}: popitem {n}");
+                    assert!(!out.is_empty(), "{why}: popitem {n}");
+                }
+                assert_eq!(records(dir, &["popitem", name]).0, 3, "{why}: then empty");
+            }
+            for e in fs::read_dir(dir).unwrap() {
+                let e = e.unwrap().path();
+                if e.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("damaged-")
+                {
+                    fs::remove_file(e).unwrap();
+                }
+            }
+        }
+    }
+    // The tiny files: a member of random text cut inside its data, then a member `z`.
+    let hex = |s: &str| -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    };
+    let mut tiny = vec![(
+        "t.tsv.gz",
+        hex(concat!(
+            "1f8b08000000000000ff05c16d9381400000e0cffc8bb45d87a9bb3aed184d3b8d954aa7a1440c66bd2c",
+            "75251179f9f5f73c1f8b08000000000000ffabe202009d6adc7402000000"
+        )),
+    )];
+    if tsvz::name::Codec::Zstd.supported() {
+        tiny.push((
+            "t.tsv.zst",
+            hex("28b52ffd2419c900006b300928b52ffd24021100007a0a10007838"),
+        ));
+    }
+    for (name, bytes) in tiny {
+        fs::write(dir.join(name), &bytes).unwrap();
+        let before = records(dir, &["keys", name]).1;
+        assert!(before.ends_with("z\n"), "{name}: {before:?}");
+        let (code, _, err) = records(dir, &["delete", name, "k0"]);
+        assert_eq!(code, 0, "{name}: {err}");
+        assert_eq!(
+            records(dir, &["keys", name]).1,
+            before,
+            "{name}: k0 became a row"
+        );
+    }
 }
 
 /// A delete of a key that is not there changes nothing: a compressed file of one column too,

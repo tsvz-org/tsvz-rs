@@ -116,15 +116,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
 
-### A compressed part is read into memory whole before it is decoded
+### A loose delete reads a compressed file whole
 - Kind: deferred
-- What the operator sees: reading a compressed part takes memory for its compressed bytes and its largest member,
-  as in 0.1.3. A `delete` in a compressed loose file of more than one column reads only as far as the first keyed
-  line, by a second decoder of its own; when that meets damage, or the file has no keyed line, the file is read
-  whole after it.
-- Why: the read decodes a part as one slice (a damaged member's bytes run to the next member's start, found by
-  looking ahead in it), so stopping early needed a separate, streaming decode.
+- What the operator sees: `delete`, `pop` and `popitem` in a compressed loose file of more than one column read
+  the whole compressed file into memory and decode it up to its first keyed line: on 88 MiB of gzip, 0.06 s and
+  91 MB in 1 MiB members, 0.47 to 0.55 s and 346 to 575 MB as one large member (0.1.3: 0.00 s, 15 MB). A plain
+  file is read only as far as its first keyed line.
+- Why: the read decodes a compressed part as one slice, where a damaged member's bytes run to the next member's
+  start, found by looking ahead; a separate streaming look at the first lines read past a damaged member into the
+  next one (0.1.4's third review), so it was removed.
 - Revisit when: the next tsvz-rs version. The plan: decode a part from the file a member at a time; the delete's
   read then stops as a plain file's does, with no second decoder.
-- Noted: 2026-11-16, in the 0.1.4 design check; a deferral under the user's standing rule that deferrals are
+- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
