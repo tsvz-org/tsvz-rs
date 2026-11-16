@@ -613,6 +613,33 @@ fn many_small_compressed_members_read_in_bounded_memory() {
     );
 }
 
+/// A loose `scrub` and `clear` work on the lines they keep and read no row. On this file (11.7
+/// MiB, the shape of a 228 MiB one measured the same way, 2026-11-16) the test build peaked at
+/// 3.0 and 5.8 times its size for `clear` and `scrub`; with every row also built, at 8.2 and 11.5
+/// times (9bc86e0). So 7 and 9 times are between the two.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_loose_scrub_and_clear_read_no_row() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let mut text = String::from("#key\tv1\tv2\tv3\n");
+    for i in 0..200_000u64 {
+        let x = i
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        text.push_str(&format!("key{i:07}\t{x:016x}\t{x:016x}\tsome text here\n"));
+    }
+    let size = text.len() as i64 / 1024;
+    for (op, times) in [("clear", 7), ("scrub", 9)] {
+        fs::write(dir.join("big.tsv"), &text).unwrap();
+        let (_, kib) = peak_rss_kib(dir, &[op, "big.tsv"]);
+        assert!(
+            kib < times * size,
+            "a loose {op} of {size} KiB peaked at {kib} KiB"
+        );
+    }
+}
+
 #[test]
 fn clear_and_scrub_refuse_a_path_that_names_one_part() {
     let d = tempfile::tempdir().unwrap();

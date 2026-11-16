@@ -608,10 +608,17 @@ impl Store {
             replay.lines = Some(Vec::new());
         }
         replay.head = options.head && !format.strict;
+        // A loose rewrite works on the lines it keeps and reads no row: no key is wanted.
+        let no_rows = Scope::Keys(Vec::new());
+        let scope = if options.lines && !format.strict {
+            &no_rows
+        } else {
+            &options.scope
+        };
         let mut store = Store {
             replay,
             tail: Vec::new(),
-            table: Table::new(&options.scope, format),
+            table: Table::new(scope, format),
             path,
             format,
             options,

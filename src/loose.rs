@@ -13,6 +13,7 @@
 //! file, where no line can delete, [`without`] (which puts a key's line in the place of a width
 //! line that goes).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(feature = "cli")]
 use std::collections::HashSet;
@@ -117,7 +118,7 @@ fn kind(line: &str, d: u8, one: bool) -> (Kind, &str) {
 /// A loose file's committed lines (without their `\n`), as a rewrite works on them.
 pub(crate) struct Lines<'a> {
     raw: &'a [Vec<u8>],
-    text: Vec<String>,
+    text: Vec<Cow<'a, str>>,
     d: u8,
     /// The line that sets the column count ([`keyed`]), if any.
     width_line: Option<usize>,
@@ -127,9 +128,9 @@ pub(crate) struct Lines<'a> {
 impl<'a> Lines<'a> {
     pub(crate) fn new(raw: &'a [Vec<u8>], d: u8) -> Lines<'a> {
         // A line as the framer reads it: one `\r` before the `\n` is no part of it.
-        let text: Vec<String> = raw
+        let text: Vec<Cow<'a, str>> = raw
             .iter()
-            .map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned())
+            .map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)))
             .collect();
         let width_line = text.iter().position(|t| keyed(t, d));
         let one = width_line.is_some_and(|i| !text[i].as_bytes().contains(&d));
