@@ -101,3 +101,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   first page; the read of that part confirms it, or the store is read again from part 0.
 - Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
+
+### A loose scrub holds every line of the file in memory
+- Kind: deferred
+- What the operator sees: `tsvz scrub` of a loose file uses memory that grows with the file's length, about 3.5
+  to 6 times its size, also when most of its lines are old values of a few keys, where 0.1.3 needed memory for
+  the live rows only: 200k lines of 1k keys (11.7 MB) peaked at 36 MB (0.1.3: 16 MB); 800k lines of 200k keys at
+  168 MB (0.1.3: 127 MB). On files of mostly unique keys it uses less than 0.1.3 (228 MiB: 1.3 GB against 2.3 GB).
+- Why: the scrub keeps each line it keeps as the file has it, so it holds every line, each in its own buffer,
+  until it decides which go.
+- Revisit when: the next tsvz-rs version. The plan: scrub in two passes. The first keeps a kind and a key number
+  for each line, and each key's latest line; the second streams the file and writes the kept lines. Memory then
+  follows the keys, as 0.1.3's did.
+- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
+  noted, not asked.
+
+### A compressed part is read into memory whole before it is decoded
+- Kind: deferred
+- What the operator sees: reading a compressed part takes memory for its compressed bytes and its largest member,
+  as in 0.1.3. A `delete` in a compressed loose file of more than one column reads only as far as the first keyed
+  line, by a second decoder of its own; when that meets damage, or the file has no keyed line, the file is read
+  whole after it.
+- Why: the read decodes a part as one slice (a damaged member's bytes run to the next member's start, found by
+  looking ahead in it), so stopping early needed a separate, streaming decode.
+- Revisit when: the next tsvz-rs version. The plan: decode a part from the file a member at a time; the delete's
+  read then stops as a plain file's does, with no second decoder.
+- Noted: 2026-11-16, in the 0.1.4 design check; a deferral under the user's standing rule that deferrals are
+  noted, not asked.
