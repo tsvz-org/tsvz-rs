@@ -286,11 +286,16 @@ fn unsupported(part: &parts::Part) -> Error {
 }
 
 /// The part a read begins at: the last snapshot part (§19.10.3), else 0. Part 0 is never one to
-/// begin at: nothing comes before it.
+/// begin at: nothing comes before it. A bzip2 part is not looked at: it gives nothing before a
+/// whole block (900 kB of text at most), so the look decodes a block that the read then decodes
+/// again, which made a read of 40 parts of 3.6 MB 1.3 times, and of 400 parts of 360 kB 1.9 times
+/// as long as 0.1.3's (2026-11-16), and 0.1.3 began no read at a snapshot part. A reader may
+/// begin there, it need not (§19.10.3): a bzip2 snapshot part is read like any part, and the
+/// result is the same.
 fn snapshot_start(list: &[parts::Part], format: Format) -> usize {
     (1..list.len())
         .rev()
-        .find(|&i| is_snapshot_part(&list[i], format))
+        .find(|&i| list[i].codec != Some(Codec::Bzip2) && is_snapshot_part(&list[i], format))
         .unwrap_or(0)
 }
 
@@ -1612,7 +1617,8 @@ mod tests {
     fn a_compressed_snapshot_part_is_found_however_far_its_first_lines_lie() {
         // bzip2 gives nothing before a whole block (up to 900 kB of text), and a long header
         // comment compresses past any fixed first read: the part is read until its first lines
-        // come out of members that passed their checks.
+        // come out of members that passed their checks. A read does not begin at a bzip2 part
+        // (`snapshot_start`), but a scrub still finds it marked.
         use crate::name::Codec;
         let long_header = format!("#{}\n", noise("", 15000).replace(['\t', '\n'], " "));
         for (what, content) in [
@@ -1632,8 +1638,17 @@ mod tests {
                     crate::codec::encode_members(codec, content.as_bytes(), 1 << 20).unwrap();
                 assert!(part.len() as u64 > SNAPSHOT_HINT, "{what} {codec:?}");
                 write(dir.path(), &format!("s.tsvz.1.{}", codec.name()), &part);
-                let s = Store::open(dir.path().join("s.tsvz"), Options::default()).unwrap();
-                assert!(s.get("a").is_none(), "{what} {codec:?}: part 0 was read");
+                let path = dir.path().join("s.tsvz");
+                let list = parts::list(&path).unwrap();
+                let format = name::format_of(&path).unwrap();
+                assert!(is_snapshot_part(&list[1], format), "{what} {codec:?}");
+                let s = Store::open(&path, Options::default()).unwrap();
+                // The part holds no row of `a`, and a read from it never sees part 0's.
+                assert_eq!(
+                    s.get("a").is_some(),
+                    codec == Codec::Bzip2,
+                    "{what} {codec:?}"
+                );
                 assert!(!s.incomplete(), "{what} {codec:?}");
             }
         }
