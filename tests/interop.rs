@@ -412,6 +412,9 @@ const LOOSE: &[&str] = &[
     "\0\0\na\nb\n",
     "\0a\t1\na\t2\n",
     "#h\n\0\0\na\t1\n\0b\t\n\0\t3\n",
+    // Only a first cell that is `#_defaults_#` makes a defaults line, to TSVZ.py.
+    "#_defaults_#x\t1\na\t\tq\n",
+    "#h\n#_defaults_#x\na\nb\n#_defaults_#x\t2\n",
 ];
 
 /// A loose file drawn from `seed`: keys a to d, with values, blank cells, keys alone, comments,
@@ -454,6 +457,16 @@ fn random_loose(seed: u64) -> String {
     text
 }
 
+/// Whether `text` has a `#_defaults_#` line, whose defaults TSVZ.py applies to the rows after it
+/// and tsvz-rs does not.
+fn has_defaults_line(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.split('\t')
+            .next()
+            .is_some_and(|k| k.trim_end() == "#_defaults_#")
+    })
+}
+
 #[test]
 fn loose_files_list_the_keys_tsvz_py_lists() {
     let py = need_tsvz_py!();
@@ -463,7 +476,7 @@ fn loose_files_list_the_keys_tsvz_py_lists() {
         std::fs::write(&file, text).unwrap();
         let (rs, py_keys) = both(&py, "keys", &file);
         assert_eq!(rs, py_keys, "{text:?}");
-        if !text.contains("#_defaults_#") {
+        if !has_defaults_line(text) {
             let (rs, py_rows) = both(&py, "read", &file);
             assert_eq!(trimmed(&rs), trimmed(&py_rows), "{text:?}");
         }

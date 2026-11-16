@@ -543,7 +543,7 @@ impl Replay {
         if self.one_column.is_none() && crate::loose::keyed(text, d) {
             self.one_column = Some(!text.as_bytes().contains(&d));
         }
-        if text.starts_with('#') {
+        if crate::loose::is_comment(text, d) {
             if first {
                 self.header = Some(text.to_string());
             }
@@ -897,6 +897,25 @@ mod tests {
         assert_eq!(table(&rows), vec![row("a", &["b"])]);
         let (_, rows, _) = run(loose, false, b"\0\0\0a\t1\n\0\t2\na\t2\n");
         assert_eq!(table(&rows), vec![row("a", &["2"])]);
+    }
+
+    #[test]
+    fn a_loose_key_that_only_begins_with_the_defaults_key_is_a_key() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        // As TSVZ.py reads it: only a first cell that is `#_defaults_#` is the defaults line.
+        let (r, rows, _) = run(
+            loose,
+            false,
+            b"#_defaults_#x\t1\n#_defaults_# \tP\na\t\tq\n#_defaults_#\n",
+        );
+        assert_eq!(r.one_column, Some(false));
+        assert_eq!(
+            table(&rows),
+            vec![row("#_defaults_#x", &["1"]), row("a", &["", "q"])]
+        );
     }
 
     #[test]

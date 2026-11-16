@@ -43,11 +43,24 @@ pub(crate) fn body(line: &str) -> &str {
     line.trim_start_matches('\0')
 }
 
+/// Whether `line` is a `#_defaults_#` line to TSVZ.py: its first cell, without the whitespace
+/// at its end, is that and no more (`#_defaults_#x` is a key).
+pub(crate) fn is_defaults(line: &str, d: u8) -> bool {
+    first_field(body(line), d).0.trim_end_matches(py_space) == DEFAULTS
+}
+
+/// Whether tsvz-rs reads `line` as a comment: one that begins with `#`, a `#_defaults_#` line
+/// included (TSVZ.py reads it as defaults), but not a key that only begins with `#_defaults_#`.
+pub(crate) fn is_comment(line: &str, d: u8) -> bool {
+    let line = body(line);
+    line.starts_with('#') && !(line.starts_with(DEFAULTS) && !is_defaults(line, d))
+}
+
 /// Whether TSVZ.py takes `line` as a keyed line, the first of which sets the column count: not
 /// empty, no comment (a `#_defaults_#` line counts), and a key that is not blank.
 pub(crate) fn keyed(line: &str, d: u8) -> bool {
     let line = body(line);
-    (!line.starts_with('#') || line.starts_with(DEFAULTS)) && !blank(first_field(line, d).0)
+    (!is_comment(line, d) || is_defaults(line, d)) && !blank(first_field(line, d).0)
 }
 
 /// What a line is to both readers, in a file whose column count is one or not (`one`).
@@ -68,11 +81,11 @@ enum Kind {
 
 fn kind(line: &str, d: u8, one: bool) -> (Kind, &str) {
     let line = body(line);
-    if line.starts_with(DEFAULTS) {
+    if is_defaults(line, d) {
         return (Kind::Defaults, "");
     }
     let (key, rest) = first_field(line, d);
-    if line.starts_with('#') || key.is_empty() {
+    if is_comment(line, d) || key.is_empty() {
         return (Kind::Skip, "");
     }
     if key.ends_with(py_space) || key.contains('<') || line.contains(['\0', '\r']) {
@@ -196,7 +209,7 @@ pub(crate) fn scrub(lines: &Lines<'_>) -> Vec<u8> {
 pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
     let d = lines.d;
     let defaults = |t: &str| {
-        let (key, rest) = first_field(t, d);
+        let (key, rest) = first_field(body(t), d);
         let valued = rest.is_some_and(|r| !r.split(d as char).all(blank));
         (key.trim_end_matches(py_space) == DEFAULTS).then_some(valued)
     };
@@ -211,7 +224,7 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let header = i == 0 && (t.is_empty() || t.starts_with('#')) && !keyed(t, d);
+            let header = i == 0 && (t.is_empty() || is_comment(t, d)) && !keyed(t, d);
             header || (defaults(i) == Some(true) && reset.is_none_or(|r| i > r))
         })
         .collect();
@@ -239,7 +252,7 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>
     if let Some(w) = lines.width_line.filter(|&w| !keep[w]) {
         let keyed_at = |i: usize| keep[i] && keyed(&lines.text[i], d);
         let next = (w + 1..n).find(|&i| keyed_at(i));
-        let row = (w + 1..n).find(|&i| keyed_at(i) && !lines.text[i].starts_with('#'));
+        let row = (w + 1..n).find(|&i| keyed_at(i) && !is_defaults(&lines.text[i], d));
         if let (Some(next), Some(row)) = (next, row) {
             if lines.fields(next) > 0 {
                 keep[w] = true;
@@ -275,6 +288,8 @@ mod tests {
             ("#_defaults_#\na\n", true),
             ("\u{feff}#h\na\t1\n", true), // the mark makes line 1 keyed, to TSVZ.py
             ("#h\n", false),
+            ("#_defaults_#x\na\t1\n", true),
+            ("#_defaults_# \tP\na\n", false),
             // A line of only NULs is empty to TSVZ.py, and a key never begins with one.
             ("\0\na\tb\n", false),
             ("\0\0\na\n", true),
@@ -311,6 +326,11 @@ mod tests {
             (
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
+            ),
+            // A key that only begins with `#_defaults_#` is a key.
+            (
+                "#h\n#_defaults_#x\t1\n#_defaults_#x\t2\n",
+                "#h\n#_defaults_#x\t2\n",
             ),
             // One column: a key alone is a row.
             ("a\nb\t1\na\n", "a\nb\t1\n"),
@@ -364,5 +384,12 @@ mod tests {
         assert_eq!(gone("\u{feff}a\nb\n", &["\u{feff}a"]), "b\n");
         assert_eq!(gone("\u{feff}zz\n", &["\u{feff}zz"]), "");
         assert_eq!(gone("\u{feff}a\nb\n", &["b"]), "\u{feff}a\n");
+        // Only a first cell that is `#_defaults_#` makes a defaults line; a key that begins with
+        // it is a row, which takes the place of a width line that goes.
+        assert_eq!(
+            gone("c\n#_defaults_#x\t1\n#c\n", &["c"]),
+            "#_defaults_#x\n#_defaults_#x\t1\n#c\n"
+        );
+        assert_eq!(gone("c\n#_defaults_#x\n", &["#_defaults_#x"]), "c\n");
     }
 }
