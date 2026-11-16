@@ -136,3 +136,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   read then stops as a plain file's does, with no second decoder.
 - Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
+
+### A scrub's look at a part's start can judge an odd part wrongly, and reads a long first line whole
+- Kind: deferred
+- What the operator sees: a multi-part `scrub` finds a part marked by its first lines. It can take a gzip part
+  that begins with `#_snapshot_#` for no snapshot part: a stored (uncompressed) member that holds the gzip magic
+  bytes `1f 8b 08` in its first 4 KiB, which the look takes for the start of a next member after a damaged one
+  (the second review's probe: 1 of 800 random gzip parts, none of 800 each in xz, zstd and bzip2). The scrub then
+  writes one more marked copy of the part, as 0.1.3's scrub always wrote one, and a later scrub finds that copy
+  marked. A read is unaffected. A part whose first line is very long is also decoded to the end of that line
+  before the look says "no": a first line of 2 MB in an 18.7 KB gzip member was read whole.
+- Why: the look decodes a part's first page by a streaming decoder of its own, and finds where a member ends and
+  where a line ends by decoding on, where the read decodes a part as one slice.
+- Revisit when: the next tsvz-rs version. The plan: the part reader of the entry above, which decodes a member at
+  a time, serves the look too, with one rule for where a member ends.
+- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
+  noted, not asked.
