@@ -349,6 +349,9 @@ mod tests {
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
             ),
+            // A line that sets the column count and a later one of the key that is pinned
+            // between its first and last lines keep their places: `a` still reads 2.
+            ("a\t1\na\t2\nb\t0\na\t1\n", "a\t1\na\t2\nb\t0\na\t1\n"),
             // Every line it keeps is as it was, its `\r` too.
             (
                 "#h\r\na\t1\r\n\r\nb\t2\r\na\t3\r\n",

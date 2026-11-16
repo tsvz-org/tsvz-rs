@@ -121,8 +121,8 @@ pub fn name_key<'k>(
 
 /// Whether `key` is `#_snapshot_#`, which a writer appending records never writes in a strict
 /// store: as the first line of a part it would make readers skip every part before it
-/// (§19.10.2, §19.10.3). A loose file has no markers (§5.2): there it is a comment, as TSVZ.py
-/// writes it.
+/// (§19.10.2, §19.10.3). A loose file does not honor markers (§5.2): there it is a comment, as
+/// TSVZ.py writes it.
 fn is_snapshot_marker(key: &[u8]) -> bool {
     key.eq_ignore_ascii_case(b"#_snapshot_#")
 }
@@ -199,7 +199,7 @@ pub(crate) fn marker_effect(r: &Record) -> Option<(String, crate::Markers)> {
 
 /// `records` encoded for `format` as runs, each with the member size in force where it starts
 /// (§16.7): `member_size`, then from the record after each valid `#_member_size_#` marker on,
-/// the size it sets, as a reader replays them (a loose file has no markers).
+/// the size it sets, as a reader replays them (a loose file does not honor markers).
 pub(crate) fn runs(
     records: &[Record],
     format: Format,
@@ -462,7 +462,8 @@ impl Writer {
         ))
     }
 
-    /// An uncommitted tail would join the first appended record: cut it first, as TSVZ.py does.
+    /// An uncommitted tail would join the first appended record: cut it first, as TSVZ.py does
+    /// for a store (a loose file, TSVZ.py ends its last line instead: docs/limitations.md).
     fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<()> {
         let size = file.metadata()?.len();
         if size == 0 {
@@ -547,10 +548,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         std::fs::write(&p, "a\t1\n").unwrap();
-        for key in ["#_snapshot_#", "#_SNAPSHOT_#"] {
+        // With a value or without one (§19.10.2).
+        for (key, values) in [
+            ("#_snapshot_#", vec![]),
+            ("#_SNAPSHOT_#", vec![]),
+            ("#_snapshot_#", vec!["x".to_string()]),
+        ] {
             let marker = Record::Marker {
                 key: key.into(),
-                values: Vec::new(),
+                values,
             };
             let e = Writer::open(&p).unwrap().append(&[marker]).unwrap_err();
             assert!(e.to_string().contains("§19.10.2"), "{key:?}: {e}");
@@ -570,6 +576,7 @@ mod tests {
         for payload in [
             &b"b\t2\n#_SNAPSHOT_#\r\n"[..],
             b"#_snapshot_#\t\n",
+            b"#_snapshot_#\tx\n",
             b"\xef\xbb\xbf#_snapshot_#\n",
         ] {
             let e = Writer::open(&p)
@@ -587,7 +594,20 @@ mod tests {
             .unwrap()
             .append_payload(b"<#>_snapshot_#\tdata\n")
             .unwrap();
-        // A loose file has no markers: there the line is a comment, as TSVZ.py writes it.
+        // The delimiter of the store's variant ends the key: a .csvz store's is a comma.
+        let csv = dir.path().join("c.csvz");
+        std::fs::write(&csv, "a,1\n").unwrap();
+        let e = Writer::open(&csv)
+            .unwrap()
+            .append_payload(b"#_snapshot_#,\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("§19.10.2"), "{e}");
+        Writer::open(&csv)
+            .unwrap()
+            .append_payload(b"b,2\n")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&csv).unwrap(), "a,1\nb,2\n");
+        // A loose file does not honor markers: there the line is a comment, as TSVZ.py writes it.
         let loose = dir.path().join("l.tsv");
         let marker = Record::Marker {
             key: "#_snapshot_#".into(),

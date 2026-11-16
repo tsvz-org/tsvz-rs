@@ -515,6 +515,24 @@ fn a_loose_scrub_and_clear_keep_what_tsvz_py_reads() {
 }
 
 #[test]
+fn a_loose_rewrite_keeps_the_bytes_after_the_last_newline() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // TSVZ.py reads that line as a row; tsvz-rs does not list it (docs/limitations.md), but
+    // a scrub and a one-column delete leave it where it is.
+    fs::write(dir.join("s.tsv"), "#h\na\t1\na\t2\nb\t9").unwrap();
+    assert_eq!(records(dir, &["scrub", "s.tsv"]).0, 0);
+    assert_eq!(file(dir, "s.tsv"), "#h\na\t2\nb\t9");
+    fs::write(dir.join("o.tsv"), "a\nb\nc\nd").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", "b"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\nc\nd");
+    // A key with whitespace at its end names the key without it, as TSVZ.py reads it.
+    fs::write(dir.join("w.tsv"), "a \nb\nc\n").unwrap();
+    assert_eq!(records(dir, &["delete", "w.tsv", "a "]).0, 0);
+    assert_eq!(file(dir, "w.tsv"), "b\nc\n");
+}
+
+#[test]
 fn a_loose_rewrite_keeps_the_lines_it_keeps_as_they_are() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();

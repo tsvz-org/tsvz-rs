@@ -1415,14 +1415,12 @@ mod tests {
         );
         let p = dir.path().join("case.tsvz");
         assert_eq!(keys(&Store::open(&p, Options::default()).unwrap()), ["b"]);
-        // A loose file has no markers (§5.2).
-        write(dir.path(), "loose.tsv", b"a\t1\n");
-        write(dir.path(), "loose.tsv.1", b"#_snapshot_#\nb\t2\n");
-        let p = dir.path().join("loose.tsv");
-        assert!(
-            keys(&Store::open(&p, Options::default()).unwrap())
-                .iter()
-                .any(|k| k == "a")
+        // A loose file does not honor markers (§5.2), and is one file whatever its siblings
+        // are named: the line is a comment, and skips nothing.
+        let p = write(dir.path(), "loose.tsv", b"a\t1\n#_snapshot_#\nb\t2\n");
+        assert_eq!(
+            keys(&Store::open(&p, Options::default()).unwrap()),
+            ["a", "b"]
         );
     }
 
@@ -1572,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_part_before_the_snapshot_part_is_still_followed() {
+    fn a_snapshot_part_is_followed_and_a_change_to_a_part_before_it_reloads() {
         let dir = tempfile::tempdir().unwrap();
         let p0 = write(dir.path(), "s.tsvz", b"a\t1\n");
         write(dir.path(), "s.tsvz.1", b"#_snapshot_#\nb\t2\n");

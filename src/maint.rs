@@ -2752,6 +2752,32 @@ mod tests {
     }
 
     #[test]
+    fn a_scrub_replays_every_part_also_those_a_snapshot_part_makes_readers_skip() {
+        // The snapshot part restates nothing of part 0, against §19.10.2: a reader that begins
+        // at it never sees `a`, but one that replays every part does (§19.10.3), and what a
+        // scrub writes must read the same to both.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "#_snapshot_#\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.5"), "c\t3\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let snapshot = fs::read_to_string(dir.path().join("s.tsvz.3")).unwrap();
+        assert!(
+            snapshot.contains("a\t1\n") && snapshot.contains("b\t2\n"),
+            "{snapshot:?}"
+        );
+        let keys = |p: &Path| -> Vec<String> {
+            Store::open(p, opts())
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .collect()
+        };
+        assert_eq!(keys(&p), ["a", "b", "c"]);
+    }
+
+    #[test]
     fn a_snapshot_part_a_scrub_wrote_unmarked_gets_a_marked_copy_once() {
         // 0.1.3 wrote no #_snapshot_#: the part reads as the prefix, but readers would go on
         // replaying the parts before it.

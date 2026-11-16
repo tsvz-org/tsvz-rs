@@ -375,7 +375,10 @@ fn neither_tool_serves_a_store_the_other_serves() {
 /// What `op` of each tool prints for the loose file `file`: (tsvz-rs, TSVZ.py).
 fn both(py: &Path, op: &str, file: &Path) -> (String, String) {
     let f = file.to_str().unwrap();
-    let text = |o: Output| String::from_utf8_lossy(&o.stdout).into_owned();
+    let text = |o: Output| {
+        assert!(o.status.success(), "{op} {f}: {:?}", o.status);
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
     (text(rust(&[op, f], b"")), text(python(py, &[op, f], b"")))
 }
 
@@ -385,7 +388,7 @@ fn trimmed(out: &str) -> Vec<Vec<u8>> {
 }
 
 /// Loose files written as TSVZ.py writes and reads them (header lines, `#_defaults_#` lines,
-/// deletions as wide as the file, one-column files), and the limitations entry's examples.
+/// one-column files), and the limitations entry's examples.
 const LOOSE: &[&str] = &[
     "a\nb\nc\n",
     "#h\na\nb\na\n",
@@ -420,6 +423,14 @@ const LOOSE: &[&str] = &[
     "#h\n#_defaults_#x\na\nb\n#_defaults_#x\t2\n",
 ];
 
+/// Loose files that are rewritten alike, but not read alike (docs/limitations.md): a key with
+/// whitespace at its end is a key of another name to TSVZ.py.
+const REWRITTEN: &[&str] = &[
+    "#h\na \t1\nb\t2\na\t3\n",
+    "a \nb\na\nb \n",
+    "#h\nk\t1\nk \t2\nk\t3\nz\t\n",
+];
+
 /// A loose file drawn from `seed`: keys a to d, with values, blank cells, keys alone, comments,
 /// empty lines, empty keys and `#_defaults_#` lines; one in three keeps only the keys.
 fn random_loose(seed: u64) -> String {
@@ -444,6 +455,9 @@ fn random_loose(seed: u64) -> String {
         "\tx",
         "K\t2",
         "K\t \t",
+        // What TSVZ.py reads differently from tsvz-rs: a key with whitespace at its end, a CR.
+        "K \t1",
+        "K\t1\r",
     ];
     let one = next(3) == 0;
     let mut text = ["", "#h\n", "\n", ""][next(4) as usize].to_string();
@@ -486,6 +500,14 @@ fn loose_files_list_the_keys_tsvz_py_lists() {
     }
 }
 
+/// Whether tsvz-rs lists the keys of `text` as TSVZ.py does: not with a bare `#_defaults_#` line
+/// (a row to TSVZ.py in a one-column file), a key with whitespace at its end, or a CR (TSVZ.py
+/// strips them, docs/limitations.md).
+fn keys_agree(text: &str) -> bool {
+    let spaced = |l: &str| l.split('\t').next().is_some_and(|k| k.trim_end() != k);
+    !text.contains('\r') && !text.lines().any(|l| l == "#_defaults_#" || spaced(l))
+}
+
 #[test]
 fn a_loose_scrub_changes_nothing_tsvz_py_reads() {
     let py = need_tsvz_py!();
@@ -493,24 +515,45 @@ fn a_loose_scrub_changes_nothing_tsvz_py_reads() {
     let file = dir.path().join("f.tsv");
     let texts = LOOSE
         .iter()
+        .chain(REWRITTEN)
         .map(|t| t.to_string())
         .chain((0..60).map(random_loose));
+    let mut compacted = 0;
     for text in texts {
         std::fs::write(&file, &text).unwrap();
         let (rs, py_rows) = both(&py, "read", &file);
+        let (rs_keys, py_keys) = both(&py, "keys", &file);
+        if keys_agree(&text) {
+            assert_eq!(rs_keys, py_keys, "{text:?}");
+        }
         let scrubbed = rust(&["scrub", file.to_str().unwrap()], b"");
         assert!(scrubbed.status.success(), "{text:?}");
         let (rs_after, py_after) = both(&py, "read", &file);
         let after = std::fs::read_to_string(&file).unwrap();
+        compacted += (after.len() < text.len()) as usize;
         // TSVZ.py reads exactly the same rows, its defaults applied; tsvz-rs the same rows,
-        // however it pads them.
+        // however it pads them, and the same keys.
         assert_eq!(py_after, py_rows, "{text:?} scrubbed to {after:?}");
         assert_eq!(
             trimmed(&rs_after),
             trimmed(&rs),
             "{text:?} scrubbed to {after:?}"
         );
+        assert_eq!(
+            both(&py, "keys", &file).0,
+            rs_keys,
+            "{text:?} scrubbed to {after:?}"
+        );
+        if keys_agree(&text) && !has_defaults_line(&text) {
+            assert_eq!(
+                trimmed(&rs_after),
+                trimmed(&py_after),
+                "{text:?} scrubbed to {after:?}"
+            );
+        }
     }
+    // A scrub that wrote every line back would pass all of the above.
+    assert!(compacted >= 40, "only {compacted} files shrank");
     // TSVZ.py's own scrub of the entry's second example: tsvz-rs lists the keys it listed.
     std::fs::write(&file, LOOSE[6]).unwrap();
     let before = both(&py, "keys", &file);
