@@ -48,7 +48,15 @@ pub use write::{KeyKind, Record, Writer, classify_key};
 pub mod cli;
 
 /// The public types may grow before a 1.0: outside this crate an enum cannot be matched without
-/// a wildcard arm, nor a struct built by a struct expression or destructured without `..`.
+/// a wildcard arm, nor a struct built by a struct expression or destructured without `..`. What
+/// a loose rewrite keeps in a `replay::Replay` (a `#[doc(hidden)]` type) is not public either:
+///
+/// ```compile_fail,E0616
+/// fn f(r: tsvz::replay::Replay) -> bool { r.lines.is_some() }
+/// ```
+/// ```compile_fail,E0616
+/// fn f(r: tsvz::replay::Replay) -> bool { r.one_column.is_some() }
+/// ```
 ///
 /// ```compile_fail
 /// fn f(e: tsvz::Error) -> u8 {

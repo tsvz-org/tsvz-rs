@@ -122,7 +122,7 @@ In loose files:
   them).
 
 The library's documented API does not change (two `#[doc(hidden)]` items do: `codec::member` and
-`codec::Member` are gone, and `replay::Replay` has two more public fields).
+`codec::Member` are gone).
 
 ## License
 

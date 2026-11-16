@@ -182,10 +182,10 @@ pub struct Replay {
     pub width: Option<usize>,
     /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
     /// line.
-    pub one_column: Option<bool>,
+    pub(crate) one_column: Option<bool>,
     /// A loose file's committed lines, without their `\n`, kept for a rewrite that keeps them
     /// ([`crate::loose`]); None unless asked for.
-    pub lines: Option<Vec<Vec<u8>>>,
+    pub(crate) lines: Option<Vec<Vec<u8>>>,
     /// Stop reading a loose file at its first keyed line.
     pub(crate) head: bool,
     first_line: bool,
