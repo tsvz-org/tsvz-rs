@@ -312,6 +312,10 @@ impl Replay {
         }
     }
 
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
     /// Start a part. `first` marks the store's first part, whose first line may be its header.
     pub fn begin_part(&mut self, path: &Path, first: bool) {
         self.part = path.to_path_buf();
@@ -958,6 +962,13 @@ mod tests {
         let mut keys = Keys(Vec::new());
         Framer::new().push(b"a\tx\ty\n", &mut |l| replay.line(l, &mut keys));
         assert_eq!(keys.0, vec![("a".to_string(), 0)]);
+    }
+
+    #[test]
+    fn a_replay_tells_its_format() {
+        // Public in 0.1.3, so kept (a ^0.1.3 requirement admits this version).
+        let r = Replay::new(TSVZ, false, None);
+        assert!(r.format().strict && r.format().delimiter == b'\t');
     }
 
     #[test]
