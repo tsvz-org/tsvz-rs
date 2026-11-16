@@ -38,13 +38,24 @@ fn first_field(line: &str, d: u8) -> (&str, Option<&str>) {
 /// Whether the cells after a key, `rest` (None for a key alone), make its line a deletion: in a
 /// file of more than one column, none or all blank, as TSVZ.py reads them.
 pub(crate) fn deletes(rest: Option<&str>, d: u8, one: bool) -> bool {
-    !one && rest.is_none_or(|r| r.split(d as char).all(blank))
+    // The first cell begins with a visible ASCII character in nearly every row: no deletion.
+    let visible = |r: &str| {
+        r.bytes()
+            .next()
+            .is_some_and(|b| b > b' ' && b < 0x7f && b != d)
+    };
+    !one && rest.is_none_or(|r| !visible(r) && r.split(d as char).all(blank))
 }
 
 /// A line as TSVZ.py reads it: without the NULs at its start (`line.strip('\x00')`), so that a
 /// line of only NULs is empty and a key never begins with one.
+#[inline]
 pub(crate) fn body(line: &str) -> &str {
-    line.trim_start_matches('\0')
+    if line.as_bytes().first() == Some(&0) {
+        line.trim_start_matches('\0')
+    } else {
+        line
+    }
 }
 
 /// Whether `line` is a `#_defaults_#` line to TSVZ.py: its first cell, without the whitespace
@@ -337,6 +348,11 @@ mod tests {
         }
         assert!(deletes(None, b'\t', false) && deletes(Some(" \t\u{1c}"), b'\t', false));
         assert!(!deletes(None, b'\t', true) && !deletes(Some("\tx"), b'\t', false));
+        // Whatever begins the first cell: a visible character, a delimiter, a blank, no ASCII.
+        assert!(!deletes(Some("1\t "), b'\t', false) && !deletes(Some("\u{e9}"), b'\t', false));
+        assert!(deletes(Some("\t"), b'\t', false) && deletes(Some(""), b'\t', false));
+        assert!(deletes(Some(" \u{a0}\u{3000}\t "), b'\t', false));
+        assert!(!deletes(Some("1;"), b';', false) && deletes(Some(";"), b';', false));
     }
 
     #[test]
