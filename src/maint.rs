@@ -1621,8 +1621,10 @@ pub(crate) fn delete_loose(
             .loose_lines()
             .expect("a loose file read whole keeps its lines");
         let gone: std::collections::HashSet<&str> = asked.iter().map(|&(_, name)| name).collect();
-        let Some(content) = loose::without(&lines, &gone) else {
-            continue; // the file changed since its first line was read
+        let content = match loose::without(&lines, &gone) {
+            None => continue, // the file changed since its first line was read
+            Some(None) => return Ok(LooseDelete::Nothing), // no line is one of the keys
+            Some(Some(content)) => content,
         };
         if s.damaged() {
             backup(&part.path, options)?;

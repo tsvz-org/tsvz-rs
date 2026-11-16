@@ -280,11 +280,13 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
 
 /// In a one-column file, where a key alone is a row and no line can delete: `lines` without the
 /// lines of `keys` (each without the whitespace at its end, as a line's key is for TSVZ.py), as
-/// TSVZ.py deletes there; None in any other file, where a key alone deletes.
+/// TSVZ.py deletes there; None in any other file, where a key alone deletes, and Some(None) when
+/// no line is one of those, so that the file stays as it is (also a compressed one, whose bytes
+/// a rewrite would change).
 /// When the line that set the column count goes and the next keyed line has more cells, the first
 /// remaining key, alone, takes its place, so that the file keeps one column, as in TSVZ.py.
 #[cfg(feature = "cli")]
-pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>> {
+pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Option<Vec<u8>>> {
     if !lines.one {
         return None;
     }
@@ -295,6 +297,9 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>
         matches!(k, Kind::Row | Kind::Odd) && keys.contains(key.trim_end_matches(py_space))
     };
     let mut keep: Vec<bool> = (0..n).map(|i| !gone(i)).collect();
+    if keep.iter().all(|&k| k) {
+        return Some(None);
+    }
     let mut put = vec![None; n];
     if let Some(w) = lines.width_line.filter(|&w| !keep[w]) {
         let keyed_at = |i: usize| keep[i] && keyed(&lines.text[i], d);
@@ -318,7 +323,7 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>
             }
         }
     }
-    Some(lines.write(&keep, &put))
+    Some(Some(lines.write(&keep, &put)))
 }
 
 #[cfg(test)]
@@ -490,7 +495,7 @@ mod tests {
         let raw = vec![b"\0a".to_vec(), b"b".to_vec()];
         let lines = Lines::new(&raw, 0);
         let keys: HashSet<&str> = ["a"].into();
-        assert_eq!(without(&lines, &keys), Some(b"b\n".to_vec()));
+        assert_eq!(without(&lines, &keys), Some(Some(b"b\n".to_vec())));
     }
 
     #[test]
@@ -498,7 +503,12 @@ mod tests {
     fn a_delete_in_a_one_column_file_keeps_one_column() {
         let gone = |text: &str, keys: &[&str]| {
             let keys: HashSet<&str> = keys.iter().copied().collect();
-            with(text, |l| without(l, &keys).unwrap())
+            with(text, |l| {
+                // None for a file of more than one column, Some(None) for a file that stays as it is
+                without(l, &keys)
+                    .unwrap()
+                    .unwrap_or_else(|| text.as_bytes().to_vec())
+            })
         };
         assert_eq!(gone("#h\na\nb\nc\n", &["b"]), "#h\na\nc\n");
         assert_eq!(gone("a\nb\nc\n", &["a", "c"]), "b\n");
@@ -512,6 +522,11 @@ mod tests {
         // A byte-order mark is part of line 1's key, as TSVZ.py reads it: `a` is another key
         // than `\u{feff}a`, and the mark goes with its line, never onto another.
         assert_eq!(gone("\u{feff}a\nb\n", &["a"]), "\u{feff}a\nb\n");
+        let raw = lines("\u{feff}a\nb\n");
+        let none: HashSet<&str> = ["a", "zz"].into();
+        assert_eq!(without(&Lines::new(&raw, b'\t'), &none), Some(None));
+        let raw = lines("a\tb\n");
+        assert_eq!(without(&Lines::new(&raw, b'\t'), &none), None);
         assert_eq!(gone("\u{feff}a\nb\n", &["\u{feff}a"]), "b\n");
         assert_eq!(gone("\u{feff}zz\n", &["\u{feff}zz"]), "");
         assert_eq!(gone("\u{feff}a\nb\n", &["b"]), "\u{feff}a\n");

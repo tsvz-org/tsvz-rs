@@ -795,6 +795,22 @@ fn a_loose_delete_reads_a_compressed_file_only_as_far_as_its_first_keyed_line() 
     assert_eq!(records(dir, &["keys", "two.tsv.gz"]).1, "b\n");
 }
 
+/// A delete of a key that is not there changes nothing: a compressed file of one column too,
+/// whose bytes a rewrite would change (here it holds two members, which one member replaces).
+#[test]
+fn a_compressed_one_column_delete_that_removes_no_line_writes_and_says_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    let bytes = [gz("#h\na\n"), gz("b\n")].concat();
+    fs::write(dir.join("c.tsv.gz"), &bytes).unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "c.tsv.gz", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(fs::read(dir.join("c.tsv.gz")).unwrap(), bytes);
+    assert_eq!(records(dir, &["delete", "c.tsv.gz", "a"]).0, 0);
+    assert_eq!(records(dir, &["keys", "c.tsv.gz"]).1, "b\n");
+}
+
 #[test]
 fn clear_and_scrub_refuse_a_path_that_names_one_part() {
     let d = tempfile::tempdir().unwrap();
