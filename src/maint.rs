@@ -1520,8 +1520,8 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
 #[cfg(feature = "cli")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LooseDelete {
-    /// A key alone, appended for each key asked.
-    Appended,
+    /// A key alone, appended for each key asked (this many).
+    Appended(usize),
     /// The file rewritten without the lines of the keys asked.
     Rewrote,
     /// Nothing written.
@@ -1541,6 +1541,15 @@ pub(crate) fn delete_loose(
     options: &Options,
     keys: &[String],
 ) -> Result<LooseDelete, Error> {
+    // Each key named without the whitespace at its end, as TSVZ.py reads a line's key, so that
+    // tsvz-rs, which does not strip it, reads a deletion alike. A key with nothing left names no
+    // row (TSVZ.py skips such lines), and would match every blank line.
+    use std::sync::{Arc, Mutex};
+    let names: Vec<&str> = keys
+        .iter()
+        .map(|k| k.trim_end_matches(loose::py_space))
+        .filter(|k| !k.is_empty())
+        .collect();
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
             Writer::open(store)?
@@ -1550,6 +1559,12 @@ pub(crate) fn delete_loose(
             return Ok(LooseDelete::Nothing);
         };
         let before = stamp(&part.path)?;
+        // The head's warnings are held: at one column the whole read below says them again.
+        let held: Arc<Mutex<Vec<Warning>>> = Arc::default();
+        let hold: crate::WarnFn = {
+            let held = held.clone();
+            Arc::new(move |w: &Warning| held.lock().unwrap().push(w.clone()))
+        };
         let head = Store::open(
             store,
             Options {
@@ -1557,25 +1572,31 @@ pub(crate) fn delete_loose(
                 verify: false,
                 skip_unreadable: false,
                 head: true,
+                warnings: Some(hold),
                 ..options.clone()
             },
         )?;
+        let say = || {
+            for w in held.lock().unwrap().iter() {
+                options.warnings.iter().for_each(|f| f(w));
+            }
+        };
         match head.one_column() {
-            None => return Ok(LooseDelete::Nothing),
+            None => {
+                say();
+                return Ok(LooseDelete::Nothing);
+            }
             Some(false) => {
-                // Each key named without the whitespace at its end, as TSVZ.py reads a line's
-                // key, so that tsvz-rs, which does not strip it, reads the deletion alike.
-                let tombstones: Vec<crate::write::Record> = keys
+                say();
+                let tombstones: Vec<crate::write::Record> = names
                     .iter()
-                    .map(|k| crate::write::Record::Tombstone {
-                        key: k.trim_end_matches(loose::py_space).to_string(),
-                    })
+                    .map(|k| crate::write::Record::Tombstone { key: k.to_string() })
                     .collect();
                 Writer::open(store)?
                     .warnings(options.warnings.clone())
                     .delimiter(options.delimiter)
                     .append(&tombstones)?;
-                return Ok(LooseDelete::Appended);
+                return Ok(LooseDelete::Appended(tombstones.len()));
             }
             Some(true) => {}
         }
@@ -1589,11 +1610,7 @@ pub(crate) fn delete_loose(
         let (lines, tail) = s
             .loose_lines()
             .expect("a loose file read whole keeps its lines");
-        // TSVZ.py names a key without the whitespace at its end.
-        let gone: std::collections::HashSet<&str> = keys
-            .iter()
-            .map(|k| k.trim_end_matches(loose::py_space))
-            .collect();
+        let gone: std::collections::HashSet<&str> = names.iter().copied().collect();
         let Some(content) = loose::without(&lines, &gone) else {
             continue; // the file changed since its first line was read
         };
@@ -1610,7 +1627,8 @@ pub(crate) fn delete_loose(
             None,
         )? {
             None => continue, // another writer committed after the read
-            Some(_) => return Ok(LooseDelete::Rewrote),
+            Some(true) => return Ok(LooseDelete::Rewrote),
+            Some(false) => return Ok(LooseDelete::Nothing),
         }
     }
     Err(Error::Refused(format!(

@@ -133,7 +133,7 @@ impl<'a> Lines<'a> {
             .map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)))
             .collect();
         let width_line = text.iter().position(|t| keyed(t, d));
-        let one = width_line.is_some_and(|i| !text[i].as_bytes().contains(&d));
+        let one = width_line.is_some_and(|i| !body(&text[i]).as_bytes().contains(&d));
         Lines {
             raw,
             text,
@@ -160,7 +160,7 @@ impl<'a> Lines<'a> {
     }
 
     fn fields(&self, i: usize) -> usize {
-        memchr::memchr_iter(self.d, self.text[i].as_bytes()).count()
+        memchr::memchr_iter(self.d, body(&self.text[i]).as_bytes()).count()
     }
 }
 
@@ -246,7 +246,7 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
     let keep: Vec<bool> = (0..n)
         .map(|i| {
             let t = &lines.text[i];
-            (i == 0 && (t.is_empty() || is_comment(t, d)) && !keyed(t, d)) || in_force(i)
+            (i == 0 && (body(t).is_empty() || is_comment(t, d)) && !keyed(t, d)) || in_force(i)
         })
         .collect();
     let mut put = vec![None; n];
@@ -440,9 +440,22 @@ mod tests {
             ("#h\na\n#_defaults_#\tP\tQ\n", "#h\n"),
             // With a byte-order mark, line 1 is a row to TSVZ.py.
             ("\u{feff}#_defaults_#\tP\na\t1\n", ""),
+            // A line 1 of only NULs is empty to TSVZ.py: kept as the empty line it writes.
+            ("\0\na\t1\n", "\0\n"),
         ] {
             assert_eq!(with(input, cleared), output, "{input:?}");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_nul_delimiter_leaves_the_nuls_at_a_lines_start_out_of_its_count() {
+        // The NULs at the start of a line are no part of it (`body`), the delimiter's too:
+        // `\0a` is a key alone, in a file of one column.
+        let raw = vec![b"\0a".to_vec(), b"b".to_vec()];
+        let lines = Lines::new(&raw, 0);
+        let keys: HashSet<&str> = ["a"].into();
+        assert_eq!(without(&lines, &keys), Some(b"b\n".to_vec()));
     }
 
     #[test]

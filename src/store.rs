@@ -344,23 +344,13 @@ impl SnapshotLines {
 fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
     let mut lines = SnapshotLines::new(delimiter);
     let mut framer = Framer::new();
-    let (mut cut, mut damaged) = (false, false);
+    let mut damaged = false;
     codec::for_each_item(codec, data, &mut |item| match item {
         Item::Data(out) => framer.push(&out, &mut |l| lines.line(l)),
-        // the last item when the member runs to the end of `data`; a Break follows it otherwise
-        Item::CutShort { .. } if more => {
-            cut = true;
-            true
-        }
-        Item::Break if cut => {
-            damaged = true;
-            false
-        }
-        Item::Break => {
-            framer.brk();
-            true
-        }
-        Item::CutShort { .. } | Item::Corrupt { .. } => {
+        // the last item when the member runs to the end of `data`; a Break follows it otherwise,
+        // and then it was a damaged member in the middle
+        Item::CutShort { .. } if more => true,
+        Item::CutShort { .. } | Item::Corrupt { .. } | Item::Break => {
             damaged = true;
             false
         }

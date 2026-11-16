@@ -476,13 +476,42 @@ fn a_loose_delete_decides_from_the_column_count_alone() {
     // One column: the lines of the keys go, whether or not the key as given has whitespace at
     // its end; a key that is not there changes nothing.
     fs::write(dir.join("o.tsv"), "#h\na\nb \nc\nb\n").unwrap();
-    assert_eq!(records(dir, &["delete", "o.tsv", "zz"]).0, 0);
+    let (code, _, err) = records(dir, &["-v", "delete", "o.tsv", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""), "nothing was rewritten");
     assert_eq!(file(dir, "o.tsv"), "#h\na\nb \nc\nb\n");
     assert_eq!(records(dir, &["delete", "o.tsv", "b\t"]).0, 0);
     assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
     // A reset of the defaults there would be a row, to TSVZ.py too: none is written.
     assert_eq!(records(dir, &["delete", "o.tsv", "#_defaults_#"]).0, 0);
     assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
+}
+
+#[test]
+fn a_loose_delete_names_no_blank_key_and_says_what_the_head_says_once() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // A key with nothing left after its whitespace names no row: it is not written at more than
+    // one column, and takes no blank line away at one.
+    fs::write(dir.join("m.tsv"), "b\t1\nc\t3\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", " ", "zz", "\t"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("appended 1 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nzz\n");
+    fs::write(dir.join("o.tsv"), "a\n \nb\n").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\n \nb\n");
+    // What the read of the head warns of is said once, though a file of one column is read
+    // again from the start.
+    let warned = |name: &str, bytes: &[u8]| {
+        fs::write(dir.join(name), bytes).unwrap();
+        records(dir, &["delete", name, "zz"])
+            .2
+            .matches("line 1 is not valid UTF-8")
+            .count()
+    };
+    assert_eq!(warned("w1.tsv", b"#\xff\na\nb\n"), 1);
+    assert_eq!(warned("w2.tsv", b"#\xff\na\t1\n"), 1);
+    assert_eq!(warned("w3.tsv", b"#\xff\n"), 1);
 }
 
 #[test]
