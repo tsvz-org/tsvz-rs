@@ -37,9 +37,16 @@ pub(crate) fn deletes(rest: Option<&str>, d: u8, one: bool) -> bool {
     !one && rest.is_none_or(|r| r.split(d as char).all(blank))
 }
 
+/// A line as TSVZ.py reads it: without the NULs at its start (`line.strip('\x00')`), so that a
+/// line of only NULs is empty and a key never begins with one.
+pub(crate) fn body(line: &str) -> &str {
+    line.trim_start_matches('\0')
+}
+
 /// Whether TSVZ.py takes `line` as a keyed line, the first of which sets the column count: not
 /// empty, no comment (a `#_defaults_#` line counts), and a key that is not blank.
 pub(crate) fn keyed(line: &str, d: u8) -> bool {
+    let line = body(line);
     (!line.starts_with('#') || line.starts_with(DEFAULTS)) && !blank(first_field(line, d).0)
 }
 
@@ -60,6 +67,7 @@ enum Kind {
 }
 
 fn kind(line: &str, d: u8, one: bool) -> (Kind, &str) {
+    let line = body(line);
     if line.starts_with(DEFAULTS) {
         return (Kind::Defaults, "");
     }
@@ -267,6 +275,10 @@ mod tests {
             ("#_defaults_#\na\n", true),
             ("\u{feff}#h\na\t1\n", true), // the mark makes line 1 keyed, to TSVZ.py
             ("#h\n", false),
+            // A line of only NULs is empty to TSVZ.py, and a key never begins with one.
+            ("\0\na\tb\n", false),
+            ("\0\0\na\n", true),
+            ("\0a\nb\t1\n", true),
         ] {
             let raw = lines(text);
             assert_eq!(Lines::new(&raw, b'\t').one, one, "{text:?}");

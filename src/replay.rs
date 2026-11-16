@@ -539,6 +539,7 @@ impl Replay {
     /// reads it ([`crate::loose`]).
     fn loose_line(&mut self, text: &str, first: bool, sink: &mut dyn Sink) {
         let d = self.format.delimiter;
+        let text = crate::loose::body(text);
         if self.one_column.is_none() && crate::loose::keyed(text, d) {
             self.one_column = Some(!text.as_bytes().contains(&d));
         }
@@ -882,6 +883,20 @@ mod tests {
             table(&rows),
             vec![row("\u{feff}a", &["1"]), row("b", &["2"])]
         );
+    }
+
+    #[test]
+    fn a_loose_line_is_read_without_the_nuls_at_its_start() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        // A line of only NULs is empty: it sets no column count and is no key.
+        let (r, rows, _) = run(loose, false, b"\0\na\tb\nc\t\n");
+        assert_eq!(r.one_column, Some(false));
+        assert_eq!(table(&rows), vec![row("a", &["b"])]);
+        let (_, rows, _) = run(loose, false, b"\0\0\0a\t1\n\0\t2\na\t2\n");
+        assert_eq!(table(&rows), vec![row("a", &["2"])]);
     }
 
     #[test]

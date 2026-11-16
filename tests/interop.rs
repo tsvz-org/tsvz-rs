@@ -406,6 +406,12 @@ const LOOSE: &[&str] = &[
     "\u{feff}#h\na\t1\n",
     "\u{feff}name\tvalue\nx\t1\n#c\nx\t2\n",
     "\u{feff}a\t1\nb\t\nb\t2\n",
+    // TSVZ.py strips the NULs at the start of a line: a line of only NULs is empty, and a key
+    // never begins with one.
+    "\0\na\tb\nc\t\n",
+    "\0\0\na\nb\n",
+    "\0a\t1\na\t2\n",
+    "#h\n\0\0\na\t1\n\0b\t\n\0\t3\n",
 ];
 
 /// A loose file drawn from `seed`: keys a to d, with values, blank cells, keys alone, comments,
