@@ -303,7 +303,6 @@ fn snapshot_start(list: &[parts::Part], format: Format) -> usize {
 const SNAPSHOT_HINT: u64 = 1 << 12;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
-#[derive(Clone)]
 struct SnapshotLines {
     delimiter: u8,
     seen: usize,
@@ -340,10 +339,8 @@ impl SnapshotLines {
 /// What the members at the start of the compressed bytes `data` say: whether the part is a
 /// snapshot part, judged only from members that passed their checks, as TSVZ.py reads a part.
 /// None when those end before the verdict: with `more`, a last member that runs past `data` is
-/// only the end of what was read so far, but what it has decoded can already say "no", which
-/// stands whether the member later passes its check or not; only a "yes" waits for the check.
-/// A member cut short or corrupt before the verdict, in the middle of `data` or at the end of
-/// the part, makes it no snapshot part.
+/// only the end of what was read so far. A member cut short or corrupt before the verdict, in
+/// the middle of `data` or at the end of the part, makes it no snapshot part.
 fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
     let mut lines = SnapshotLines::new(delimiter);
     let mut framer = Framer::new();
@@ -351,13 +348,7 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
     codec::for_each_item(codec, data, &mut |item| match item {
         Item::Data(out) => framer.push(&out, &mut |l| lines.line(l)),
         // the last item when the member runs to the end of `data`; a Break follows it otherwise
-        Item::CutShort { out, .. } if more => {
-            let (mut ahead, mut seen) = (framer.clone(), lines.clone());
-            ahead.push(&out, &mut |l| seen.line(l));
-            if seen.verdict == Some(false) {
-                lines.verdict = seen.verdict;
-                return false;
-            }
+        Item::CutShort { .. } if more => {
             cut = true;
             true
         }
@@ -381,6 +372,39 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
     }
 }
 
+/// Whether the first member of a part, fed to a decoder one page at a time from `reader`, says
+/// "no" (§19.10.1) before it is whole. A "no" stands whether the member later passes its check
+/// or not, as a damaged member before the verdict also makes it no snapshot part, so a part
+/// that is none is settled by the first block bzip2 gives, not by the doubling reads below.
+/// `data` gets the bytes read, for those to start from. A "yes", a data error and a member that
+/// ends before the verdict are left to them: only members that passed their checks can say yes.
+fn first_member_says_no(
+    codec: Codec,
+    reader: &mut impl Read,
+    delimiter: u8,
+    data: &mut Vec<u8>,
+) -> bool {
+    let mut decoder = codec::Decoder::new(codec);
+    let (mut lines, mut framer) = (SnapshotLines::new(delimiter), Framer::new());
+    let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT as usize], Vec::new());
+    while lines.verdict.is_none() {
+        let n = match reader.read(&mut page) {
+            Ok(n) if n > 0 => n,
+            _ => break,
+        };
+        data.extend_from_slice(&page[..n]);
+        out.clear();
+        let Ok((_, ended)) = decoder.feed(&page[..n], &mut out) else {
+            break;
+        };
+        framer.push(&out, &mut |l| lines.line(l));
+        if ended {
+            break;
+        }
+    }
+    lines.verdict == Some(false)
+}
+
 /// Whether `part` is a snapshot part (§19.10.1): its first committed line, or its second after a
 /// comment, is `#_snapshot_#` without a value. Only the start of the part is read: a compressed
 /// one a piece at a time, until its first lines come out of members that passed their checks
@@ -396,7 +420,11 @@ pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
         Some(c) if !c.supported() => false,
         Some(c) => {
             let mut data = Vec::new();
-            let mut want = SNAPSHOT_HINT;
+            if first_member_says_no(c, &mut reader, d, &mut data) {
+                return false;
+            }
+            // at least one byte more, so that `more` says whether the part goes on past `data`
+            let mut want = (data.len() as u64 + 1).max(SNAPSHOT_HINT);
             loop {
                 let room = want - data.len() as u64;
                 let Ok(n) = (&mut reader).take(room).read_to_end(&mut data) else {
@@ -1490,23 +1518,55 @@ mod tests {
         out
     }
 
+    /// A reader that counts the bytes it hands out.
+    struct Counting<'a> {
+        rest: &'a [u8],
+        read: usize,
+    }
+
+    impl Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.rest.len());
+            buf[..n].copy_from_slice(&self.rest[..n]);
+            self.rest = &self.rest[n..];
+            self.read += n;
+            Ok(n)
+        }
+    }
+
     #[test]
-    fn what_a_cut_member_has_decoded_can_say_no_at_once_but_yes_waits_for_its_check() {
+    fn a_member_that_says_no_is_settled_before_it_is_read_whole_but_yes_waits_for_its_check() {
         use crate::codec::encode_member;
-        use crate::name::Codec::Gzip;
-        let cut = |content: &str| {
-            let member = encode_member(Gzip, content.as_bytes()).unwrap();
-            assert!(member.len() as u64 > SNAPSHOT_HINT);
-            let start = &member[..SNAPSHOT_HINT as usize];
-            compressed_verdict(Gzip, start, b'\t', true)
-        };
-        // A first line that is not a comment, or a second that is not the marker: no part
-        // begins its member so, whether or not the member passes its check.
-        assert_eq!(cut(&noise("", 20000)), Some(false));
-        assert_eq!(cut(&noise("#h\n", 20000)), Some(false));
-        // The marker waits for the check of the member that holds it.
-        assert_eq!(cut(&noise("#_snapshot_#\n", 20000)), None);
-        assert_eq!(cut(&noise("#h\n#_snapshot_#\n", 20000)), None);
+        for codec in [Codec::Gzip, Codec::Bzip2, Codec::Xz, Codec::Zstd] {
+            if !codec.supported() {
+                continue;
+            }
+            let says = |content: &str| {
+                let member = encode_member(codec, content.as_bytes()).unwrap();
+                let mut reader = Counting {
+                    rest: &member,
+                    read: 0,
+                };
+                let no = first_member_says_no(codec, &mut reader, b'\t', &mut Vec::new());
+                (no, reader.read, member.len())
+            };
+            // A first line that is not a comment, or a second that is not the marker: no part
+            // begins its member so, whether or not the member passes its check, and what the
+            // decoder has given by then is enough (bzip2 gives nothing before a whole block).
+            for head in ["", "#h\n"] {
+                let (no, read, whole) = says(&noise(head, 100_000));
+                assert!(no, "{codec:?} {head:?}");
+                assert!(
+                    read * 2 < whole,
+                    "{codec:?} {head:?}: {read} of {whole} bytes"
+                );
+            }
+            // The marker is no "no": it waits for the check of the member that holds it.
+            for head in ["#_snapshot_#\n", "#h\n#_snapshot_#\n"] {
+                let (no, ..) = says(&noise(head, 100_000));
+                assert!(!no, "{codec:?} {head:?}");
+            }
+        }
     }
 
     #[test]

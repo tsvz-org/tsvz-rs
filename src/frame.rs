@@ -23,7 +23,6 @@ impl<'a> Line<'a> {
 
 /// Turns a part's bytes into committed lines: one BOM removed at the start (§4.7), lines
 /// ended by `\n`, bytes after the last `\n` held as the uncommitted tail (§4.3).
-#[derive(Clone)]
 pub struct Framer {
     pending: Vec<u8>,
     bom_decided: bool,

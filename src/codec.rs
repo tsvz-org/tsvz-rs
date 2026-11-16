@@ -154,7 +154,7 @@ pub fn gzip_header_len(data: &[u8]) -> Option<usize> {
     None
 }
 
-struct GzipDecoder {
+pub(crate) struct GzipDecoder {
     header: GzipHeader,
     /// The raw inflater once the header is complete, and whether its deflate stream ended.
     inflate: Option<(flate2::Decompress, bool)>,
@@ -165,7 +165,7 @@ struct GzipDecoder {
 }
 
 /// An incremental decoder for one member.
-enum Decoder {
+pub(crate) enum Decoder {
     Gzip(Box<GzipDecoder>),
     #[cfg(feature = "bzip2")]
     Bzip2(bzip2::Decompress),
@@ -179,7 +179,7 @@ enum Decoder {
 }
 
 impl Decoder {
-    fn new(codec: Codec) -> Decoder {
+    pub(crate) fn new(codec: Codec) -> Decoder {
         match codec {
             Codec::Gzip => Decoder::Gzip(Box::new(GzipDecoder {
                 header: GzipHeader::default(),
@@ -208,7 +208,7 @@ impl Decoder {
 
     /// Feed `input`, appending output to `out`. Ok((bytes consumed, member ended and checked))
     /// or Err(()) on a data error. Output decoded before an error stays in `out`.
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(usize, bool), ()> {
+    pub(crate) fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(usize, bool), ()> {
         match self {
             Decoder::Gzip(g) => g.feed(input, out),
             #[cfg(feature = "bzip2")]
