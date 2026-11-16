@@ -677,3 +677,74 @@ fn a_delete_of_a_loose_files_marked_line_1_takes_the_mark_with_it() {
         assert_eq!(rs, py_keys, "{text:?} {key:?}: {after:?}");
     }
 }
+
+#[test]
+fn a_loose_clear_keeps_the_column_count_its_defaults_were_read_at() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let (kept, cleared) = (dir.path().join("kept.tsv"), dir.path().join("cleared.tsv"));
+    // The rows TSVZ.py reads for the probe key, as it pads them to the file's width.
+    let z = |f: &Path| {
+        let out = python(&py, &["read", f.to_str().unwrap()], b"");
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
+        out.lines()
+            .filter(|l| l.starts_with("zz\t") || *l == "zz")
+            .map(|l| l.trim_end_matches('\t').to_string())
+            .collect::<Vec<_>>()
+    };
+    // (a file, whether it has one column)
+    for (text, one) in [
+        // Defaults of more cells than the file has columns, and of fewer.
+        ("a\t1\n#_defaults_#\tP\tQ\tS\n", false),
+        ("a\t1\t2\t3\n#_defaults_#\tP\tQ\n", false),
+        ("#h\na\t1\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n", false),
+        (
+            "#_defaults_#\tP\tQ\na\t1\t\n#_defaults_#\n#_defaults_#\tR\tS\tT\n",
+            false,
+        ),
+        // One column: a key alone stays a row, whatever defaults the file had.
+        ("a\n#_defaults_#\tP\n", true),
+        ("#h\na\nb\n#_defaults_#\tP\tQ\tS\n", true),
+    ] {
+        for f in [&kept, &cleared] {
+            std::fs::write(f, text).unwrap();
+        }
+        assert!(
+            rust(&["clear", cleared.to_str().unwrap()], b"")
+                .status
+                .success()
+        );
+        let after = std::fs::read_to_string(&cleared).unwrap();
+        assert_eq!(both(&py, "keys", &cleared), (String::new(), String::new()));
+        // Rows with blank cells read with the defaults they had, but at one column, which
+        // keeps none: a defaults line of more cells would make a key alone a deletion.
+        for probe in ["zz\t\tq\tr\n", "zz\t5\n", "zz\t\t\n"] {
+            let (mut want, mut got) = (text.to_string(), after.clone());
+            want.push_str(probe);
+            got.push_str(probe);
+            std::fs::write(&kept, want).unwrap();
+            std::fs::write(&cleared, got).unwrap();
+            if !one {
+                assert_eq!(
+                    z(&cleared),
+                    z(&kept),
+                    "{text:?} cleared to {after:?}, then {probe:?}"
+                );
+            }
+        }
+        for f in [&kept, &cleared] {
+            std::fs::write(f, if f == &kept { text } else { &after }).unwrap();
+        }
+        let bare = |f: &Path| {
+            assert!(
+                rust(&["set", f.to_str().unwrap(), "zz"], b"")
+                    .status
+                    .success()
+            );
+            let keys = python(&py, &["keys", f.to_str().unwrap()], b"").stdout;
+            String::from_utf8_lossy(&keys).lines().any(|k| k == "zz")
+        };
+        assert_eq!(bare(&cleared), bare(&kept), "{text:?} cleared to {after:?}");
+        assert_eq!(bare(&kept), one, "{text:?}");
+    }
+}

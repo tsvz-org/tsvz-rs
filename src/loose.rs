@@ -203,33 +203,48 @@ pub(crate) fn scrub(lines: &Lines<'_>) -> Vec<u8> {
 }
 
 /// What `clear` leaves of `lines`: line 1 when it is a comment or empty (TSVZ.py writes an empty
-/// line where a file has no header), and the `#_defaults_#` lines that hold a value after the
-/// last one that holds none (which resets the defaults, but in a one-column file), so that rows
-/// written later read to TSVZ.py as they would have before. A line that holds none is left out:
-/// it changes nothing there, and would be a row in a file whose column count it sets.
+/// line where a file has no header), and, in a file of more than one column, the `#_defaults_#`
+/// lines that hold a value after the last one that holds none (which resets the defaults), so
+/// that rows written later read to TSVZ.py with the defaults they had before. They keep the
+/// file's column count too, which the first of them may not have: a `#_defaults_#` line that
+/// holds no value, at that count, goes before it (it sets the count, and changes nothing else).
+/// A one-column file keeps none: its first keyed line would be a defaults line of more cells,
+/// and a key alone, a row there, would be a deletion.
 pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
     let d = lines.d;
-    let defaults = |t: &str| {
-        let (key, rest) = first_field(body(t), d);
+    let n = lines.raw.len();
+    let defaults = |i: usize| {
+        let (key, rest) = first_field(body(&lines.text[i]), d);
         let valued = rest.is_some_and(|r| !r.split(d as char).all(blank));
         (key.trim_end_matches(py_space) == DEFAULTS).then_some(valued)
     };
-    let defaults = |i: usize| defaults(&lines.text[i]);
-    let reset = if lines.one {
-        None
-    } else {
-        (0..lines.text.len()).rposition(|i| defaults(i) == Some(false))
-    };
-    let keep: Vec<bool> = lines
-        .text
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let header = i == 0 && (t.is_empty() || is_comment(t, d)) && !keyed(t, d);
-            header || (defaults(i) == Some(true) && reset.is_none_or(|r| i > r))
+    let reset = (0..n).rposition(|i| defaults(i) == Some(false));
+    let in_force =
+        |i: usize| !lines.one && defaults(i) == Some(true) && reset.is_none_or(|r| i > r);
+    let keep: Vec<bool> = (0..n)
+        .map(|i| {
+            let t = &lines.text[i];
+            (i == 0 && (t.is_empty() || is_comment(t, d)) && !keyed(t, d)) || in_force(i)
         })
         .collect();
-    lines.write(&keep, &vec![None; lines.raw.len()])
+    let mut put = vec![None; n];
+    // The column count of the file, and the first line kept that is not line 1's header.
+    let first = (0..n).find(|&i| in_force(i));
+    let count = |i: usize| memchr::memchr_iter(d, body(&lines.text[i]).as_bytes()).count() + 1;
+    let width: Vec<u8>;
+    if let (Some(first), Some(w)) = (first, lines.width_line) {
+        if count(first) != count(w) {
+            width = [
+                DEFAULTS.as_bytes(),
+                &vec![d; count(w) - 1],
+                b"\n",
+                &lines.raw[first],
+            ]
+            .concat();
+            put[first] = Some(&width[..]);
+        }
+    }
+    lines.write(&keep, &put)
 }
 
 /// In a one-column file, where a key alone is a row and no line can delete: `lines` without the
@@ -359,13 +374,29 @@ mod tests {
                 "#h\r\na\t1\r\n#_defaults_#\tP\r\n",
                 "#h\r\n#_defaults_#\tP\r\n",
             ),
-            // A #_defaults_# line that holds no value resets the defaults, but at one column,
-            // where it is a row: it goes, with what it reset.
+            // A #_defaults_# line that holds no value resets the defaults: it goes, with what
+            // it reset.
             (
-                "#h\n#_defaults_#\tP\nb\t1\n#_defaults_#\n#_defaults_#\tQ\tR\n",
-                "#h\n#_defaults_#\tQ\tR\n",
+                "#h\n#_defaults_#\tP\tQ\nb\t1\n#_defaults_#\n#_defaults_#\tR\tS\n",
+                "#h\n#_defaults_#\tR\tS\n",
             ),
-            ("a\n#_defaults_#\tP\n#_defaults_#\n", "#_defaults_#\tP\n"),
+            // The column count stays what it was: a defaults line of another count goes after
+            // a blank one of the file's.
+            (
+                "a\t1\n#_defaults_#\tP\tQ\tS\n",
+                "#_defaults_#\t\n#_defaults_#\tP\tQ\tS\n",
+            ),
+            (
+                "a\t1\t2\t3\n#_defaults_#\tP\tQ\n",
+                "#_defaults_#\t\t\t\n#_defaults_#\tP\tQ\n",
+            ),
+            (
+                "#h\na\t1\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n",
+                "#h\n#_defaults_#\t\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n",
+            ),
+            // A one-column file keeps none: a defaults line of more cells would make it two.
+            ("a\n#_defaults_#\tP\n#_defaults_#\n", ""),
+            ("#h\na\n#_defaults_#\tP\tQ\n", "#h\n"),
             // With a byte-order mark, line 1 is a row to TSVZ.py.
             ("\u{feff}#_defaults_#\tP\na\t1\n", ""),
         ] {
