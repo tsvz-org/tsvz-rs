@@ -88,3 +88,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   it was read with, and read again otherwise, as the one-column rewrite already does.
 - Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that
   deferrals are noted, not asked.
+
+### A read of a store of many bzip2 parts decodes each part's first block twice
+- Kind: deferred
+- What the operator sees: reading a multi-part store with no snapshot part takes longer when its parts are
+  bzip2: 40 parts of one 3 MiB member each, `tsvz get` took 3.9 s, and 0.1.3 1.7 s (gzip parts: the same as 0.1.3).
+- Why: a read begins at the last snapshot part (§19.10.3), so each part, from the last, has its first lines
+  looked at. bzip2 gives nothing before a whole block (up to 900 kB of text), so the look decodes that block, and
+  the read then decodes it again. 0.1.3 had no such look.
+- Revisit when: the next tsvz-rs version. The plan: keep the first member's output from the look for the read of
+  that part, so that it is decoded once.
+- Noted: 2026-11-16, in the 0.1.4 fix round; a deferral under the user's standing rule that deferrals are noted,
+  not asked.

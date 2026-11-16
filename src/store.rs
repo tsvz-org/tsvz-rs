@@ -296,10 +296,11 @@ fn snapshot_start(list: &[parts::Part], format: Format) -> usize {
 
 /// Compressed bytes of a part read first to look for the marker, doubled until it is judged. A
 /// gzip, xz or zstd member gives its first lines from its first bytes, and a first line that is
-/// no comment settles a part, so 64 KiB (a size that costs nothing to read beside opening the
-/// part) judges nearly every part; bzip2 gives nothing before a whole block (900 kB of text at
-/// most, its published block size) and takes a few doublings.
-const SNAPSHOT_HINT: u64 = 1 << 16;
+/// no comment settles a part, so 4 KiB judges nearly every part. Measured on 200 gzip parts of
+/// one member each, a `get` took 0.51 s with 64 KiB, 0.41 s with 16 KiB and 0.39 s with 4 KiB
+/// (0.1.3, which asked nothing of a part, 0.40 s). bzip2 gives nothing before a whole block (900
+/// kB of text at most, its published block size) and takes a few doublings, whatever this is.
+const SNAPSHOT_HINT: u64 = 1 << 12;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
 #[derive(Clone)]
