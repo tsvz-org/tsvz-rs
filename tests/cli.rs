@@ -434,8 +434,9 @@ fn a_one_column_loose_file_holds_keys_alone() {
     assert_eq!(records(dir, &["set", "hosts.tsv", "h4"]).0, 0);
     assert_eq!(records(dir, &["scrub", "hosts.tsv"]).0, 0);
     assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\nh4\n");
-    // A missing file is made, and holds nothing: in a file with no keyed line yet, a key alone
-    // would make it one column, and a row.
+    // A missing file is made, and tsvz-rs holds nothing in it (TSVZ.py writes one empty line; the
+    // two read alike): in a file with no keyed line yet, a key alone would make it one column,
+    // and a row.
     assert_eq!(records(dir, &["delete", "new.tsv", "k"]).0, 0);
     assert_eq!(file(dir, "new.tsv"), "");
     assert_eq!(records(dir, &["keys", "new.tsv"]).1, "");
@@ -512,6 +513,22 @@ fn a_loose_delete_names_no_blank_key_and_says_what_the_head_says_once() {
     assert_eq!(warned("w1.tsv", b"#\xff\na\nb\n"), 1);
     assert_eq!(warned("w2.tsv", b"#\xff\na\t1\n"), 1);
     assert_eq!(warned("w3.tsv", b"#\xff\n"), 1);
+}
+
+#[test]
+fn a_loose_delete_of_more_than_one_column_reads_no_further_than_its_first_keyed_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // Line 2 holds bytes that are no UTF-8: a read of it warns, and one that stops at line 1 does
+    // not get there.
+    fs::write(dir.join("m.tsv"), b"a\t1\n\xff\t2\n").unwrap();
+    let (code, _, err) = records(dir, &["delete", "m.tsv", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert!(
+        records(dir, &["len", "m.tsv"])
+            .2
+            .contains("line 2 is not valid UTF-8")
+    );
 }
 
 #[test]

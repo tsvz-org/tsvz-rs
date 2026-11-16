@@ -388,17 +388,17 @@ fn trimmed(out: &str) -> Vec<Vec<u8>> {
 }
 
 /// Loose files written as TSVZ.py writes and reads them (header lines, `#_defaults_#` lines,
-/// one-column files), and the limitations entry's examples.
+/// one-column files), and files as a TSVZ.py scrub and a TSVZed commit leave them.
 const LOOSE: &[&str] = &[
     "a\nb\nc\n",
     "#h\na\nb\na\n",
     "a\nb\t1\nc\n",
     "#h\tx\ty\na\t1\t\nb\t\t2\na\t\t\n",
     "#h\tx\ty\n#_defaults_#\tP\tQ\na\t1\t\nb\t\t2\n#c\na\t3\t\n#_defaults_#\tR\nb\t\t4\nc\t\t\n",
-    // The entry's second example, as TSVZ.py 5.10's scrub wrote it, then before that scrub.
+    // A file as TSVZ.py 5.10's scrub wrote it, then the file before that scrub (LOOSE[6]).
     "id\nb\t1\tX\tX\na\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n",
     "id\nb\t1\tX\tX\na\na\t2\nd\tX\tX\t2\na\t\n#_defaults_#\tP\t\tQ\n",
-    // Its first example, after and before a TSVZed commit.
+    // A file after and before a TSVZed commit.
     "d\tX\tW\nd\ne\t1\nd\t\n",
     "d\tX\tW\na\nd\t\ne\t1\nd\t\n",
     "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
@@ -429,6 +429,9 @@ const REWRITTEN: &[&str] = &[
     "#h\na \t1\nb\t2\na\t3\n",
     "a \nb\na\nb \n",
     "#h\nk\t1\nk \t2\nk\t3\nz\t\n",
+    // A run of CRs before a newline: TSVZ.py cuts them all, tsvz-rs one, and a rewrite must keep
+    // the rest of them, or the last cell reads otherwise.
+    "#h\na\t1\nb\t1\r\r\n",
 ];
 
 /// A loose file drawn from `seed`: keys a to d, with values, blank cells, keys alone, comments,
@@ -521,12 +524,25 @@ fn loose_rows_are_padded_to_the_width_of_the_first_keyed_line() {
     }
 }
 
+/// Whether `text` is one column to TSVZ.py: its first keyed line (not a comment, but for a
+/// `#_defaults_#` line, and with a key that is not blank) holds no tab.
+fn one_column(text: &str) -> bool {
+    text.lines()
+        .map(|l| l.trim_start_matches('\0'))
+        .find(|l| {
+            let key = l.split('\t').next().unwrap_or("");
+            (!l.starts_with('#') || l.starts_with("#_defaults_#")) && !key.trim().is_empty()
+        })
+        .is_some_and(|l| !l.contains('\t'))
+}
+
 /// Whether tsvz-rs lists the keys of `text` as TSVZ.py does: not with a bare `#_defaults_#` line
-/// (a row to TSVZ.py in a one-column file), a key with whitespace at its end, or a CR (TSVZ.py
-/// strips them, docs/limitations.md).
+/// in a one-column file (a row to TSVZ.py there, and a comment to tsvz-rs), a key with
+/// whitespace at its end, or a CR (TSVZ.py strips them, docs/limitations.md).
 fn keys_agree(text: &str) -> bool {
     let spaced = |l: &str| l.split('\t').next().is_some_and(|k| k.trim_end() != k);
-    !text.contains('\r') && !text.lines().any(|l| l == "#_defaults_#" || spaced(l))
+    let bare = one_column(text) && text.lines().any(|l| l == "#_defaults_#");
+    !text.contains('\r') && !bare && !text.lines().any(spaced)
 }
 
 #[test]
@@ -573,9 +589,11 @@ fn a_loose_scrub_changes_nothing_tsvz_py_reads() {
             );
         }
     }
-    // A scrub that wrote every line back would pass all of the above.
+    // A scrub that wrote every line back would pass all of the above. 61 of the 88 texts shrink
+    // (counted 2026-11-16): 40 is well under that, and above what a scrub that kept most lines
+    // would reach.
     assert!(compacted >= 40, "only {compacted} files shrank");
-    // TSVZ.py's own scrub of the entry's second example: tsvz-rs lists the keys it listed.
+    // TSVZ.py's own scrub of LOOSE[6]: tsvz-rs lists the keys it listed.
     std::fs::write(&file, LOOSE[6]).unwrap();
     let before = both(&py, "keys", &file);
     assert!(
