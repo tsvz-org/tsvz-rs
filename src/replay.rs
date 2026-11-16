@@ -186,9 +186,6 @@ pub struct Replay {
     pub lines: Option<Vec<Vec<u8>>>,
     /// Stop reading a loose file at its first keyed line.
     pub(crate) head: bool,
-    /// Whether a loose file began with a byte-order mark, which the framer drops (§4.7) and
-    /// TSVZ.py reads as part of line 1.
-    pub bom: bool,
     first_line: bool,
     part: PathBuf,
     warn: Option<WarnFn>,
@@ -309,7 +306,6 @@ impl Replay {
             one_column: None,
             lines: None,
             head: false,
-            bom: false,
             first_line: false,
             part: PathBuf::new(),
             warn,
@@ -378,6 +374,13 @@ impl Replay {
                 }
             }
         }
+        // A loose file's line 1 begins with its byte-order mark, as TSVZ.py reads it (§5.2: the
+        // data semantics of a loose file are implementation-defined); the framer drops it (§4.7).
+        let marked: Vec<u8>;
+        if !self.format.strict && first && line.offset == 3 {
+            marked = [&b"\xef\xbb\xbf"[..], body].concat();
+            body = &marked;
+        }
         let text = String::from_utf8_lossy(body);
         if matches!(text, Cow::Owned(_)) {
             self.warn(
@@ -391,7 +394,6 @@ impl Replay {
         if self.format.strict {
             self.strict_line(&text, line, first, sink);
         } else {
-            self.bom |= first && line.offset == 3;
             if let Some(lines) = &mut self.lines {
                 lines.push(body.to_vec());
             }
@@ -537,8 +539,7 @@ impl Replay {
     /// reads it ([`crate::loose`]).
     fn loose_line(&mut self, text: &str, first: bool, sink: &mut dyn Sink) {
         let d = self.format.delimiter;
-        // TSVZ.py reads a byte-order mark as part of line 1, which is then keyed.
-        if self.one_column.is_none() && ((first && self.bom) || crate::loose::keyed(text, d)) {
+        if self.one_column.is_none() && crate::loose::keyed(text, d) {
             self.one_column = Some(!text.as_bytes().contains(&d));
         }
         if text.starts_with('#') {
@@ -859,6 +860,28 @@ mod tests {
         // The first keyed line, a #_defaults_# line included, sets the column count.
         let (_, rows, _) = run(loose, false, b"#_defaults_#\tP\na\nb\t1\nb\t\n");
         assert!(table(&rows).is_empty());
+    }
+
+    #[test]
+    fn a_loose_files_byte_order_mark_is_part_of_line_1() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        // As TSVZ.py reads it: a keyed line, so its column count is the file's, and a key.
+        let (r, rows, _) = run(loose, false, b"\xef\xbb\xbf#h\na\t1\nb\n");
+        assert_eq!(r.one_column, Some(true));
+        assert_eq!(
+            table(&rows),
+            vec![row("\u{feff}#h", &[]), row("a", &["1"]), row("b", &[])]
+        );
+        // Only line 1 begins with it.
+        let (r, rows, _) = run(loose, false, b"\xef\xbb\xbfa\t1\n#h\nb\t2\n");
+        assert_eq!(r.one_column, Some(false));
+        assert_eq!(
+            table(&rows),
+            vec![row("\u{feff}a", &["1"]), row("b", &["2"])]
+        );
     }
 
     #[test]

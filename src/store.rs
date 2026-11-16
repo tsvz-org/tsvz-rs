@@ -892,7 +892,7 @@ impl Store {
     /// keep them.
     pub(crate) fn loose_lines(&self) -> Option<(crate::loose::Lines<'_>, &[u8])> {
         let lines = self.replay.lines.as_deref()?;
-        let lines = crate::loose::Lines::new(lines, self.format.delimiter, self.replay.bom);
+        let lines = crate::loose::Lines::new(lines, self.format.delimiter);
         Some((lines, &self.tail))
     }
 
@@ -901,6 +901,7 @@ impl Store {
     }
 
     /// Whether a loose file's column count is one; None before its first keyed line.
+    #[cfg(feature = "cli")]
     pub(crate) fn one_column(&self) -> Option<bool> {
         self.replay.one_column
     }

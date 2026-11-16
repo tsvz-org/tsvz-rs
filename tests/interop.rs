@@ -401,6 +401,11 @@ const LOOSE: &[&str] = &[
     "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
     "#h\nk\t1\nk\t \t\nk\nz\t2\n",
     "\na\t1\nb\t2\na\t3\n",
+    // A byte-order mark is part of line 1, to TSVZ.py: its key, whatever it holds.
+    "\u{feff}a\nb\n",
+    "\u{feff}#h\na\t1\n",
+    "\u{feff}name\tvalue\nx\t1\n#c\nx\t2\n",
+    "\u{feff}a\t1\nb\t\nb\t2\n",
 ];
 
 /// A loose file drawn from `seed`: keys a to d, with values, blank cells, keys alone, comments,
@@ -609,5 +614,44 @@ fn a_loose_delete_writes_what_tsvz_py_writes() {
             std::fs::read_to_string(&a).unwrap(),
             std::fs::read_to_string(&b).unwrap()
         );
+    }
+}
+
+#[test]
+fn a_delete_of_a_loose_files_marked_line_1_takes_the_mark_with_it() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("rs.tsv"), dir.path().join("py.tsv"));
+    // The mark is part of line 1's key, so `a` is not the key of line 1, and the line that
+    // follows a deleted line 1 never takes the mark.
+    for (text, key) in [
+        ("\u{feff}a\nb\n", "\u{feff}a"),
+        ("\u{feff}a\nb\n", "a"),
+        ("\u{feff}zz\n", "\u{feff}zz"),
+        ("\u{feff}a\t1\nb\t2\n", "\u{feff}a"),
+        ("\u{feff}#h\na\nb\n", "\u{feff}#h"),
+    ] {
+        for f in [&a, &b] {
+            std::fs::write(f, text).unwrap();
+        }
+        assert!(
+            rust(&["delete", a.to_str().unwrap(), key], b"")
+                .status
+                .success()
+        );
+        assert!(
+            python(&py, &["delete", b.to_str().unwrap(), key], b"")
+                .status
+                .success()
+        );
+        let after = std::fs::read_to_string(&a).unwrap();
+        assert_eq!(
+            py_keys_sorted(&py, &a),
+            py_keys_sorted(&py, &b),
+            "{text:?} {key:?}: {after:?}"
+        );
+        // And tsvz-rs reads the file as TSVZ.py does.
+        let (rs, py_keys) = both(&py, "keys", &a);
+        assert_eq!(rs, py_keys, "{text:?} {key:?}: {after:?}");
     }
 }

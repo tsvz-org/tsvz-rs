@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 const DEFAULTS: &str = "#_defaults_#";
-const BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// Whether `c` is whitespace to Python's `str.rstrip()`, which TSVZ.py applies to every cell.
 pub(crate) fn py_space(c: char) -> bool {
@@ -87,22 +86,15 @@ pub(crate) struct Lines<'a> {
     /// The line that sets the column count ([`keyed`]), if any.
     width_line: Option<usize>,
     one: bool,
-    /// Whether the file began with a byte-order mark: TSVZ.py reads it as part of line 1.
-    bom: bool,
 }
 
 impl<'a> Lines<'a> {
-    pub(crate) fn new(raw: &'a [Vec<u8>], d: u8, bom: bool) -> Lines<'a> {
+    pub(crate) fn new(raw: &'a [Vec<u8>], d: u8) -> Lines<'a> {
         let text: Vec<String> = raw
             .iter()
             .map(|l| String::from_utf8_lossy(l).into_owned())
             .collect();
-        // TSVZ.py reads a byte-order mark as part of line 1, which is then keyed.
-        let width_line = if bom && !text.is_empty() {
-            Some(0)
-        } else {
-            text.iter().position(|t| keyed(t, d))
-        };
+        let width_line = text.iter().position(|t| keyed(t, d));
         let one = width_line.is_some_and(|i| !text[i].as_bytes().contains(&d));
         Lines {
             raw,
@@ -110,17 +102,12 @@ impl<'a> Lines<'a> {
             d,
             width_line,
             one,
-            bom,
         }
     }
 
-    /// The lines `keep` says, each as `put` has it, else as it was, after the file's byte-order
-    /// mark when `bom`.
-    fn write(&self, keep: &[bool], put: &[Option<&[u8]>], bom: bool) -> Vec<u8> {
+    /// The lines `keep` says, each as `put` has it, else as it was.
+    fn write(&self, keep: &[bool], put: &[Option<&[u8]>]) -> Vec<u8> {
         let mut out = Vec::new();
-        if bom {
-            out.extend_from_slice(BOM);
-        }
         for i in (0..keep.len()).filter(|&i| keep[i]) {
             out.extend_from_slice(put[i].unwrap_or(&self.raw[i]));
             out.push(b'\n');
@@ -145,10 +132,7 @@ impl<'a> Lines<'a> {
 pub(crate) fn scrub(lines: &Lines<'_>) -> Vec<u8> {
     let n = lines.raw.len();
     let d = lines.d;
-    let mut kinds: Vec<(Kind, &str)> = lines.text.iter().map(|t| kind(t, d, lines.one)).collect();
-    if lines.bom && n > 0 {
-        kinds[0].0 = Kind::Odd; // line 1 and its key, to TSVZ.py, begin with the mark
-    }
+    let kinds: Vec<(Kind, &str)> = lines.text.iter().map(|t| kind(t, d, lines.one)).collect();
     // The lines that set the column count: the first keyed line, and the first after line 1,
     // which a reader that takes line 1 for its header counts from.
     let after_first = (1..n).find(|&i| keyed(&lines.text[i], d));
@@ -158,7 +142,7 @@ pub(crate) fn scrub(lines: &Lines<'_>) -> Vec<u8> {
         .collect();
     let mut put = vec![None; n];
     if kinds.iter().any(|(k, _)| *k == Kind::Odd) {
-        return lines.write(&keep, &put, lines.bom);
+        return lines.write(&keep, &put);
     }
     let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, (k, key)) in kinds.iter().enumerate() {
@@ -193,7 +177,7 @@ pub(crate) fn scrub(lines: &Lines<'_>) -> Vec<u8> {
             keep[last] = false;
         }
     }
-    lines.write(&keep, &put, lines.bom)
+    lines.write(&keep, &put)
 }
 
 /// What `clear` leaves of `lines`: line 1 when it is a comment or empty (TSVZ.py writes an empty
@@ -208,8 +192,7 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
         let valued = rest.is_some_and(|r| !r.split(d as char).all(blank));
         (key.trim_end_matches(py_space) == DEFAULTS).then_some(valued)
     };
-    // With a byte-order mark line 1 is a row to TSVZ.py, whatever it holds.
-    let defaults = |i: usize| defaults(&lines.text[i]).filter(|_| !(lines.bom && i == 0));
+    let defaults = |i: usize| defaults(&lines.text[i]);
     let reset = if lines.one {
         None
     } else {
@@ -224,8 +207,7 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
             header || (defaults(i) == Some(true) && reset.is_none_or(|r| i > r))
         })
         .collect();
-    // Without the byte-order mark, which would make line 1 a row to TSVZ.py.
-    lines.write(&keep, &vec![None; lines.raw.len()], false)
+    lines.write(&keep, &vec![None; lines.raw.len()])
 }
 
 /// In a one-column file, where a key alone is a row and no line can delete: `lines` without the
@@ -257,26 +239,22 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>
             }
         }
     }
-    Some(lines.write(&keep, &put, lines.bom))
+    Some(lines.write(&keep, &put))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lines(text: &str) -> (Vec<Vec<u8>>, bool) {
-        let bom = text.starts_with('\u{feff}');
-        let text = text.trim_start_matches('\u{feff}');
-        let raw = text
-            .split_terminator('\n')
+    fn lines(text: &str) -> Vec<Vec<u8>> {
+        text.split_terminator('\n')
             .map(|l| l.as_bytes().to_vec())
-            .collect();
-        (raw, bom)
+            .collect()
     }
 
     fn with(text: &str, f: impl Fn(&Lines<'_>) -> Vec<u8>) -> String {
-        let (raw, bom) = lines(text);
-        String::from_utf8(f(&Lines::new(&raw, b'\t', bom))).unwrap()
+        let raw = lines(text);
+        String::from_utf8(f(&Lines::new(&raw, b'\t'))).unwrap()
     }
 
     #[test]
@@ -290,8 +268,8 @@ mod tests {
             ("\u{feff}#h\na\t1\n", true), // the mark makes line 1 keyed, to TSVZ.py
             ("#h\n", false),
         ] {
-            let (raw, bom) = lines(text);
-            assert_eq!(Lines::new(&raw, b'\t', bom).one, one, "{text:?}");
+            let raw = lines(text);
+            assert_eq!(Lines::new(&raw, b'\t').one, one, "{text:?}");
         }
         assert!(deletes(None, b'\t', false) && deletes(Some(" \t\u{1c}"), b'\t', false));
         assert!(!deletes(None, b'\t', true) && !deletes(Some("\tx"), b'\t', false));
@@ -368,5 +346,11 @@ mod tests {
             gone("a\n#_defaults_#\tP\nb\n", &["a"]),
             "b\n#_defaults_#\tP\nb\n"
         );
+        // A byte-order mark is part of line 1's key, as TSVZ.py reads it: `a` is another key
+        // than `\u{feff}a`, and the mark goes with its line, never onto another.
+        assert_eq!(gone("\u{feff}a\nb\n", &["a"]), "\u{feff}a\nb\n");
+        assert_eq!(gone("\u{feff}a\nb\n", &["\u{feff}a"]), "b\n");
+        assert_eq!(gone("\u{feff}zz\n", &["\u{feff}zz"]), "");
+        assert_eq!(gone("\u{feff}a\nb\n", &["b"]), "\u{feff}a\n");
     }
 }
