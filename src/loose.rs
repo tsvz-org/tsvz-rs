@@ -197,7 +197,14 @@ pub(crate) fn scrub(lines: &Lines<'_>) -> Vec<u8> {
             keep[i] = pinned(i);
         }
     }
-    let defaults_between = |a: usize, b: usize| (a + 1..b).any(|i| kinds[i].0 == Kind::Defaults);
+    // How many `#_defaults_#` lines come before each line: whether one lies between two is then
+    // a subtraction, not a scan per key (a scan made a file of many keys, each on several lines,
+    // take time in the square of its length).
+    let mut defaults_before = vec![0usize; n + 1];
+    for (i, (k, _)) in kinds.iter().enumerate() {
+        defaults_before[i + 1] = defaults_before[i] + usize::from(*k == Kind::Defaults);
+    }
+    let defaults_between = |a: usize, b: usize| defaults_before[b] > defaults_before[a + 1];
     for at in by_key.values() {
         let last_delete = at.iter().rposition(|&i| kinds[i].0 == Kind::Delete);
         let run = &at[last_delete.map_or(0, |p| p + 1)..];
@@ -405,6 +412,32 @@ mod tests {
         ] {
             assert_eq!(with(input, scrub), output, "{input:?}");
         }
+    }
+
+    /// 200,000 lines of 50,000 keys, about four lines each and far apart, as the file a scrub is
+    /// for (keys written many times). A scan of the lines between each key's first and last
+    /// took 55 s here in a debug build, and 1.4 s in a release build (0.1.3: 0.06 s, linear);
+    /// counted once, the scrub takes 0.2 s. 5 s lies between, 25 times either side.
+    #[test]
+    fn a_scrub_takes_time_in_the_length_of_the_file_whatever_the_keys_repeat() {
+        let (count, keys) = (200_000u64, 50_000u64);
+        let mut text = String::from("#h\tv\n");
+        let mut x = 1u64;
+        for i in 0..count {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            text.push_str(&format!("k{}\t{i}\n", (x >> 33) % keys));
+        }
+        let raw = lines(&text);
+        let start = std::time::Instant::now();
+        let out = scrub(&Lines::new(&raw, b'\t'));
+        let took = start.elapsed();
+        assert!(out.len() < text.len());
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "a scrub of {count} lines of {keys} keys took {took:?}"
+        );
     }
 
     #[test]
