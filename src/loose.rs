@@ -469,16 +469,26 @@ mod tests {
 
     /// 400,000 keys, each written twice: a block of them, then the block again, so that every
     /// key's first and last line lie 400,000 lines apart. A scan of the lines between them, per
-    /// key, took 50 s in a release build here (2026-11-16; the old test, 200,000 lines of 50,000
-    /// keys in random order, took 1.4 s with the scan and so passed in a release build); counted
-    /// once, the scrub takes 1.4 s in a debug build and 0.4 s in a release one. The scrub runs on a
-    /// thread, so that a scan fails the test after 10 s, 7 times the debug scrub and a fifth of
-    /// the release scan, and not when it ends (it takes minutes in a debug build).
+    /// key, took 50 s of CPU in a release build here (2026-11-16; the old test, 200,000 lines of
+    /// 50,000 keys in random order, took 1.4 s with the scan and so passed in a release build);
+    /// counted once, the scrub takes 1.4 s in a debug build and 0.4 s in a release one. 10 s of
+    /// CPU, on the thread that scrubs, lies 7 times above the debug scrub and a fifth of the
+    /// release scan, whatever else the machine runs (it failed on wall time, 10 s, in a run beside
+    /// 160 busy processes). The thread has 120 s of wall time to end, so that a scan that does not
+    /// (a debug build takes many minutes) fails the test and does not hold it.
     #[test]
     fn a_scrub_takes_time_in_the_length_of_the_file_whatever_the_keys_repeat() {
         let keys = 400_000u64;
         let (done, took) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let cpu = || {
+                let mut t = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+                std::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+            };
             let mut text = String::from("#h\tv\n");
             for round in 0..2 {
                 for k in 0..keys {
@@ -486,14 +496,18 @@ mod tests {
                 }
             }
             let raw = lines(&text);
-            let start = std::time::Instant::now();
+            let start = cpu();
             let out = scrub(&Lines::new(&raw, b'\t'));
-            let _ = done.send((start.elapsed(), out.len() < text.len()));
+            let _ = done.send((cpu() - start, out.len() < text.len()));
         });
-        let (time, smaller) = took
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("a scrub of 800,000 lines of 400,000 keys took more than 10 s");
-        assert!(smaller, "the scrub took {time:?}");
+        let (cpu, smaller) = took
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("a scrub of 800,000 lines of 400,000 keys did not end in 120 s");
+        assert!(smaller);
+        assert!(
+            cpu < std::time::Duration::from_secs(10),
+            "the scrub took {cpu:?} of CPU"
+        );
     }
 
     #[test]
