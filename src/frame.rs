@@ -11,6 +11,8 @@ pub struct Line<'a> {
     pub number: u64,
     /// Where the line starts in the part's byte stream (decompressed for a compressed part).
     pub offset: u64,
+    /// The part began with a byte-order mark, which the framer removed, and this is its line 1.
+    pub bom: bool,
 }
 
 impl<'a> Line<'a> {
@@ -29,6 +31,8 @@ pub struct Framer {
     number: u64,
     consumed: u64,
     committed: u64,
+    /// A byte-order mark was removed at the start, and no member has been dropped since.
+    bom: bool,
 }
 
 impl Default for Framer {
@@ -46,6 +50,7 @@ impl Framer {
             number: 0,
             consumed: 0,
             committed: 0,
+            bom: false,
         }
     }
 
@@ -57,6 +62,7 @@ impl Framer {
             number,
             consumed: offset,
             committed: offset,
+            bom: false,
         }
     }
 
@@ -79,6 +85,7 @@ impl Framer {
             held.drain(..3);
             self.consumed += 3;
             self.committed += 3;
+            self.bom = true;
         }
         self.push_decided(&held, on_line)
     }
@@ -115,14 +122,17 @@ impl Framer {
             raw,
             number: self.number,
             offset: self.committed,
+            bom: self.bom && self.number == 1,
         };
         self.committed += raw.len() as u64;
         on_line(&line)
     }
 
-    /// A damaged member ended here (§16.6): drop the unfinished line; a later BOM is data.
+    /// A damaged member ended here (§16.6): drop the unfinished line, and with it a mark that
+    /// began it; a later BOM is data.
     pub fn brk(&mut self) {
         self.pending.clear();
+        self.bom = false;
         self.bom_decided = true;
         self.committed = self.consumed;
     }
@@ -197,6 +207,38 @@ mod tests {
         assert_eq!(split[0].1, b"k\tv");
         let (only, f) = frame(&[b"\xef\xbb\xbf"]);
         assert!(only.is_empty() && f.tail().is_empty());
+    }
+
+    /// A line is marked as line 1 of a part that began with a byte-order mark only when the framer
+    /// removed one there: a line at offset 3 after a dropped unfinished line of three bytes is not.
+    #[test]
+    fn the_mark_is_reported_on_line_1_when_it_was_removed_there() {
+        let flags = |f: &mut Framer, data: &[u8]| {
+            let mut got = Vec::new();
+            f.push(data, &mut |l| {
+                got.push((l.number, l.offset, l.bom));
+                true
+            });
+            got
+        };
+        let mut f = Framer::new();
+        assert_eq!(
+            flags(&mut f, b"\xef\xbb\xbfa\nb\n"),
+            vec![(1, 3, true), (2, 5, false)]
+        );
+        let mut f = Framer::new();
+        assert_eq!(flags(&mut f, b"a\n"), vec![(1, 0, false)]);
+        // Three bytes of a damaged member's last line are dropped: the next line is no line 1 of a
+        // marked part, whatever its offset.
+        let mut f = Framer::new();
+        assert!(flags(&mut f, b"abc").is_empty());
+        f.brk();
+        assert_eq!(flags(&mut f, b"k\n"), vec![(1, 3, false)]);
+        // A mark that began the dropped line goes with it.
+        let mut f = Framer::new();
+        assert!(flags(&mut f, b"\xef\xbb\xbfab").is_empty());
+        f.brk();
+        assert_eq!(flags(&mut f, b"k\n"), vec![(1, 5, false)]);
     }
 
     #[test]

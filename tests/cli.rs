@@ -958,8 +958,10 @@ fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_rea
     }
     for (name, bytes) in tiny {
         fs::write(dir.join(name), &bytes).unwrap();
+        // (the zstd one, read with a byte-order mark before `z`, because the dropped bytes of the
+        // cut member were three, and the next line then began at offset 3)
         let before = records(dir, &["keys", name]).1;
-        assert!(before.ends_with("z\n"), "{name}: {before:?}");
+        assert_eq!(before, "z\n", "{name}");
         let (code, _, err) = records(dir, &["delete", name, "k0"]);
         assert_eq!(code, 0, "{name}: {err}");
         assert_eq!(

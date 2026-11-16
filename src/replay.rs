@@ -383,7 +383,7 @@ impl Replay {
         // A loose file's line 1 begins with its byte-order mark, as TSVZ.py reads it (§5.2: the
         // data semantics of a loose file are implementation-defined); the framer drops it (§4.7).
         let marked: Vec<u8>;
-        let mark: &[u8] = if !self.format.strict && first && line.offset == 3 {
+        let mark: &[u8] = if !self.format.strict && first && line.bom {
             b"\xef\xbb\xbf"
         } else {
             b""
