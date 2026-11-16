@@ -1530,12 +1530,12 @@ pub(crate) enum LooseDelete {
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
-/// deletion, appended for each key asked, live or not, as TSVZ.py names it (without the whitespace
-/// at its end) and, where that differs, as given; one column, where a key alone is a row
-/// and no line can delete, a rewrite without the lines of the keys ([`loose::without`]); no
-/// keyed line yet, nothing, since a key alone would set one column and be a row. Only the first
-/// keyed line is read, and the whole file only at one column. A missing file is created
-/// (§20.2.2).
+/// deletion, appended for each key asked, live or not, as TSVZ.py names it (without the
+/// whitespace at its end, unless nothing is left of it) and, where that differs, as given; one
+/// column, where a key alone is a row and no line can delete, a rewrite without the lines of the
+/// keys ([`loose::without`]); no keyed line yet, nothing, since a key alone would set one column
+/// and be a row. Only the first keyed line is read, and the whole file only at one column. A
+/// missing file is created (§20.2.2).
 #[cfg(feature = "cli")]
 pub(crate) fn delete_loose(
     store: &Path,
@@ -1544,12 +1544,13 @@ pub(crate) fn delete_loose(
 ) -> Result<LooseDelete, Error> {
     // Each key as TSVZ.py reads a line's key, without the whitespace at its end, and as given:
     // tsvz-rs, which reads a key whole, deletes the row of either. A key with nothing left names
-    // no row (TSVZ.py skips such lines), and would match every blank line.
+    // no row to TSVZ.py, which skips such lines; tsvz-rs reads such a row, by its given spelling
+    // (more than one column) or, at one column, by the empty name, which takes every line whose
+    // key is only whitespace.
     use std::sync::{Arc, Mutex};
     let asked: Vec<(&str, &str)> = keys
         .iter()
         .map(|k| (k.as_str(), k.trim_end_matches(loose::py_space)))
-        .filter(|(_, name)| !name.is_empty())
         .collect();
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
@@ -1592,7 +1593,10 @@ pub(crate) fn delete_loose(
                 let tombstones: Vec<crate::write::Record> = asked
                     .iter()
                     .flat_map(|&(given, name)| {
-                        std::iter::once(name).chain((given != name).then_some(given))
+                        (!name.is_empty())
+                            .then_some(name)
+                            .into_iter()
+                            .chain((given != name).then_some(given))
                     })
                     .map(|key| crate::write::Record::Tombstone {
                         key: key.to_string(),

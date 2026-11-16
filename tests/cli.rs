@@ -491,19 +491,29 @@ fn a_loose_delete_decides_from_the_column_count_alone() {
 }
 
 #[test]
-fn a_loose_delete_names_no_blank_key_and_says_what_the_head_says_once() {
+fn a_loose_delete_writes_a_blank_key_as_given_and_says_what_the_head_says_once() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    // A key with nothing left after its whitespace names no row: it is not written at more than
-    // one column, and takes no blank line away at one.
-    fs::write(dir.join("m.tsv"), "b\t1\nc\t3\n").unwrap();
-    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", " ", "zz", "\t"]);
+    // A key of only whitespace is a row to tsvz-rs, which reads a key whole (TSVZ.py skips such
+    // a line): at more than one column its given spelling is the tombstone, and nothing is
+    // written for the name TSVZ.py would read, which is empty. A tab is no key a loose file can
+    // hold, and is refused, as in 0.1.3.
+    fs::write(dir.join("m.tsv"), "b\t1\n \t2\nc\t3\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "\t"]);
+    assert!(
+        code == 1 && err.contains("holds the delimiter"),
+        "{code} {err}"
+    );
+    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\n");
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", " ", "zz"]);
     assert_eq!(code, 0, "{err}");
-    assert!(err.contains("appended 1 tombstones"), "{err}");
-    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nzz\n");
+    assert!(err.contains("appended 2 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\n \nzz\n");
+    assert_eq!(records(dir, &["keys", "m.tsv"]).1, "b\nc\n");
+    // At one column the lines whose key is only whitespace go.
     fs::write(dir.join("o.tsv"), "a\n \nb\n").unwrap();
     assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
-    assert_eq!(file(dir, "o.tsv"), "a\n \nb\n");
+    assert_eq!(file(dir, "o.tsv"), "a\nb\n");
     // What the read of the head warns of is said once, though a file of one column is read
     // again from the start.
     let warned = |name: &str, bytes: &[u8]| {
@@ -516,6 +526,31 @@ fn a_loose_delete_names_no_blank_key_and_says_what_the_head_says_once() {
     assert_eq!(warned("w1.tsv", b"#\xff\na\nb\n"), 1);
     assert_eq!(warned("w2.tsv", b"#\xff\na\t1\n"), 1);
     assert_eq!(warned("w3.tsv", b"#\xff\n"), 1);
+}
+
+/// `popitem` until the file is empty: it ends within as many calls as there are keys, so a loop
+/// that drains a file ends. A row whose key is only whitespace is one of them.
+#[test]
+fn popitem_drains_a_loose_file_with_a_blank_key() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    for (name, text, rows) in [
+        ("m.tsv", " \t2\na\t1\nb\t3\n", 3),
+        ("o.tsv", "a\n \nb\n", 3),
+    ] {
+        fs::write(dir.join(name), text).unwrap();
+        let mut popped = Vec::new();
+        for _ in 0..rows {
+            let (code, out, err) = records(dir, &["popitem", name]);
+            assert_eq!((code, err.as_str()), (0, ""), "{name}");
+            popped.push(out);
+        }
+        popped.sort();
+        popped.dedup();
+        assert_eq!(popped.len(), rows, "{name}: each call pops another row");
+        assert_eq!(records(dir, &["popitem", name]).0, 3, "{name}: then empty");
+        assert_eq!(records(dir, &["keys", name]).1, "", "{name}");
+    }
 }
 
 #[test]
