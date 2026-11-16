@@ -298,6 +298,7 @@ fn snapshot_start(list: &[parts::Part], format: Format) -> usize {
 const SNAPSHOT_HINT: u64 = 1 << 16;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
+#[derive(Clone)]
 struct SnapshotLines {
     delimiter: u8,
     seen: usize,
@@ -334,8 +335,10 @@ impl SnapshotLines {
 /// What the members at the start of the compressed bytes `data` say: whether the part is a
 /// snapshot part, judged only from members that passed their checks, as TSVZ.py reads a part.
 /// None when those end before the verdict: with `more`, a last member that runs past `data` is
-/// only the end of what was read so far. A member cut short or corrupt before the verdict, in
-/// the middle of `data` or at the end of the part, makes it no snapshot part.
+/// only the end of what was read so far, but what it has decoded can already say "no", which
+/// stands whether the member later passes its check or not; only a "yes" waits for the check.
+/// A member cut short or corrupt before the verdict, in the middle of `data` or at the end of
+/// the part, makes it no snapshot part.
 fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
     let mut lines = SnapshotLines::new(delimiter);
     let mut framer = Framer::new();
@@ -343,7 +346,13 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
     codec::for_each_item(codec, data, &mut |item| match item {
         Item::Data(out) => framer.push(&out, &mut |l| lines.line(l)),
         // the last item when the member runs to the end of `data`; a Break follows it otherwise
-        Item::CutShort { .. } if more => {
+        Item::CutShort { out, .. } if more => {
+            let (mut ahead, mut seen) = (framer.clone(), lines.clone());
+            ahead.push(&out, &mut |l| seen.line(l));
+            if seen.verdict == Some(false) {
+                lines.verdict = seen.verdict;
+                return false;
+            }
             cut = true;
             true
         }
@@ -1474,6 +1483,25 @@ mod tests {
             out.push_str(&format!("k{i}\t{x:016x}\n"));
         }
         out
+    }
+
+    #[test]
+    fn what_a_cut_member_has_decoded_can_say_no_at_once_but_yes_waits_for_its_check() {
+        use crate::codec::encode_member;
+        use crate::name::Codec::Gzip;
+        let cut = |content: &str| {
+            let member = encode_member(Gzip, content.as_bytes()).unwrap();
+            assert!(member.len() as u64 > SNAPSHOT_HINT);
+            let start = &member[..SNAPSHOT_HINT as usize];
+            compressed_verdict(Gzip, start, b'\t', true)
+        };
+        // A first line that is not a comment, or a second that is not the marker: no part
+        // begins its member so, whether or not the member passes its check.
+        assert_eq!(cut(&noise("", 20000)), Some(false));
+        assert_eq!(cut(&noise("#h\n", 20000)), Some(false));
+        // The marker waits for the check of the member that holds it.
+        assert_eq!(cut(&noise("#_snapshot_#\n", 20000)), None);
+        assert_eq!(cut(&noise("#h\n#_snapshot_#\n", 20000)), None);
     }
 
     #[test]
