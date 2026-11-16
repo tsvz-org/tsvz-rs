@@ -738,8 +738,8 @@ fn attempt(
         },
     };
     // A one-part scrub with no room for the copy (it is how a full disk gets room back)
-    // rewrites in place without one, as TSVZ.py does, where the file system overwrites in
-    // place: the rewrite reserves its length first, so it still changes nothing when even
+    // rewrites in place without one (TSVZ.py never writes one), where the file system overwrites
+    // in place: the rewrite reserves its length first, so it still changes nothing when even
     // that does not fit. A copy-on-write one gives no such promise: refused there.
     let recovery = match write_recovery(store, &target.path, &content) {
         Ok(path) => Some(path),

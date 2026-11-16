@@ -1,13 +1,17 @@
-//! Loose files (§5.2, §20.2.4) as two readers read them: tsvz-rs by design section 5.6's rule,
-//! and TSVZ.py by its 3.39 rules (TSVZ.py `_processLine`). Both take the column count from the
-//! first keyed line ([`keyed`]), and both read a line whose cells after the key are none or all
-//! blank as a deletion ([`deletes`]), but in a one-column file, where it is a row. tsvz-rs reads
-//! every `#` line as a comment, TSVZ.py a `#_defaults_#` line as defaults for the rows after it,
-//! and only TSVZ.py strips each cell's trailing whitespace and decodes `<…>` tokens.
+//! Loose files (§5.2, §20.2.4) as two readers read them: tsvz-rs by its own rule (a loose file's
+//! data semantics are implementation-defined), and TSVZ.py by its 3.39 rules (TSVZ.py
+//! `_processLine`). Both drop the NULs at the start of a line, take the column count from the
+//! first keyed line ([`keyed`]), and read a line whose cells after the key are none or all blank
+//! as a deletion ([`deletes`]), but in a one-column file, where it is a row. Line 1 begins with
+//! its byte-order mark, which is part of its key. tsvz-rs reads every `#` line as a comment,
+//! TSVZ.py a `#_defaults_#` line as defaults for the rows after it, and only TSVZ.py strips each
+//! cell's trailing whitespace and decodes `<…>` tokens.
 //!
-//! A rewrite keeps lines as they are and in their places, and changes a line only where both
-//! readers read the result alike: [`scrub`], [`cleared`] and, in a one-column file, where no
-//! line can delete, [`without`].
+//! A rewrite keeps each line it keeps as the file has it, `\r` included, and changes what a
+//! reader reads only where both readers read the result alike: [`scrub`] (which moves a key's
+//! last line into its first line's place where that is so), [`cleared`] and, in a one-column
+//! file, where no line can delete, [`without`] (which puts a key's line in the place of a width
+//! line that goes).
 
 use std::collections::HashMap;
 #[cfg(feature = "cli")]
@@ -150,7 +154,7 @@ impl<'a> Lines<'a> {
 
 /// A compacted `lines`: comments, empty lines, superseded lines and dead keys' lines go; line 1,
 /// every `#_defaults_#` line, the lines that set the column count, and for each live key the
-/// line that places it and the one that gives its value stay, each where it was. A key's value
+/// line that places it and the one that gives its value stay. A key's value
 /// line takes the place of its first line when no `#_defaults_#` line (which changes how TSVZ.py
 /// reads a row) and no other line of the key kept lies between them, and that place is not line
 /// 1 (unless the two lines are the same) nor a line that sets the column count (unless the two

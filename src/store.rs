@@ -294,7 +294,11 @@ fn snapshot_start(list: &[parts::Part], format: Format) -> usize {
         .unwrap_or(0)
 }
 
-/// Compressed bytes of a part read first to look for the marker, doubled until it is judged.
+/// Compressed bytes of a part read first to look for the marker, doubled until it is judged. A
+/// gzip, xz or zstd member gives its first lines from its first bytes, and a first line that is
+/// no comment settles a part, so 64 KiB (a size that costs nothing to read beside opening the
+/// part) judges nearly every part; bzip2 gives nothing before a whole block (900 kB of text at
+/// most, its published block size) and takes a few doublings.
 const SNAPSHOT_HINT: u64 = 1 << 16;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
@@ -408,6 +412,8 @@ pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
         None => {
             let mut lines = SnapshotLines::new(d);
             let mut framer = Framer::new();
+            // One page at a time: a first line that is no comment settles a part from the first
+            // read, and a snapshot part's marker follows at most one comment, a long one read on.
             let mut buf = vec![0u8; 1 << 12];
             let mut first = true;
             loop {

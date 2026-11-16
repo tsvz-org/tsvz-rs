@@ -8,4 +8,4 @@ When one has to change, add the full entry to `lessons-full.md` and one line her
 same commit as the change. Never merge lines to save space; before this file passes 80 KB (what one
 Claude Code read returns, measured 2026-11-15), ask the user.
 
-- **2026-11-15 Loose files are read and rewritten by TSVZ.py's rules where the two can agree**: when you read and rewrite files another program owns, read them by its rules wherever you can, and let a rewrite keep lines in their places, changing one only where every reader reads the result alike.
+- **2026-11-15 Loose files are read and rewritten by TSVZ.py's rules where the two can agree**: when you read and rewrite files another program owns, read them by its rules wherever you can, and let a rewrite keep lines as they are, changing one only where every reader reads the result alike; decide a write from the same input its rules decide from, since a state they do not have is one your reading can get wrong.

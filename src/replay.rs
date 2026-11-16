@@ -175,8 +175,9 @@ pub struct Replay {
     /// The first committed line of the first part, when it is a comment (§19.2.3c).
     pub header: Option<String>,
     /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
-    /// set by the first data row, as TSVZ.py sets it, to the count of the defaults then active
-    /// when there are any, else to that row's written cells. None before any data row.
+    /// set by the first data row to the count of the defaults then active when there are any,
+    /// else to that row's written cells. None before any data row. (TSVZ.py sets a loose file's
+    /// from its first keyed line, a deletion included: docs/limitations.md.)
     pub width: Option<usize>,
     /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
     /// line.

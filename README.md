@@ -33,10 +33,13 @@ applies the store's `#_rotate_#`; writers keep appending throughout. A read begi
 snapshot part (§19.10); `verify` replays every part. `scrub` and `clear` refuse parts that
 declare a spec version newer than tsvz implements (§6.3).
 
-Loose files (`.tsv .csv .nsv .psv`, §20.2.4) list the keys TSVZ.py's command line lists, but
-for an unterminated last line, which tsvz-rs ignores; tsvz-rs reads `#_defaults_#` lines as
-comments and leaves cells as written. `scrub` keeps the lines TSVZ.py reads in their places, and
-`clear` the `#_defaults_#` lines ([docs/silent-choices.md](docs/silent-choices.md)).
+Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
+except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
+unterminated last line, reads `#_defaults_#` lines as comments (it fills no empty cell from
+them), and strips and decodes no key or cell. A rewrite changes no line it keeps: `scrub` keeps
+the lines TSVZ.py reads (a key's last line may take the place of its first, where nothing
+TSVZ.py reads changes), and `clear` the `#_defaults_#` lines in force
+([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
 
@@ -96,14 +99,29 @@ choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
 ## Upgrading to 0.1.4 from 0.1.3
 
-Nothing changes for strict stores (`.tsvz .csvz .nsvz .psvz`). In loose files:
+In strict stores (`.tsvz .csvz .nsvz .psvz`) a read begins at the last snapshot part (§19.10.3),
+a multi-part `scrub` writes snapshot parts that begin with `#_snapshot_#` (and makes one marked
+copy of a part a 0.1.3 scrub wrote), and a writer now refuses `#_snapshot_#` (§19.10.2; 0.1.3
+wrote it). A store with no snapshot part reads as before. Upgrade every host that scrubs the
+same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a new snapshot part each time
+(0.1.3 does not expect the marker line), and the next 0.1.4 scrub adds a marked copy of it.
+
+In loose files:
 
 - A key alone is a row when the file's first keyed line has one column; `delete`, `pop` and
-  `popitem` there rewrite the file without the key.
-- A row whose cells are all blank is a deletion, as in TSVZ.py: `tsvz set f.tsv k ''` deletes `k`,
-  and a file holding `k<TAB>` reads without `k`.
-- `scrub` keeps the file's lines in their places, `#_defaults_#` lines included, and `clear` keeps
-  the `#_defaults_#` lines.
+  `popitem` there rewrite the file without the key's lines. With more columns they append a key
+  alone for each key asked, as before.
+- A row whose cells are all blank is a deletion, as in TSVZ.py, but in a file of one column,
+  where it is a row: in any other file `tsvz set f.tsv k ''` deletes `k`, and a file holding
+  `k<TAB>` reads without `k`.
+- Line 1's byte-order mark is part of its key, as TSVZ.py reads it (`keys` lists it, where 0.1.3
+  dropped it); the NULs at the start of a line are dropped; a key that only begins with
+  `#_defaults_#` is a key.
+- `scrub` keeps each line it keeps as the file has it, `#_defaults_#` lines included, and
+  `clear` keeps the `#_defaults_#` lines in force (none in a file of one column), so that rows
+  written later read with the defaults they had.
+
+The library gains `Options::full_history`; nothing else in its documented API changes.
 
 ## License
 
