@@ -1530,7 +1530,7 @@ pub(crate) enum LooseDelete {
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
-/// deletion, appended for each key asked, live or not; one column, where a key alone is a row
+/// deletion, appended for each key asked, live or not, without the whitespace at its end; one column, where a key alone is a row
 /// and no line can delete, a rewrite without the lines of the keys ([`loose::without`]); no
 /// keyed line yet, nothing, since a key alone would set one column and be a row. Only the first
 /// keyed line is read, and the whole file only at one column. A missing file is created
@@ -1563,9 +1563,13 @@ pub(crate) fn delete_loose(
         match head.one_column() {
             None => return Ok(LooseDelete::Nothing),
             Some(false) => {
+                // Each key named without the whitespace at its end, as TSVZ.py reads a line's
+                // key, so that tsvz-rs, which does not strip it, reads the deletion alike.
                 let tombstones: Vec<crate::write::Record> = keys
                     .iter()
-                    .map(|k| crate::write::Record::Tombstone { key: k.clone() })
+                    .map(|k| crate::write::Record::Tombstone {
+                        key: k.trim_end_matches(loose::py_space).to_string(),
+                    })
                     .collect();
                 Writer::open(store)?
                     .warnings(options.warnings.clone())

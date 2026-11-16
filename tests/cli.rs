@@ -446,12 +446,15 @@ fn a_loose_delete_decides_from_the_column_count_alone() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     // More than one column: a key alone deletes, and one is appended for each key asked, live
-    // or not, as TSVZ.py appends it; its name is without the whitespace at its end.
+    // or not, as TSVZ.py appends it, but without the whitespace at its end, which TSVZ.py strips
+    // when it reads a key and tsvz-rs does not.
     fs::write(dir.join("m.tsv"), "b\t1\nc\t3\n").unwrap();
     let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "b ", "zz"]);
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("appended 2 tombstones"), "{err}");
-    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nb \nzz\n");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nb\nzz\n");
+    // tsvz-rs reads the deletion as TSVZ.py does: `b` is gone.
+    assert_eq!(records(dir, &["keys", "m.tsv"]).1, "c\n");
     // A reset of the defaults is a line there too.
     fs::write(dir.join("d.tsv"), "#_defaults_#\tX\tY\na\t1\nb\t2\n").unwrap();
     assert_eq!(records(dir, &["delete", "d.tsv", "#_defaults_#"]).0, 0);
