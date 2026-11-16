@@ -973,6 +973,38 @@ fn a_one_column_delete_that_removes_no_line_writes_and_says_nothing() {
     assert_eq!(records(dir, &["keys", "c.tsv.gz"]).1, "b\n");
 }
 
+/// A delete of a key that is not there writes nothing in a damaged compressed file either: the
+/// rewrite that would drop the key's lines has none to drop, and would only leave a copy of the
+/// damaged bytes (`.damaged-`) and replace them by the recovered lines.
+#[test]
+fn a_one_column_delete_that_removes_no_line_leaves_a_damaged_file_and_makes_no_copy() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    let mut second = gz(&"b\nc\n".repeat(20));
+    let middle = second.len() / 2;
+    second[middle] ^= 0xff;
+    let bytes = [gz("#h\na\n"), second].concat();
+    fs::write(dir.join("d.tsv.gz"), &bytes).unwrap();
+    assert!(
+        records(dir, &["keys", "d.tsv.gz"]).2.contains("corrupt"),
+        "the file is damaged"
+    );
+    let (code, _, _) = records(dir, &["delete", "d.tsv.gz", "zz"]);
+    assert_eq!(code, 0);
+    assert_eq!(fs::read(dir.join("d.tsv.gz")).unwrap(), bytes);
+    let names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["d.tsv.gz"], "no copy of the damaged part");
+    // A key that is there is deleted, and the damaged bytes are kept beside the rewrite.
+    let (code, _, err) = records(dir, &["delete", "d.tsv.gz", "a"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("damaged-"), "{err}");
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
+}
+
 #[test]
 fn clear_and_scrub_refuse_a_path_that_names_one_part() {
     let d = tempfile::tempdir().unwrap();
