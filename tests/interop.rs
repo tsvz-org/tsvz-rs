@@ -670,10 +670,10 @@ fn a_loose_delete_writes_what_tsvz_py_writes() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (dir.path().join("rs.tsv"), dir.path().join("py.tsv"));
     // More than one column, or no keyed line: a key alone for every key asked, live or not;
-    // none for a reset of the defaults it finds; nothing where no line is keyed. The bytes are
-    // TSVZ.py's, but for the whitespace at the end of a key, which tsvz-rs leaves off, since it
-    // does not strip it when it reads. Both read the file alike: tsvz-rs the keys TSVZ.py
-    // lists, and TSVZ.py the same keys after either tool's delete.
+    // a reset of the defaults is a line of its own there; nothing where no line is keyed. The
+    // bytes are TSVZ.py's, but for a key with whitespace at its end: tsvz-rs appends it also
+    // without, since it does not strip it when it reads. Both read the file alike: tsvz-rs the
+    // keys TSVZ.py lists, and TSVZ.py the same keys after either tool's delete.
     for (text, keys) in [
         ("b\t1\nc\t3\n", &["b "][..]),
         ("b\t1\nc\t3\n", &["zz", "c"]),
