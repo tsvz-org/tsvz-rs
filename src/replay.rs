@@ -176,8 +176,9 @@ pub struct Replay {
     pub header: Option<String>,
     /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
     /// set by the first data row to the count of the defaults then active when there are any,
-    /// else to that row's written cells. None before any data row. (TSVZ.py sets a loose file's
-    /// from its first keyed line, a deletion included: docs/limitations.md.)
+    /// else to that row's written cells. None before any data row. A loose file's is that of its
+    /// first keyed line ([`crate::loose::keyed`]), a deletion or a `#_defaults_#` line included,
+    /// as TSVZ.py sets it.
     pub width: Option<usize>,
     /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
     /// line.
@@ -533,8 +534,8 @@ impl Replay {
         sink.put(&key, cells, &binding);
     }
 
-    /// Set the width at the first data row, whose value fields are `rest` (none for a loose key
-    /// alone, see `width`).
+    /// Set the width at the first data row (a loose file's first keyed line), whose value fields
+    /// are `rest` (none for a loose key alone, see `width`).
     fn set_width(&mut self, rest: Option<&str>) {
         if self.width.is_none() {
             let written = rest.map_or(0, |r| {
@@ -553,6 +554,7 @@ impl Replay {
         let text = crate::loose::body(text);
         if self.one_column.is_none() && crate::loose::keyed(text, d) {
             self.one_column = Some(!text.as_bytes().contains(&d));
+            self.set_width(split_first(text, d).1);
         }
         if crate::loose::is_comment(text, d) {
             if first {
@@ -568,7 +570,6 @@ impl Replay {
             sink.delete(key);
             return;
         }
-        self.set_width(rest);
         let binding = self.binding();
         let mut cells = Cells::default();
         if let (true, Some(rest)) = (sink.wants_cells(key), rest) {
@@ -872,6 +873,26 @@ mod tests {
         // The first keyed line, a #_defaults_# line included, sets the column count.
         let (_, rows, _) = run(loose, false, b"#_defaults_#\tP\na\nb\t1\nb\t\n");
         assert!(table(&rows).is_empty());
+    }
+
+    #[test]
+    fn a_loose_files_width_is_that_of_its_first_keyed_line_a_deletion_included() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        for (text, width) in [
+            (&b"k\t\t\na\t1\n"[..], 2),
+            (b"#h\n\nk\t \nb\t2\t3\t4\n", 1),
+            (b"a\t1\nb\t2\t3\n", 1),
+            (b"#_defaults_#\tP\tQ\na\t1\n", 2),
+            (b"#h\nk\nb\t2\t3\n", 0),
+            // a blank key is no keyed line
+            (b" \t1\t2\nk\t3\n", 1),
+        ] {
+            let (r, ..) = run(loose, false, text);
+            assert_eq!(r.width, Some(width), "{:?}", String::from_utf8_lossy(text));
+        }
     }
 
     #[test]

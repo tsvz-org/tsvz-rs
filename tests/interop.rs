@@ -500,6 +500,27 @@ fn loose_files_list_the_keys_tsvz_py_lists() {
     }
 }
 
+#[test]
+fn loose_rows_are_padded_to_the_width_of_the_first_keyed_line() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.tsv");
+    // The first keyed line sets the width, a deletion's blank cells included, where the first
+    // data row is a narrower one. No row has empty cells at its end past the width, which
+    // TSVZ.py cuts and tsvz-rs keeps (docs/limitations.md).
+    for text in [
+        "k\t\t\na\t1\n",
+        "#h\nk\t \t\na\t1\nb\t2\t3\nc\t\t\tx\n",
+        "x\t\t\t\ny\t1\nz\t2\t3\n",
+        "a\t1\nb\t2\t3\nc\t4\n",
+        "#h\n\nk\t\na\t1\t2\nb\t3\n",
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let (rs, py_rows) = both(&py, "read", &file);
+        assert_eq!(rs, py_rows, "{text:?}");
+    }
+}
+
 /// Whether tsvz-rs lists the keys of `text` as TSVZ.py does: not with a bare `#_defaults_#` line
 /// (a row to TSVZ.py in a one-column file), a key with whitespace at its end, or a CR (TSVZ.py
 /// strips them, docs/limitations.md).
