@@ -1546,9 +1546,8 @@ pub(crate) fn delete_loose(
 ) -> Result<LooseDelete, Error> {
     // Each key as TSVZ.py reads a line's key, without the whitespace at its end, and as given:
     // tsvz-rs, which reads a key whole, deletes the row of either. A key with nothing left names
-    // no row to TSVZ.py, which skips such lines; tsvz-rs reads such a row, by its given spelling
-    // (more than one column) or, at one column, by the empty name, which takes every line whose
-    // key is only whitespace.
+    // no row to TSVZ.py, which skips such lines; tsvz-rs reads such a row, by its given spelling,
+    // at one column too: the line of that spelling goes, and no other.
     use std::sync::{Arc, Mutex};
     let asked: Vec<(&str, &str)> = keys
         .iter()
@@ -1624,7 +1623,11 @@ pub(crate) fn delete_loose(
         let (lines, tail) = s
             .loose_lines()
             .expect("a loose file read whole keeps its lines");
-        let gone: std::collections::HashSet<&str> = asked.iter().map(|&(_, name)| name).collect();
+        // a key is named without the whitespace at its end, one of only whitespace as given
+        let gone: std::collections::HashSet<&str> = asked
+            .iter()
+            .map(|&(given, name)| if name.is_empty() { given } else { name })
+            .collect();
         let content = match loose::without(&lines, &gone) {
             None => continue, // the file changed since its first line was read
             Some(None) => return Ok(LooseDelete::Nothing), // no line is one of the keys

@@ -289,8 +289,9 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
 }
 
 /// In a one-column file, where a key alone is a row and no line can delete: `lines` without the
-/// lines of `keys` (each without the whitespace at its end, as a line's key is for TSVZ.py), as
-/// TSVZ.py deletes there; None in any other file, where a key alone deletes, and Some(None) when
+/// lines of `keys` (each without the whitespace at its end, as a line's key is for TSVZ.py; a key
+/// of only whitespace as it is spelled, since TSVZ.py skips such lines and tsvz-rs reads each
+/// spelling as a row of its own), as TSVZ.py deletes there; None in any other file, where a key alone deletes, and Some(None) when
 /// no line is one of those, so that the file stays as it is (also a compressed one, whose bytes
 /// a rewrite would change).
 /// When the line that set the column count goes and the next keyed line has more cells, the first
@@ -306,7 +307,9 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Option<
     let n = lines.raw.len();
     let gone = |i: usize| {
         let (k, key) = kind(&lines.text[i], d, true);
-        matches!(k, Kind::Row | Kind::Odd) && keys.contains(key.trim_end_matches(py_space))
+        let name = key.trim_end_matches(py_space);
+        matches!(k, Kind::Row | Kind::Odd)
+            && keys.contains(if name.is_empty() { key } else { name })
     };
     let mut keep: Vec<bool> = (0..n).map(|i| !gone(i)).collect();
     if keep.iter().all(|&k| k) {
@@ -580,6 +583,8 @@ mod tests {
         };
         assert_eq!(gone("#h\na\nb\nc\n", &["b"]), "#h\na\nc\n");
         assert_eq!(gone("a\nb\nc\n", &["a", "c"]), "b\n");
+        // A key of only whitespace is a row of its own spelling, and goes by it alone.
+        assert_eq!(gone("a\n  \t1\n \t2\n \nb\n", &[" "]), "a\n  \t1\nb\n");
         // The line that set one column goes: the first remaining key, alone, takes its place (TSVZ.py
         // takes `c`, the first later key that holds no value, and so moves it to the front).
         assert_eq!(gone("a\nb\t1\nc\n", &["a"]), "b\nb\t1\nc\n");

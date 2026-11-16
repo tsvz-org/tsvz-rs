@@ -577,6 +577,22 @@ fn a_blank_key_is_deleted_in_a_file_with_no_keyed_line() {
     assert_eq!(file(dir, "z.tsv"), " \t5\n");
 }
 
+/// At one column too, a key of only whitespace is deleted by its own spelling: TSVZ.py skips such
+/// lines, and tsvz-rs reads each spelling as a row of its own, as a row at more than one column.
+/// A delete of one used to take every line whose key is only whitespace.
+#[test]
+fn a_one_column_delete_of_a_blank_key_takes_that_spelling_only() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("o.tsv"), "a\n  \t1\n \t2\n \nb\n").unwrap();
+    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\n  \n \nb\n");
+    assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\n  \t1\nb\n");
+    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\n  \nb\n");
+    assert_eq!(records(dir, &["delete", "o.tsv", "  "]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\nb\n");
+}
+
 /// `popitem` until the file is empty: it ends within as many calls as there are keys, so a loop
 /// that drains a file ends. A row whose key is only whitespace is one of them.
 #[test]
