@@ -606,6 +606,81 @@ fn a_loose_scrub_changes_nothing_tsvz_py_reads() {
     assert_eq!(before.0, "id\nb\na\nd\n");
 }
 
+/// A `.nsv` file is a loose file whose delimiter is NUL. Its scrub compacts it as it does the same
+/// lines in a `.tsv` (with NULs for the tabs), and changes nothing TSVZ.py reads: a line that holds
+/// a NUL once stopped it from compacting at all (0.1.4 before this), where 0.1.3 did. Lines that
+/// begin with NULs, which TSVZ.py strips, are read alike.
+#[test]
+fn a_loose_nsv_scrub_compacts_as_its_tsv_twin_does_and_changes_nothing_tsvz_py_reads() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let (tsv, nsv) = (dir.path().join("f.tsv"), dir.path().join("f.nsv"));
+    let nul = |t: &str| t.replace('\t', "\0");
+    // The `.nsv` files: the twins of the `.tsv` ones without a NUL or a line that begins with its
+    // delimiter (a `.nsv` line loses its leading NULs, an empty first cell too), and some of their own.
+    let own = [
+        "#h\0v\n\0a\0\x31\n\0\0a\0\x32\nb\0\x33\n",
+        "\0\0\n#h\0x\0y\n\0a\0\x31\0\nb\0\0\x32\n\0\0a\0\0\x33\n",
+        "#h\n\0a\n\0\0b\na\n",
+        "a\0\x31\n\0\0b\0\x32\n\0b\0\n",
+    ];
+    let mut compacted = 0;
+    let texts = LOOSE
+        .iter()
+        .chain(REWRITTEN)
+        .map(|t| t.to_string())
+        .chain((0..60).map(random_loose))
+        .filter(|t| !t.contains('\0') && !t.lines().any(|l| l.starts_with('\t')))
+        .map(|t| (nul(&t), Some(t)))
+        .chain(own.iter().map(|t| (t.to_string(), None)));
+    for (text, twin) in texts {
+        std::fs::write(&nsv, &text).unwrap();
+        let (rs, py_rows) = both(&py, "read", &nsv);
+        let rs_keys = both(&py, "keys", &nsv);
+        let scrubbed = rust(&["scrub", nsv.to_str().unwrap()], b"");
+        assert!(scrubbed.status.success(), "{text:?}");
+        let after = std::fs::read_to_string(&nsv).unwrap();
+        compacted += (after.len() < text.len()) as usize;
+        let (rs_after, py_after) = both(&py, "read", &nsv);
+        assert_eq!(py_after, py_rows, "{text:?} scrubbed to {after:?}");
+        assert_eq!(
+            rows(rs_after.as_bytes(), 0),
+            rows(rs.as_bytes(), 0),
+            "{text:?} scrubbed to {after:?}"
+        );
+        assert_eq!(both(&py, "keys", &nsv), rs_keys, "{text:?} to {after:?}");
+        if let Some(twin) = twin {
+            std::fs::write(&tsv, &twin).unwrap();
+            assert!(
+                rust(&["scrub", tsv.to_str().unwrap()], b"")
+                    .status
+                    .success()
+            );
+            assert_eq!(
+                after,
+                nul(&std::fs::read_to_string(&tsv).unwrap()),
+                "{text:?}"
+            );
+        }
+    }
+    // A one-column delete puts a key where the line that set the count went: the first cell of a
+    // line without its leading NULs, which TSVZ.py strips (a piece before the first NUL is none).
+    std::fs::write(&nsv, "0\n\n#_defaults_#\0Q\0\n\0x\n").unwrap();
+    assert!(
+        rust(&["delete", nsv.to_str().unwrap(), "0"], b"")
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&nsv).unwrap(),
+        "x\n\n#_defaults_#\0Q\0\n\0x\n"
+    );
+    assert_eq!(both(&py, "keys", &nsv), ("x\n".into(), "x\n".into()));
+    // A scrub that wrote every line back would pass all of the above: 55 of the 84 shrink
+    // (counted 2026-11-16 on the files without a NUL), 40 is well under that.
+    assert!(compacted >= 40, "only {compacted} files shrank");
+}
+
 #[test]
 fn rows_written_after_a_loose_clear_read_to_tsvz_py_as_before() {
     let py = need_tsvz_py!();

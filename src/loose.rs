@@ -106,7 +106,12 @@ fn kind(line: &str, d: u8, one: bool) -> (Kind, &str) {
     if is_comment(line, d) || key.is_empty() {
         return (Kind::Skip, "");
     }
-    if key.ends_with(py_space) || key.contains('<') || line.contains(['\0', '\r']) {
+    // A NUL is the delimiter of a `.nsv` file, no odd byte there.
+    if key.ends_with(py_space)
+        || key.contains('<')
+        || line.contains('\r')
+        || (d != 0 && line.contains('\0'))
+    {
         return (Kind::Odd, key);
     }
     let kind = if deletes(rest, d, one) {
@@ -312,7 +317,13 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Option<
             is_defaults(&lines.text[i], d) && deletes(first_field(&lines.text[i], d).1, d, false)
         };
         let stand_in = match row {
-            Some(row) => lines.raw[row].split(|&b| b == d).next(),
+            // the first cell of the line as both readers read it, without the NULs at its start
+            // (in a `.nsv` file the first piece of the raw line is empty)
+            Some(row) => {
+                let raw = &lines.raw[row];
+                let start = raw.iter().take_while(|&&b| b == 0).count();
+                raw[start..].split(|&b| b == d).next()
+            }
             None if (w + 1..n).any(|i| keep[i] && valueless(i)) => Some(DEFAULTS.as_bytes()),
             None => None,
         };
@@ -419,6 +430,31 @@ mod tests {
         }
     }
 
+    /// NUL is the delimiter of a `.nsv` file: a line that holds one is no odd line there (0.1.4's
+    /// scrub of such a file never compacted it), and is one with another delimiter.
+    #[test]
+    fn a_scrub_compacts_a_file_whose_delimiter_is_nul() {
+        let nul = |text: &str| {
+            let raw = lines(text);
+            String::from_utf8(scrub(&Lines::new(&raw, 0))).unwrap()
+        };
+        assert_eq!(
+            nul("#h\0v\n#c\na\0\x31\na\0\x32\nb\0\x33\n\nb\0\n"),
+            "#h\0v\na\0\x32\n"
+        );
+        // The NULs at a line's start are no part of it, as TSVZ.py strips them: `a` is `a`, and
+        // the last line, as the file has it, takes the first one's place.
+        assert_eq!(
+            nul("#h\0v\n\0a\0\x31\n\0\0a\0\x32\n"),
+            "#h\0v\n\0\0a\0\x32\n"
+        );
+        // With another delimiter the same bytes are odd, and only the skipped lines go.
+        assert_eq!(
+            with("#h\n#c\na\0\t1\na\t2\na\t3\n", scrub),
+            "#h\na\0\t1\na\t2\na\t3\n"
+        );
+    }
+
     /// 200,000 lines of 50,000 keys, about four lines each and far apart, as the file a scrub is
     /// for (keys written many times). A scan of the lines between each key's first and last
     /// took 55 s here in a debug build, and 1.4 s in a release build (0.1.3: 0.06 s, linear);
@@ -496,6 +532,26 @@ mod tests {
         let lines = Lines::new(&raw, 0);
         let keys: HashSet<&str> = ["a"].into();
         assert_eq!(without(&lines, &keys), Some(Some(b"b\n".to_vec())));
+    }
+
+    /// The key that takes the place of a column-count line that goes is a line's first cell
+    /// without its leading NULs, which in a `.nsv` file is not the first piece of the raw line:
+    /// an empty one there left the file with a `#_defaults_#` line of three cells for its count,
+    /// and every row after it a deletion.
+    #[test]
+    #[cfg(feature = "cli")]
+    fn the_key_that_replaces_a_width_line_is_read_without_its_leading_nuls() {
+        let raw = lines("0\n\n#_defaults_#\0Q\0\n\0x\n");
+        let keys: HashSet<&str> = ["0"].into();
+        assert_eq!(
+            without(&Lines::new(&raw, 0), &keys),
+            Some(Some(b"x\n\n#_defaults_#\0Q\0\n\0x\n".to_vec()))
+        );
+        let tabs = lines("0\n\n#_defaults_#\tQ\t\n\0x\n");
+        assert_eq!(
+            without(&Lines::new(&tabs, b'\t'), &keys),
+            Some(Some(b"x\n\n#_defaults_#\tQ\t\n\0x\n".to_vec()))
+        );
     }
 
     #[test]
