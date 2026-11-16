@@ -555,6 +555,28 @@ fn a_compressed_loose_delete_says_its_warnings_once_and_names_the_file() {
     }
 }
 
+/// A file whose only rows have a key of only whitespace has no keyed line (TSVZ.py skips them),
+/// and tsvz-rs lists them: a delete of such a key still writes it, which sets no column count, so
+/// that a `popitem` loop ends. A key that is not blank is not written there.
+#[test]
+fn a_blank_key_is_deleted_in_a_file_with_no_keyed_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    for text in [" \t5\n", "#h\n \n\x0b\t2\n"] {
+        fs::write(dir.join("n.tsv"), text).unwrap();
+        let rows = records(dir, &["len", "n.tsv"]).1;
+        let rows: usize = rows.trim().parse().unwrap();
+        for _ in 0..rows {
+            assert_eq!(records(dir, &["popitem", "n.tsv"]).0, 0, "{text:?}");
+        }
+        assert_eq!(records(dir, &["popitem", "n.tsv"]).0, 3, "{text:?}");
+        assert_eq!(records(dir, &["keys", "n.tsv"]).1, "", "{text:?}");
+    }
+    fs::write(dir.join("z.tsv"), " \t5\n").unwrap();
+    assert_eq!(records(dir, &["delete", "z.tsv", "zz"]).0, 0);
+    assert_eq!(file(dir, "z.tsv"), " \t5\n");
+}
+
 /// `popitem` until the file is empty: it ends within as many calls as there are keys, so a loop
 /// that drains a file ends. A row whose key is only whitespace is one of them.
 #[test]

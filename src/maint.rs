@@ -1533,8 +1533,9 @@ pub(crate) enum LooseDelete {
 /// whitespace at its end, unless nothing is left of it) and, where that differs, as given; one
 /// column, where a key alone is a row and no line can delete, a rewrite without the lines of the
 /// keys ([`loose::without`]); no keyed line yet, nothing, since a key alone would set one column
-/// and be a row. Only the first keyed line is read, and the whole file only at one column. A
-/// missing file is created (§20.2.2).
+/// and be a row (but a key of only whitespace, which sets none, is written as given). Only the
+/// first keyed line is read, and the whole file only at one column. A missing file is created
+/// (§20.2.2).
 #[cfg(feature = "cli")]
 pub(crate) fn delete_loose(
     store: &Path,
@@ -1582,32 +1583,33 @@ pub(crate) fn delete_loose(
                 options.warnings.iter().for_each(|f| f(w));
             }
         };
-        match head.one_column() {
-            None => {
-                say();
+        let one = head.one_column();
+        if one != Some(true) {
+            say();
+            // More than one column: a tombstone for each key. No keyed line yet: a key alone would
+            // set one column and be a row, so none, but for a key with nothing left of it, which
+            // TSVZ.py skips (it sets no column count), and tsvz-rs reads as a row, so that a
+            // `popitem` loop ends in a file that holds only such rows.
+            let all = one == Some(false);
+            let tombstones: Vec<crate::write::Record> = asked
+                .iter()
+                .flat_map(|&(given, name)| {
+                    let named = (all && !name.is_empty()).then_some(name);
+                    let as_given = (given != name && (all || name.is_empty())).then_some(given);
+                    named.into_iter().chain(as_given)
+                })
+                .map(|key| crate::write::Record::Tombstone {
+                    key: key.to_string(),
+                })
+                .collect();
+            if tombstones.is_empty() && !all {
                 return Ok(LooseDelete::Nothing);
             }
-            Some(false) => {
-                say();
-                let tombstones: Vec<crate::write::Record> = asked
-                    .iter()
-                    .flat_map(|&(given, name)| {
-                        (!name.is_empty())
-                            .then_some(name)
-                            .into_iter()
-                            .chain((given != name).then_some(given))
-                    })
-                    .map(|key| crate::write::Record::Tombstone {
-                        key: key.to_string(),
-                    })
-                    .collect();
-                Writer::open(store)?
-                    .warnings(options.warnings.clone())
-                    .delimiter(options.delimiter)
-                    .append(&tombstones)?;
-                return Ok(LooseDelete::Appended(tombstones.len()));
-            }
-            Some(true) => {}
+            Writer::open(store)?
+                .warnings(options.warnings.clone())
+                .delimiter(options.delimiter)
+                .append(&tombstones)?;
+            return Ok(LooseDelete::Appended(tombstones.len()));
         }
         let s = Store::open(store, whole(options))?;
         if s.incomplete() {
