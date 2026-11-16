@@ -419,16 +419,29 @@ fn first_member_says_no(
 fn compressed_head(
     codec: Codec,
     reader: &mut impl Read,
+    path: &Path,
     format: Format,
     warnings: Option<WarnFn>,
 ) -> Option<bool> {
-    let mut replay = Replay::new(format, false, warnings);
+    // Held: a head that gives no answer is followed by a read of the whole part, which says
+    // every warning again.
+    let held: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
+    let hold: WarnFn = {
+        let held = held.clone();
+        Arc::new(move |w: &Warning| held.lock().unwrap().push(w.clone()))
+    };
+    let mut replay = Replay::new(format, false, Some(hold));
     replay.head = true;
-    replay.begin_part(Path::new(""), true);
+    replay.begin_part(path, true);
     let mut table = Table::new(&Scope::Keys(Vec::new()), format);
     first_member_lines(codec, reader, &mut Vec::new(), &mut |l| {
         replay.line(l, &mut table)
     });
+    if replay.one_column.is_some() {
+        for w in held.lock().unwrap().iter() {
+            warnings.iter().for_each(|f| f(w));
+        }
+    }
     replay.one_column
 }
 
@@ -749,7 +762,10 @@ impl Store {
             Some(codec) => {
                 if replay.head {
                     let warnings = self.options.warnings.clone();
-                    if let Some(one) = compressed_head(codec, &mut reader, self.format, warnings) {
+                    let path = &part.path;
+                    if let Some(one) =
+                        compressed_head(codec, &mut reader, path, self.format, warnings)
+                    {
                         replay.one_column = Some(one);
                         return Ok(());
                     }

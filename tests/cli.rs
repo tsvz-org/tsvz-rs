@@ -528,6 +528,30 @@ fn a_loose_delete_writes_a_blank_key_as_given_and_says_what_the_head_says_once()
     assert_eq!(warned("w3.tsv", b"#\xff\n"), 1);
 }
 
+/// What the read of a compressed file's head says is said once, with the file's name, whether
+/// the head finds a keyed line (and the read stops there) or not (and the whole file is read).
+#[test]
+fn a_compressed_loose_delete_says_its_warnings_once_and_names_the_file() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &[u8]| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t).unwrap();
+    for (name, bytes) in [
+        ("w4.tsv.gz", gz(b"#\xff\na\t1\n")),
+        ("w5.tsv.gz", [gz(b"#\xff\n"), gz(b"a\t1\n")].concat()),
+        ("w6.tsv.gz", gz(b"#\xff\n")),
+        ("w7.tsv.gz", gz(b"#\xff\na\nb\n")),
+    ] {
+        fs::write(dir.join(name), bytes).unwrap();
+        let (code, _, err) = records(dir, &["delete", name, "zz"]);
+        assert_eq!(code, 0, "{name}: {err}");
+        assert_eq!(err.lines().count(), 1, "{name}: {err}");
+        assert!(
+            err.contains(&format!("{name}: line 1 is not valid UTF-8")),
+            "{name}: {err}"
+        );
+    }
+}
+
 /// `popitem` until the file is empty: it ends within as many calls as there are keys, so a loop
 /// that drains a file ends. A row whose key is only whitespace is one of them.
 #[test]
