@@ -137,6 +137,12 @@ impl<'a> Lines<'a> {
         out
     }
 
+    /// How many lines there are.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.raw.len()
+    }
+
     fn fields(&self, i: usize) -> usize {
         memchr::memchr_iter(self.d, self.text[i].as_bytes()).count()
     }

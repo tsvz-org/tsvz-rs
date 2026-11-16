@@ -1000,11 +1000,11 @@ impl Store {
         replay.begin_part(&path, last == self.start && offset == 0);
         framer.push(&data, &mut |l| replay.line(l, table));
         let committed = (framer.committed() - offset) as usize;
-        if self.replay.stopped.is_none()
-            && !framer.tail().is_empty()
-            && framer.tail() != self.follow.tail.as_slice()
-        {
-            self.replay.tail(framer.tail().len());
+        if self.replay.stopped.is_none() {
+            if !framer.tail().is_empty() && framer.tail() != self.follow.tail.as_slice() {
+                self.replay.tail(framer.tail().len());
+            }
+            // Also an empty tail: an append that completes the last line leaves none.
             if self.replay.lines.is_some() {
                 self.tail = framer.tail().to_vec();
             }
@@ -1550,6 +1550,25 @@ mod tests {
         write(dir.path(), "missing", b"z\t9\n");
         assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
         assert_eq!(keys(&s), ["b"]);
+    }
+
+    #[test]
+    fn a_follow_that_completes_a_loose_files_last_line_leaves_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsv", b"a\t1\nb\t2");
+        let options = Options {
+            lines: true,
+            ..Options::default()
+        };
+        let mut s = Store::open(&p, options).unwrap();
+        assert_eq!(s.loose_lines().unwrap().1, b"b\t2");
+        append(&p, b"\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        let (lines, tail) = s.loose_lines().unwrap();
+        assert_eq!((lines.len(), tail), (2, &b""[..]));
+        append(&p, b"c\t3");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(s.loose_lines().unwrap().1, b"c\t3");
     }
 
     #[test]
