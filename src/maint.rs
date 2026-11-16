@@ -1516,26 +1516,65 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
     )))
 }
 
-/// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`):
-/// a key alone for each live one, appended, as TSVZ.py writes it; in a one-column file, where a
-/// key alone is a row (to TSVZ.py too) and no line can delete, a rewrite without their lines
-/// ([`loose::without`]). A key that is not live is not written: in a file with no keyed line yet
-/// it would set one column, and be a row. A missing file is created (§20.2.2).
+/// What a loose delete did.
+#[cfg(feature = "cli")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LooseDelete {
+    /// A key alone, appended for each key asked.
+    Appended,
+    /// The file rewritten without the lines of the keys asked.
+    Rewrote,
+    /// Nothing written.
+    Nothing,
+}
+
+/// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
+/// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
+/// deletion, appended for each key asked, live or not; one column, where a key alone is a row
+/// and no line can delete, a rewrite without the lines of the keys ([`loose::without`]); no
+/// keyed line yet, nothing, since a key alone would set one column and be a row. Only the first
+/// keyed line is read, and the whole file only at one column. A missing file is created
+/// (§20.2.2).
 #[cfg(feature = "cli")]
 pub(crate) fn delete_loose(
     store: &Path,
     options: &Options,
     keys: &[String],
-) -> Result<Outcome, Error> {
+) -> Result<LooseDelete, Error> {
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
             Writer::open(store)?
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
                 .append(&[])?;
-            return Ok(Outcome::Written);
+            return Ok(LooseDelete::Nothing);
         };
         let before = stamp(&part.path)?;
+        let head = Store::open(
+            store,
+            Options {
+                scope: Scope::KeysOnly,
+                verify: false,
+                skip_unreadable: false,
+                head: true,
+                ..options.clone()
+            },
+        )?;
+        match head.one_column() {
+            None => return Ok(LooseDelete::Nothing),
+            Some(false) => {
+                let tombstones: Vec<crate::write::Record> = keys
+                    .iter()
+                    .map(|k| crate::write::Record::Tombstone { key: k.clone() })
+                    .collect();
+                Writer::open(store)?
+                    .warnings(options.warnings.clone())
+                    .delimiter(options.delimiter)
+                    .append(&tombstones)?;
+                return Ok(LooseDelete::Appended);
+            }
+            Some(true) => {}
+        }
         let s = Store::open(store, whole(options))?;
         if s.incomplete() {
             return Err(Error::Refused(format!(
@@ -1543,28 +1582,16 @@ pub(crate) fn delete_loose(
                 store.display()
             )));
         }
-        let mut live: Vec<&str> = Vec::new();
-        for key in keys {
-            if s.get(key).is_some() && !live.contains(&key.as_str()) {
-                live.push(key);
-            }
-        }
-        if live.is_empty() {
-            return Ok(Outcome::Unchanged);
-        }
         let (lines, tail) = s
             .loose_lines()
             .expect("a loose file read whole keeps its lines");
-        let Some(content) = loose::without(&lines, &live.iter().copied().collect()) else {
-            let tombstones: Vec<crate::write::Record> = live
-                .iter()
-                .map(|k| crate::write::Record::Tombstone { key: k.to_string() })
-                .collect();
-            Writer::open(store)?
-                .warnings(options.warnings.clone())
-                .delimiter(options.delimiter)
-                .append(&tombstones)?;
-            return Ok(Outcome::Written);
+        // TSVZ.py names a key without the whitespace at its end.
+        let gone: std::collections::HashSet<&str> = keys
+            .iter()
+            .map(|k| k.trim_end_matches(loose::py_space))
+            .collect();
+        let Some(content) = loose::without(&lines, &gone) else {
+            continue; // the file changed since its first line was read
         };
         if s.damaged() {
             backup(&part.path, options)?;
@@ -1579,7 +1606,7 @@ pub(crate) fn delete_loose(
             None,
         )? {
             None => continue, // another writer committed after the read
-            Some(_) => return Ok(Outcome::Written),
+            Some(_) => return Ok(LooseDelete::Rewrote),
         }
     }
     Err(Error::Refused(format!(

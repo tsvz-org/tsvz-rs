@@ -434,11 +434,52 @@ fn a_one_column_loose_file_holds_keys_alone() {
     assert_eq!(records(dir, &["set", "hosts.tsv", "h4"]).0, 0);
     assert_eq!(records(dir, &["scrub", "hosts.tsv"]).0, 0);
     assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\nh4\n");
-    // A delete writes nothing for a key that is not there: in a file with no keyed line yet,
-    // a key alone would make it one column, and a row.
+    // A missing file is made, and holds nothing: in a file with no keyed line yet, a key alone
+    // would make it one column, and a row.
     assert_eq!(records(dir, &["delete", "new.tsv", "k"]).0, 0);
     assert_eq!(file(dir, "new.tsv"), "");
     assert_eq!(records(dir, &["keys", "new.tsv"]).1, "");
+}
+
+#[test]
+fn a_loose_delete_decides_from_the_column_count_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // More than one column: a key alone deletes, and one is appended for each key asked, live
+    // or not, as TSVZ.py appends it; its name is without the whitespace at its end.
+    fs::write(dir.join("m.tsv"), "b\t1\nc\t3\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "b ", "zz"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("appended 2 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nb \nzz\n");
+    // A reset of the defaults is a line there too.
+    fs::write(dir.join("d.tsv"), "#_defaults_#\tX\tY\na\t1\nb\t2\n").unwrap();
+    assert_eq!(records(dir, &["delete", "d.tsv", "#_defaults_#"]).0, 0);
+    assert_eq!(
+        file(dir, "d.tsv"),
+        "#_defaults_#\tX\tY\na\t1\nb\t2\n#_defaults_#\n"
+    );
+    // pop and popitem delete the same way.
+    fs::write(dir.join("p.tsv"), "a\t1\nb\t2\n").unwrap();
+    assert_eq!(records(dir, &["pop", "p.tsv", "a"]).1, "a\t1\n");
+    assert_eq!(records(dir, &["popitem", "p.tsv"]).1, "b\t2\n");
+    assert_eq!(file(dir, "p.tsv"), "a\t1\nb\t2\na\nb\n");
+    // No keyed line yet: nothing is written, and an empty file stays empty.
+    for (name, text) in [("e.tsv", ""), ("c.tsv", "#h\n\n#c\n")] {
+        fs::write(dir.join(name), text).unwrap();
+        assert_eq!(records(dir, &["delete", name, "k", "#_defaults_#"]).0, 0);
+        assert_eq!(file(dir, name), text);
+    }
+    // One column: the lines of the keys go, whether or not the key as given has whitespace at
+    // its end; a key that is not there changes nothing.
+    fs::write(dir.join("o.tsv"), "#h\na\nb \nc\nb\n").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", "zz"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nb \nc\nb\n");
+    assert_eq!(records(dir, &["delete", "o.tsv", "b\t"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
+    // A reset of the defaults there would be a row, to TSVZ.py too: none is written.
+    assert_eq!(records(dir, &["delete", "o.tsv", "#_defaults_#"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
 }
 
 #[test]

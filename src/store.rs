@@ -51,6 +51,9 @@ pub struct Options {
     pub full_history: bool,
     /// Keep a loose file's lines, for a rewrite that keeps them ([`crate::loose`]).
     pub(crate) lines: bool,
+    /// Read a loose file only as far as its first keyed line, which sets its column count
+    /// ([`Store::one_column`]).
+    pub(crate) head: bool,
 }
 
 /// One part as `parts` lists it (§20.2).
@@ -560,6 +563,7 @@ impl Store {
         if options.lines && !format.strict {
             replay.lines = Some(Vec::new());
         }
+        replay.head = options.head && !format.strict;
         let mut store = Store {
             replay,
             tail: Vec::new(),
@@ -894,6 +898,11 @@ impl Store {
 
     pub fn header(&self) -> Option<&str> {
         self.replay.header.as_deref()
+    }
+
+    /// Whether a loose file's column count is one; None before its first keyed line.
+    pub(crate) fn one_column(&self) -> Option<bool> {
+        self.replay.one_column
     }
 
     pub fn parts(&self) -> &[PartInfo] {

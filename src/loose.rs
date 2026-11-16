@@ -17,7 +17,7 @@ const DEFAULTS: &str = "#_defaults_#";
 const BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// Whether `c` is whitespace to Python's `str.rstrip()`, which TSVZ.py applies to every cell.
-fn py_space(c: char) -> bool {
+pub(crate) fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 
@@ -229,7 +229,8 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
 }
 
 /// In a one-column file, where a key alone is a row and no line can delete: `lines` without the
-/// lines of `keys`, as TSVZ.py deletes there; None in any other file, where a key alone deletes.
+/// lines of `keys` (each without the whitespace at its end, as a line's key is for TSVZ.py), as
+/// TSVZ.py deletes there; None in any other file, where a key alone deletes.
 /// When the line that set the column count goes and the next keyed line has more cells, the first
 /// remaining key, alone, takes its place, so that the file keeps one column, as in TSVZ.py.
 #[cfg(feature = "cli")]
@@ -241,7 +242,7 @@ pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Vec<u8>
     let n = lines.raw.len();
     let gone = |i: usize| {
         let (k, key) = kind(&lines.text[i], d, true);
-        matches!(k, Kind::Row | Kind::Odd) && keys.contains(key)
+        matches!(k, Kind::Row | Kind::Odd) && keys.contains(key.trim_end_matches(py_space))
     };
     let mut keep: Vec<bool> = (0..n).map(|i| !gone(i)).collect();
     let mut put = vec![None; n];

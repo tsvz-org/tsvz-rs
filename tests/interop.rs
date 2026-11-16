@@ -546,3 +546,68 @@ fn a_delete_in_a_one_column_loose_file_reads_alike() {
         );
     }
 }
+
+/// Keys of the loose file `file` as TSVZ.py lists them, sorted (a delete may move a key).
+fn py_keys_sorted(py: &Path, file: &Path) -> Vec<String> {
+    let (_, keys) = both(py, "keys", file);
+    let mut keys: Vec<String> = keys.lines().map(str::to_string).collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn a_loose_delete_writes_what_tsvz_py_writes() {
+    let py = need_tsvz_py!();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("rs.tsv"), dir.path().join("py.tsv"));
+    // More than one column, or no keyed line: the same bytes. A key alone for every key asked,
+    // live or not, without the whitespace at its end; none for a reset of the defaults it
+    // finds; nothing where no line is keyed.
+    for (text, keys) in [
+        ("b\t1\nc\t3\n", &["b "][..]),
+        ("b\t1\nc\t3\n", &["zz", "c"]),
+        ("#_defaults_#\tX\tY\na\t1\nb\t2\n", &["#_defaults_#", "a"]),
+        ("#_defaults_#\tX\tY\na\t1\nb\t2\n", &["#_defaults_#x"]),
+        ("#h\n\n#c\n", &["k"]),
+        ("a\t\nb\n", &["a"]),
+    ] {
+        for f in [&a, &b] {
+            std::fs::write(f, text).unwrap();
+        }
+        let mut args = vec!["delete", a.to_str().unwrap()];
+        args.extend_from_slice(keys);
+        assert!(rust(&args, b"").status.success(), "{text:?} {keys:?}");
+        args[1] = b.to_str().unwrap();
+        assert!(python(&py, &args, b"").status.success());
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "{text:?} {keys:?}"
+        );
+    }
+    // One column: the same keys, in whatever order (TSVZ.py may move one first), whether or
+    // not the key as given has whitespace at its end.
+    for (text, keys) in [
+        ("a\nb\nc\n", &["b"][..]),
+        ("#h\na\nb \nc\nb\n", &["b"]),
+        ("#h\na\nb\nc\nb\n", &["b\t", "zz"]),
+        ("a\nb\t1\nc\n", &["a"]),
+        ("a\n#_defaults_#\tP\nb\nc\n", &["a", "c"]),
+    ] {
+        for f in [&a, &b] {
+            std::fs::write(f, text).unwrap();
+        }
+        let mut args = vec!["delete", a.to_str().unwrap()];
+        args.extend_from_slice(keys);
+        assert!(rust(&args, b"").status.success(), "{text:?} {keys:?}");
+        args[1] = b.to_str().unwrap();
+        assert!(python(&py, &args, b"").status.success());
+        assert_eq!(
+            py_keys_sorted(&py, &a),
+            py_keys_sorted(&py, &b),
+            "{text:?} {keys:?}: {:?} against {:?}",
+            std::fs::read_to_string(&a).unwrap(),
+            std::fs::read_to_string(&b).unwrap()
+        );
+    }
+}

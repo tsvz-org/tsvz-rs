@@ -86,8 +86,10 @@ pub(crate) fn delete(ctx: &mut Ctx) -> Result<i32, Error> {
 /// Delete `keys` from a loose file (`maint::delete_loose`).
 fn delete_loose(ctx: &Ctx, keys: &[String]) -> Result<(), Error> {
     let options = ctx.options(Scope::All, false);
-    if maint::delete_loose(&ctx.store, &options, keys)? == maint::Outcome::Written {
-        ctx.info(&format!("deleted {} keys", keys.len()));
+    match maint::delete_loose(&ctx.store, &options, keys)? {
+        maint::LooseDelete::Appended => ctx.info(&format!("appended {} tombstones", keys.len())),
+        maint::LooseDelete::Rewrote => ctx.info("rewrote the file without the lines of those keys"),
+        maint::LooseDelete::Nothing => {}
     }
     Ok(())
 }

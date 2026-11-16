@@ -184,6 +184,8 @@ pub struct Replay {
     /// A loose file's committed lines, without their `\n`, kept for a rewrite that keeps them
     /// ([`crate::loose`]); None unless asked for.
     pub lines: Option<Vec<Vec<u8>>>,
+    /// Stop reading a loose file at its first keyed line.
+    pub(crate) head: bool,
     /// Whether a loose file began with a byte-order mark, which the framer drops (§4.7) and
     /// TSVZ.py reads as part of line 1.
     pub bom: bool,
@@ -306,6 +308,7 @@ impl Replay {
             width: None,
             one_column: None,
             lines: None,
+            head: false,
             bom: false,
             first_line: false,
             part: PathBuf::new(),
@@ -393,6 +396,7 @@ impl Replay {
                 lines.push(body.to_vec());
             }
             self.loose_line(&text, first, sink);
+            return !(self.head && self.one_column.is_some());
         }
         true
     }
