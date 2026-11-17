@@ -205,9 +205,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `setdefault`) says `ignoring the pointer file ...: Permission denied (os error 13); using the files directly` and
   works on the files, as `--x-direct` does. `verify` and `parts` never look for a handler and work on the files.
   `tsvz stop` fails with the same `Permission denied`, so the handler has to be stopped by a signal. A second
-  `tsvz serve` is refused (the message depends on the error cifs gives for the conflicting lock, which was not
-  measured). `tsvz::handler::Client::connect` finds no handler either. A client given the socket's address itself
-  still reaches the handler. Measured: `get` beside an idle handler.
+  `tsvz serve` is refused (`cannot take the pointer file ... Permission denied`, or `already served`, by the error
+  cifs gives for the conflicting lock, which was not measured). `tsvz::handler::Client::connect` finds no handler
+  either. A client given the socket's address itself still reaches the handler. Measured on cifs: `get` beside an
+  idle handler; the other commands were run with the pointer file's mode set to 000, which gives the same error.
 - Why: the handler holds its pointer file with `flock`, as TSVZ.py's does, and cifs turns that into a mandatory SMB
   byte-range lock, so another process's read of the file fails with EACCES. Found by the 0.1.4 measurements on a
   loopback SMB share (2026-11-17).
@@ -270,7 +271,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   before it ends, but its connection is cut before the row reaches the client: the row is gone from the store, the
   command exits 1 with `may or may not have been applied`, and nobody has the row. From reading; to be reproduced
   first. 0.1.4 drains the same way.
-- Why: `finish_connections` gives requests already received `FINISH` (5 s) and then ends every connection still open;
+- Why: `finish_connections` gives requests already read `FINISH` (5 s) and then ends every connection still open;
   a pop is the one request whose answer is the data.
 - Revisit when: 0.2.1. The plan: reproduce with a stalled sync; then wait without a limit for a request whose batch
   is being written, keeping the five seconds for a client that does not read its answer.

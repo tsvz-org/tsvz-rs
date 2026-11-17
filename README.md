@@ -115,8 +115,9 @@ and `Writer::append_runs_at` is now `append_at`.
 - A command that reaches a handler as it stops no longer gets `the handler is stopping`: the
   handler closes the connection, so `read`, `get`, `has`, `len` and `keys` run on the files and
   succeed (before, they exited 1), and any other command exits 1 saying the request may or may
-  not have been applied. A request the handler had already received when the stop began is
-  still served and answered, for up to 5 s.
+  not have been applied. A request the handler had already read when the stop began is
+  still served and answered, for up to 5 s; a command that comes once it has closed its socket
+  works on the files, with a warning, as before.
 - A compressed batch that sets `#_member_size_#` is written at the member size in force where
   it started. A handler applies the new size from its next batch, and so do `pop`, `popitem`
   and `setdefault` on the files; `set`, `append` and `delete` on the files write at 1 MiB, as

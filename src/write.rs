@@ -385,8 +385,9 @@ impl Writer {
                 missing = None;
                 continue;
             }
-            // The warning of a cut tail is sent once the lock is let go, whatever else happened: a
-            // callback that opens this part would otherwise release a classic lock (docs/limitations.md).
+            // The warning of a cut tail is sent once the lock is let go, whatever else happened:
+            // a callback that opens this part would otherwise release a classic lock
+            // (docs/limitations.md).
             let mut cut = None;
             let locked = (|| {
                 let before = stamp(&file).map_err(io)?;

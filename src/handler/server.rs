@@ -328,9 +328,11 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
 const FINISH: Duration = Duration::from_secs(5);
 
 /// End the open connections as a stop does: no request sent from now on is read; the ones
-/// already received finish and are answered (a pop in flight has written its tombstone: its
-/// row must reach its client); then each connection ends when it reads its next line. A
-/// connection still open after [`FINISH`] (a client not reading its answer) is cut off.
+/// already read finish and are answered (a pop in flight has written its tombstone: its row
+/// must reach its client), and on Linux so do those already queued on the connection, which
+/// the shutdown leaves readable (macOS drops them); then each connection ends when it reads
+/// its next line. A connection still open after [`FINISH`] (a client not reading its answer)
+/// is cut off.
 fn finish_connections(shared: &Shared) {
     for conn in lock(&shared.open).values() {
         let _ = conn.shutdown(std::net::Shutdown::Read);

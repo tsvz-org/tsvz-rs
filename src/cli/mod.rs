@@ -74,8 +74,9 @@ exit status: 0 done, 1 failed or refused, 2 usage error, 3 missing key, 4 checks
 /// SIGPIPE ignored while this lives, so that writing to a closed pipe or socket fails instead of
 /// ending the process; its default action is restored after. `main` leaves the default for the
 /// standard output, which should end the process quietly; every write to a handler's socket runs
-/// under this, because std passes `MSG_NOSIGNAL` to a Unix socket's writes only from Rust 1.90
-/// and the crate builds with 1.85.
+/// under this, because std passes `MSG_NOSIGNAL` to a Unix socket's writes only on Linux and only
+/// from Rust 1.90 (a write to a closed socket ends a Mac's process with Rust 1.100 too), and the
+/// crate builds with 1.85.
 struct NoSigpipe;
 
 impl NoSigpipe {

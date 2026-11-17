@@ -77,10 +77,10 @@ entries go last, in the same commit as the change:
   once it is stopping, or whose request comes after the stop) as TSVZ.py's does, instead of answering
   them "the handler is stopping"; the refusal and its five limits (128 clients, 1 s, 200 ms, 16 reads,
   64 KiB) go. A routed read that meets a stop now runs on the files and succeeds (before, it exited 1); a
-  write exits 1 saying it may or may not have been applied. A request already received when the stop began
+  write exits 1 saying it may or may not have been applied. A request already read when the stop began
   is still served and answered, for up to 5 s. The command line holds SIGPIPE off around its writes to a
-  handler's socket, since std passes `MSG_NOSIGNAL` to a Unix socket's writes only from Rust 1.90 (the
-  crate builds from 1.85).
+  handler's socket, since std passes `MSG_NOSIGNAL` to a Unix socket's writes only on Linux and only from
+  Rust 1.90 (a write to a closed socket ends a Mac's process with Rust 1.100 too); the crate builds from 1.85.
 - Why we had to change: the command line redoes a read on the files when the connection is lost during the
   request (and runs every command there when none can be made), but not when the handler answers that it
   is stopping, so the refusal made routed reads fail during a stop; the refusal cost about 50 code and 80
