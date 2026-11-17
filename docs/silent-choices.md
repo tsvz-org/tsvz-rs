@@ -29,7 +29,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | `clear` of one part | Header comment and markers, without `#_version_#` | `_specClearTabularFile` |
 | A path that names one part (`s.tsvz.1`, §20.1.3) | `clear` and `scrub` refuse it, exit 1, nothing written; other operations treat it as a store of its own | `_specClearTabularFile`, `_specScrub` |
 | Space for an in-place rewrite | Reserved first with `posix_fallocate` on Linux (§19.8's SHOULD); if a write still fails, the whole old part is put back, and if that fails too the error says the part is damaged. macOS has the restore only | `_specRewriteInPlace` |
-| A damaged part before a rewrite | Copied to `<part>.damaged-<YYYYmmddTHHMMSS>` (`.1`, `.2`, … when taken) and synced | `_specBackupPart` |
+| A damaged part before a rewrite | Copied to `<part>.damaged-<YYYYmmddTHHMMSS>` (`.1`, `.2`, … when taken) and synced; a scrub tried again because a writer appended meanwhile keeps every copy it made, each named in its warnings | `_specBackupPart` |
 | The backup copy's permissions | The part's read bits plus owner write (`mode & 0o644`, less the umask), so a private store's copy stays private and never carries setuid, setgid or execute bits; the part's owner and group where allowed, else, left in another group, no group bits | `_specBackupPart`, `_matchOwner` |
 | A gzip member header | Parsed a byte at a time with no length cap, as zlib accepts it | `zlib.decompressobj(31)` |
 | xz and lzma decoder memory | At most 1 GiB; a member whose header demands more (a legacy `.lzma` header can declare a 4 GiB dictionary) is judged corrupt. TSVZ.py's `lzma` has no limit | `lzma.LZMADecompressor()` |

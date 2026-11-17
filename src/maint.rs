@@ -592,8 +592,8 @@ fn metas(parts: &[parts::Part]) -> Result<Vec<std::fs::Metadata>, Error> {
         .collect()
 }
 
-/// One attempt of [`scrub`]; `backed_up` is the copy of a damaged part made by an attempt,
-/// and `told` whether the in-place warning was given.
+/// One attempt of [`scrub`]; `backed_up` holds the copies of a damaged part the attempts made,
+/// each kept (TSVZ.py keeps every one), and `told` whether the in-place warning was given.
 fn attempt(
     store: &Path,
     options: &Options,
@@ -702,15 +702,8 @@ fn attempt(
     if s.damaged() || s.stopped().is_some() {
         copy = match backed_up.last() {
             Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
-            last => {
+            _ => {
                 let path = read!(backup(&target.path, options), Step::Again);
-                // A copy of the part as it was before (appends since) holds nothing more.
-                if let Some((_, old)) = last {
-                    if starts_with_file(&path, old) {
-                        let _ = std::fs::remove_file(old);
-                        backed_up.pop();
-                    }
-                }
                 backed_up.push((before[before.len() - 1], path.clone()));
                 Some(path)
             }
@@ -835,26 +828,6 @@ fn attempt(
 /// The metadata of `path`.
 fn stamp_meta(path: &Path) -> Result<std::fs::Metadata, Error> {
     std::fs::metadata(path).map_err(|e| Error::io(path, e))
-}
-
-/// Whether the file `whole` begins with the bytes of the file `start` (an older copy of a part
-/// that was only appended to since).
-fn starts_with_file(whole: &Path, start: &Path) -> bool {
-    use std::io::Read;
-    let (Ok(mut a), Ok(mut b)) = (File::open(whole), File::open(start)) else {
-        return false;
-    };
-    let (mut x, mut y) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
-    loop {
-        let n = match b.read(&mut y) {
-            Ok(0) => return true,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        if a.read_exact(&mut x[..n]).is_err() || x[..n] != y[..n] {
-            return false;
-        }
-    }
 }
 
 /// Write the snapshot of `prefix` (read whole as `s`) as the new part `ordinal`, between it and
@@ -2040,17 +2013,6 @@ mod tests {
         let like = fs::metadata(&theirs).unwrap();
         assert!(new_snapshot(&theirs, &like).is_err());
         assert_eq!(fs::read(&theirs).unwrap(), b"another scrub's\n");
-    }
-
-    #[test]
-    fn a_copy_of_a_part_appended_to_since_holds_nothing_more() {
-        let dir = tempfile::tempdir().unwrap();
-        let (old, new) = (dir.path().join("old"), dir.path().join("new"));
-        fs::write(&old, "a\t1\n\0\0").unwrap();
-        fs::write(&new, "a\t1\n\0\0b\t2\n").unwrap();
-        assert!(starts_with_file(&new, &old));
-        fs::write(&new, "c\t3\n").unwrap(); // rewritten in place, not appended to
-        assert!(!starts_with_file(&new, &old));
     }
 
     #[test]
