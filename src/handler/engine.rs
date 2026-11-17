@@ -8,13 +8,13 @@
 //! are waited for outside it.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::handler::protocol::{Request, Response};
-use crate::lock::Handle;
 use crate::maint::{self, Outcome};
 use crate::name::{self, Format};
 use crate::ops::{self, Out, Plan};
@@ -58,7 +58,7 @@ struct Queue {
     foreign: u64,
     /// Each part a batch was appended to without an fsync since, by path and inode, with the
     /// file it was appended through.
-    unsynced: Vec<(PathBuf, u64, Handle)>,
+    unsynced: Vec<(PathBuf, u64, File)>,
     /// A sync of a part left behind that failed, until a flush reports it.
     sync_error: Option<String>,
     /// Syncs of parts left behind under way, which a flush waits for.
@@ -213,7 +213,7 @@ impl Batcher {
                         q.foreign += 1;
                     }
                     let (part, ino) = (appended.part.clone(), appended.after.ino);
-                    let listed = |(p, i, _): &(PathBuf, u64, Handle)| *p == part && *i == ino;
+                    let listed = |(p, i, _): &(PathBuf, u64, File)| *p == part && *i == ino;
                     // Parts other than this one get no more of our batches: they are synced
                     // and let go below, so that open files do not pile up until stop.
                     let (this, others): (Vec<_>, Vec<_>) = std::mem::take(&mut q.unsynced)
@@ -284,7 +284,7 @@ impl Batcher {
 }
 
 /// Fsync each of `files`; the first error, once every one was tried.
-fn sync(files: &[(PathBuf, u64, Handle)]) -> Result<(), Error> {
+fn sync(files: &[(PathBuf, u64, File)]) -> Result<(), Error> {
     let mut first = Ok(());
     for (part, _, file) in files {
         if let Err(e) = file.sync_data() {
@@ -1038,7 +1038,7 @@ mod tests {
         // Markers queued but not yet written (the writer waits for the lock) govern what follows.
         e.batcher.barrier(); // written, so that the writer next takes the entry below alone
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock(&file, &p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
         submit(&marker("#_WRITE_ACK_#", "Memory"));
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
@@ -1073,7 +1073,7 @@ mod tests {
             values: vec!["v".into()],
         };
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock(&file, &p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
         submit(&[row("blocker".into())]); // the writer takes it, then waits for the lock
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1111,32 +1111,6 @@ mod tests {
         // The blocker; the 200 rows and the 64 marker; the x row with the empty marker; then
         // the y and z rows, together again.
         assert_eq!(members, [1, 201, 2, 2]);
-    }
-
-    #[test]
-    fn a_follow_while_the_writer_holds_a_classic_lock_keeps_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("s.tsvz");
-        fs::write(&p, "a\t1\n").unwrap();
-        let e = engine(dir.path(), "s.tsvz");
-        append(&p, b"b\t2\n"); // another writer: the next submit follows the files
-        // The writer thread mid-append, under a classic POSIX lock (macOS).
-        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock_classic(&file, &p).unwrap();
-        let mut st = lock(&e.state);
-        let row = Record::Data {
-            key: "c".into(),
-            values: vec!["3".into()],
-        };
-        e.submit(&mut st, Instant::now(), &[row], false, None, false)
-            .unwrap();
-        drop(st);
-        assert!(
-            crate::lock::locked_elsewhere(&p),
-            "the follow's descriptor took the writer's lock with it"
-        );
-        drop(held);
-        assert_eq!(ask(&e, "keys").lines, ["a", "b", "c"]);
     }
 
     #[test]
@@ -1202,7 +1176,7 @@ mod tests {
         e.batcher.barrier();
         assert!(!submit(&data("y")).waited);
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock(&file, &p).unwrap(); // y waits for the lock
+        let held = crate::lock::lock(&file).unwrap(); // y waits for the lock
         assert!(!submit(&data("z")).waited);
         (&file).write_all(b"#_write_ack_#\tdisk\n").unwrap(); // before y is written
         drop(held);

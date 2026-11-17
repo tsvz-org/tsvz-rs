@@ -226,14 +226,16 @@ pub struct Appended {
     pub part: PathBuf,
     pub before: parts::Stamp,
     pub after: parts::Stamp,
-    pub file: lock::Handle,
+    pub file: File,
 }
 
-/// Whether `path` still names the file `file` was opened as.
-fn names(path: &Path, file: &lock::Handle) -> bool {
+/// Whether `path` still names the file `file` is open on.
+fn names(path: &Path, file: &File) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let opened = file.opened();
-    std::fs::metadata(path).is_ok_and(|m| m.dev() == opened.dev() && m.ino() == opened.ino())
+    let (Ok(open), Ok(named)) = (file.metadata(), std::fs::metadata(path)) else {
+        return false;
+    };
+    named.dev() == open.dev() && named.ino() == open.ino()
 }
 
 fn stamp(file: &File) -> io::Result<parts::Stamp> {
@@ -242,10 +244,10 @@ fn stamp(file: &File) -> io::Result<parts::Stamp> {
 
 /// Appends batches of records to a store's active part (§17.7).
 ///
-/// Each append holds the write lock shared with TSVZ.py: where only a classic POSIX lock is
-/// available (macOS, and Linux without open file description locks), closing another
-/// descriptor of the part in this process releases it. A program that appends with a `Writer`
-/// should not open the store's parts by other means meanwhile.
+/// Each append holds the write lock shared with TSVZ.py (an open file description lock on
+/// Linux, `flock` on macOS). Where the kernel or file system refuses it, the lock is a classic
+/// POSIX lock, which closing any other descriptor of the part in this process releases
+/// (docs/limitations.md).
 pub struct Writer {
     store: PathBuf,
     format: Format,
@@ -385,7 +387,7 @@ impl Writer {
                 .append(true)
                 .create(create)
                 .read(part.codec.is_none());
-            let file = match lock::Handle::open(path, &options) {
+            let file = match options.open(path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !create => {
                     let e = io(e);
@@ -397,7 +399,7 @@ impl Writer {
                 }
                 Err(e) => return Err(io(e)),
             };
-            let guard = lock::lock(&file, path).map_err(io)?;
+            let guard = lock::lock(&file).map_err(io)?;
             // Still the active part: the directory kept its timestamp, and shows no name made,
             // renamed or removed since the listing (parts::DirTrust), in which part 0 was no
             // symbolic link (its target is elsewhere); else listed again.
@@ -894,8 +896,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();
-        let held = lock::Handle::open(&p, OpenOptions::new().append(true)).unwrap();
-        let guard = lock::lock(&held, &p).unwrap();
+        let held = OpenOptions::new().append(true).open(&p).unwrap();
+        let guard = lock::lock(&held).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
             Writer::open(&store)
@@ -1034,8 +1036,8 @@ mod tests {
         let Some(_ahead) = kept_and_aged(&p) else {
             return;
         };
-        let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
-        let guard = lock::lock(&held, &one).unwrap();
+        let held = OpenOptions::new().append(true).open(&one).unwrap();
+        let guard = lock::lock(&held).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
             let _ahead = parts::RunAhead::by(60);
@@ -1063,8 +1065,8 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         let one = dir.path().join("s.tsvz.1");
         fs::write(&one, "b\t2\n").unwrap();
-        let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
-        let guard = lock::lock(&held, &one).unwrap();
+        let held = OpenOptions::new().append(true).open(&one).unwrap();
+        let guard = lock::lock(&held).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
             Writer::open(&store)

@@ -81,11 +81,11 @@ for (key, row) in store.iter() {
 # Ok::<(), tsvz::Error>(())
 ```
 
-Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
-available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
-process loses when it closes any other descriptor of the same file. The library opens a store's
-files as `tsvz::lock::Handle`s, which it closes only once it holds no such lock on them; a
-program that opens a store's files itself while it writes should do the same.
+Appends take the same file lock as TSVZ.py: an open-file-description lock on Linux, `flock` on
+macOS. Where neither exists (Linux before 3.15, or a file system without them), it is a classic
+POSIX lock, which a multi-threaded process (`tsvz serve`, or a program that reads while it
+appends) loses for a moment when one thread closes another descriptor of the file: a record it
+or a TSVZ.py writer appends then could be lost ([docs/limitations.md](docs/limitations.md)).
 
 Build without the command line and C libraries with
 `default-features = false, features = ["bzip2"]` (gzip and all digests are always in).

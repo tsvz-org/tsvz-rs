@@ -6,22 +6,37 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: TSVZ.py 5.3 readers of a `.tsv`-family file take a shared lock while they read (byte 0 of
   an open file description lock on Linux, `flock` `LOCK_SH` on macOS), so a rewrite under the file lock is waited
-  out. tsvz-rs readers (`Handle::open_read` callers) take none: like TSVZ.py 5.2, they can read another process's
+  out. tsvz-rs readers take none: like TSVZ.py 5.2, they can read another process's
   in-place rewrite part way, and a delete made in that moment can be lost. Compatibility needs nothing on Linux:
   tsvz-rs's whole-file write lock conflicts with every 5.3 lock (its appends now also wait for Python readers,
-  since byte 0 is inside its whole-file lock: slower, not wrong). On macOS `flock` and POSIX locks exclude each
-  other (TSVZ's macOS CI job checked it, 2026-11-04, against `lockf`), so it holds there too.
+  since byte 0 is inside its whole-file lock: slower, not wrong). On macOS tsvz-rs takes `flock` as 5.3 does (since
+  0.2.0), which also excludes 5.2's `lockf` (TSVZ's macOS CI job checked it, 2026-11-04), so it holds there too.
 - Why: tsvz-rs follows TSVZ.py; the change is a lock-layer change of its own:
-  - `Handle::open_read` callers take READ: byte 0 shared on Linux, through the gate (byte 2 shared, let go of once
-    byte 0 is held). On macOS that works only after a move to
-    `flock`, because a shared POSIX lock would replace the process's own write lock.
+  - Readers take READ: byte 0 shared on Linux, through the gate (byte 2 shared, let go of once byte 0 is held);
+    `flock` `LOCK_SH` on macOS, but on a file this thread holds the write lock on (it would wait for itself).
   - `maint.rs` rewrites take byte 1, the gate (byte 2), then the whole file; appends move to byte 1, so they do not wait for Python
     readers.
-  - Optional: `flock` on macOS would let the `Handle` table and its deferred closes go.
   - Tests: extend `tests/interop.rs` with "a Python READ waits for a Rust rewrite" and "a Rust reader waits for a
     Python rewrite".
 - Revisit when: someone shares a file between tsvz-rs and another writer that rewrites it.
 - Approved: 2026-11-04, the user chose "Deferred in tsvz-rs (Recommended)".
+
+### Where neither file lock exists, a multi-threaded process can lose its write lock for a moment
+- Kind: known limitation
+- What the operator sees: tsvz-rs takes TSVZ.py's write lock, an open file description lock on Linux and `flock` on
+  macOS. Where the kernel or file system refuses it (Linux before 3.15 without the backport, which is CentOS 7.0 to
+  7.4, outside the targets; or a mount that refuses `flock` on macOS), the lock is a classic POSIX lock, as TSVZ.py's
+  own fallback (`lockf`) is, and the process loses it when any of its threads closes another descriptor of that
+  file. A `tsvz serve` that answers a read while its writer appends, or a program that reads a store in one thread
+  while it appends in another, can then lose the lock for a moment, and a TSVZ.py writer appending at that moment
+  can interleave with it, so a record could be lost. A single command (`tsvz set`, `scrub`) opens no other
+  descriptor of a file it holds locked.
+- Why: 0.1.x kept every descriptor of a locked file open until the lock was released (`tsvz::lock::Handle`, a
+  process-wide table), because macOS took classic locks then. Once macOS takes `flock`, the table guards only
+  systems outside the targets, for about 350 code and 225 test lines, a CI step and four fixes so far; 0.2.0
+  removed it.
+- Revisit when: an operator shares a store with another writer on a system without either lock.
+- Approved: 2026-11-17, the user's pick (relayed by chief): "Switch, accept it (Recommended)".
 
 ### A loose file's unterminated last line is ignored, and cut before an append
 - Kind: deferred
