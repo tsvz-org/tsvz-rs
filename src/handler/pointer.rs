@@ -254,6 +254,26 @@ fn connect_within(path: &Path, patience: Duration) -> io::Result<UnixStream> {
     if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
+    // A write to a connection the handler closed (a stop) fails with EPIPE, as on std's own
+    // sockets, rather than ending the process by SIGPIPE (Linux's std writes with MSG_NOSIGNAL).
+    #[cfg(target_vendor = "apple")]
+    {
+        let on: libc::c_int = 1;
+        let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: setsockopt reads one c_int of the given size.
+        let set = unsafe {
+            libc::setsockopt(
+                raw,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const on).cast(),
+                size,
+            )
+        };
+        if set < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     // SAFETY: fcntl reads the file status flags of the descriptor `fd` owns.
     let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     // SAFETY: as above.

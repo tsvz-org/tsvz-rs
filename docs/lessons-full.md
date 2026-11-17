@@ -68,3 +68,20 @@ entries go last, in the same commit as the change:
   implementation, record by record, where the batch is the unit a writer already has.
 - Lesson: honour a SHOULD at the grain the other implementation does, and the unit your writer already
   has; a finer grain is state kept for a case that no reader can tell apart.
+
+## 2026-11-17 A stop closes the socket
+- Changed: a handler that stops closes the connections it will not serve (those still queued, accepted
+  once it is stopping, or whose request comes after the stop) as TSVZ.py's does, instead of answering
+  them "the handler is stopping"; the refusal and its five limits (128 clients, 1 s, 200 ms, 16 reads,
+  64 KiB) go. A routed read that meets a stop now runs on the files and succeeds (it exited 1); a write
+  exits 1 saying it may or may not have been applied, and nothing of it is made, as before. On macOS a
+  client's socket no longer raises SIGPIPE when a handler closes it unread.
+- Why we had to change: the command line falls back to the files only when it loses the connection, so
+  the refusal made routed reads fail during a stop; the refusal cost about 50 code and 80 test lines and
+  five limits (the user's pick 2026-11-17, "Close the socket (Recommended)").
+- Original design was wrong because: it gave a case clients already handle (a handler that goes away)
+  an answer of its own, which the read's fallback never learnt; and an answer has to be written before
+  the request is read, which needed the limits.
+- Lesson: when a server stops, end the connections it will not serve the way clients already handle a
+  server that goes away, not with a new answer: a new answer works only on the client paths taught it,
+  and the one left untaught fails.

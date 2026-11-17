@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -368,7 +368,7 @@ fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
 #[test]
 fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     // A pop answered after its tombstone is written must reach its client, or not be made:
-    // a stop lets requests already read finish and answer, and refuses the ones after.
+    // a stop lets requests already read finish and answer, and closes the connections after.
     let dir = tempfile::tempdir().unwrap();
     let rows = 100_000;
     let mut content = String::from("#_write_ack_#\tdisk\n");
@@ -410,6 +410,63 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
         answered.len()
     );
     assert!(lost.is_empty(), "deleted and never answered: {lost:?}");
+}
+
+#[test]
+fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
+    // A handler that stops closes the connections it will not serve, as TSVZ.py's does: a routed
+    // read then runs on the files; a write is not redone there, and exits 1 saying so. A stand-in
+    // handler closes them here, so that the moment is not left to chance.
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "k\tv\n");
+    let (code, direct, _) = cli(dir.path(), &["--x-direct", "get", "s.tsvz", "k"], b"");
+    assert_eq!(code, 0);
+    let sock = dir.path().join("sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let at = pointer::path_of(&s);
+    fs::write(
+        &at,
+        format!(
+            "tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t{}\n",
+            sock.display(),
+            pointer::hostname(),
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&at, fs::Permissions::from_mode(0o644)).unwrap();
+    let closer = std::thread::spawn(move || {
+        // The read's connection: closed once its request came, unanswered.
+        let (conn, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&conn).read_line(&mut request).unwrap();
+        drop(conn);
+        // The write's: closed before its request comes.
+        drop(listener.accept().unwrap());
+    });
+    let (code, out, err) = cli(dir.path(), &["get", "s.tsvz", "k"], b"");
+    assert_eq!((code, out.as_str()), (0, direct.as_str()), "{err}");
+    assert!(err.contains("using the files directly"), "{err}");
+    // `set -` sends once its input ends: here after its connection was closed.
+    let mut child = tsvz()
+        .current_dir(dir.path())
+        .args(["set", "s.tsvz", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    closer.join().unwrap();
+    child.stdin.take().unwrap().write_all(b"k\tw\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("may or may not have been applied"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(&s).unwrap(), "k\tv\n", "not redone");
 }
 
 #[test]

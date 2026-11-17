@@ -466,6 +466,8 @@ impl Engine {
         f: impl FnOnce(&mut State) -> Result<R, Error>,
     ) -> (Result<R, Error>, Vec<String>) {
         let mut st = lock(&self.state);
+        // Closed: no writer thread is left to make a write (a request still running when a stop
+        // cut its connection off).
         let result = if st.closed {
             Err(Error::Refused("the handler is stopping".into()))
         } else {
@@ -803,12 +805,6 @@ impl Engine {
     /// Make every acknowledged write durable (`stop`, §21.9.3).
     pub fn flush(&self) -> Result<(), Error> {
         self.batcher.flush().map_err(Error::Refused)
-    }
-
-    /// Refuse every request from now on ("the handler is stopping"); requests already past that
-    /// point finish, and the writer thread goes on writing what they queue.
-    pub fn refuse(&self) {
-        lock(&self.state).closed = true;
     }
 
     /// Answer no more requests; write and fsync everything queued, and end the writer thread.
