@@ -49,7 +49,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Loose reads still differ from TSVZ.py's in six ways
 - Kind: deferred
 - What the operator sees: in a loose file, `tsvz read`, `get` and `keys` differ from TSVZ.py's command line in
-  six ways, none of them new in 0.1.4:
+  six ways (one shape is new in 0.1.4: a line of only whitespace alone in a one-column file is a row, as every
+  key alone there is since 0.1.4, where 0.1.3 read every key alone as a deletion):
   - the values of a `#_defaults_#` line are not filled into the empty cells of the rows after it (tsvz-rs reads
     the line as a comment);
   - a `#_defaults_#` line with no value, bare or with blank cells, in a one-column file is a row to TSVZ.py,
@@ -136,14 +137,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A loose delete reads a compressed file whole
 - Kind: deferred
-- What the operator sees: `delete`, `pop` and `popitem` in a compressed loose file read the whole compressed
+- What the operator sees: `delete` in a compressed loose file reads the whole compressed
   file into memory and decode it a member at a time, up to the end of the member that holds its first keyed
   line. A file of more than one column is then done (it appends a key alone), and says only the damage it met
   on the way; one of one column is read whole again, for the rewrite. On 4,000,000 rows of the layout above
   (228 MiB of text, 89 MiB of gzip at level 6) the delete takes 0.1 s and 94 MiB in 1 MiB members, and 0.7 to
   0.8 s and 348 MiB (the header in a member of its own) to 577 MiB (the header in the one member) as one
   member, where 0.1.3 took 0.00 s and 15 MiB (the times are from a busy host: 0.06 s and 0.5 s on a quiet
-  one). A plain file of more than one column is read only as far as its first keyed line.
+  one). `pop` and `popitem` first read the whole file, as 0.1.3 did, and then do the same. A `delete` of a plain
+  file of more than one column reads only as far as its first keyed line.
 - Why: the read decodes a compressed part as one slice, where a damaged member's bytes run to the next member's
   start, found by looking ahead; a separate streaming look at the first lines read past a damaged member into the
   next one (0.1.4's third review), so it was removed.

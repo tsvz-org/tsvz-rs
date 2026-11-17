@@ -793,8 +793,8 @@ fn a_loose_scrub_and_clear_read_no_row() {
     assert!(over.is_empty(), "{over:?}");
 }
 
-/// A delete of a compressed loose file of more than one column reads the file as a `get` does,
-/// as far as the end of the member that holds its first keyed line (docs/limitations.md): the
+/// A delete of a compressed loose file of more than one column reads the whole file into memory as a
+/// `get` does, and decodes it as far as the end of the member that holds its first keyed line (docs/limitations.md): the
 /// damage of that member is found and said, once, with the file's name. A first member with no
 /// keyed line, or only a header, is no matter: the read goes on into the next.
 #[test]
@@ -858,15 +858,15 @@ fn a_compressed_loose_delete_says_the_damage_of_the_member_with_its_first_key_on
 /// that holds only comment lines is cut short and members of rows follow. A look at the first
 /// lines alone fed the cut member's decoder the next member's bytes, and took the garbage that
 /// came out for a keyed line, so that it gave a wrong column count: the delete then failed with
-/// "the file kept changing", or wrote a key alone, a row at one column, so that a `popitem` loop
-/// never ended. The tiny files below: a gzip member of random text cut inside its data and a
+/// "the file kept changing", or decided from a wrong column count (in the files that found it, a key
+/// alone written at one column, so that a `popitem` loop never ended). The tiny files below: a gzip member cut inside its data and a
 /// member `z`, and the same in zstd.
 #[test]
 fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_read_does() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     let gz = |t: &[u8]| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t).unwrap();
-    // 600 comment lines of random words (a few with a tab), so that the member is a few KiB of
+    // 600 comment lines of random words (about half with a tab), so that the member is a few KiB of
     // dynamic Huffman codes, cut at 63 points: the look failed at 5 of them at two columns and
     // at 1 at one (counted on the build before the look was removed, 0e0e128).
     let mut x = 0x1234_5678_9abc_def1u64;
@@ -937,7 +937,7 @@ fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_rea
             }
         }
     }
-    // The tiny files: a member of random text cut inside its data, then a member `z`.
+    // The tiny files: a member cut inside its data, then a member `z`.
     let hex = |s: &str| -> Vec<u8> {
         (0..s.len() / 2)
             .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
