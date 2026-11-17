@@ -105,10 +105,10 @@ In strict stores (`.tsvz .csvz .nsvz .psvz`) a read replays every part, as befor
 `scrub` writes snapshot parts that carry a `#_snapshot_#` line (the first, or the second after a
 header comment; it also makes one marked copy of a part a 0.1.3 scrub wrote), and a writer now
 refuses `#_snapshot_#` (§19.10.2; 0.1.3 accepted it and wrote it as a record). Upgrade every host
-that scrubs the same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a
-new snapshot part each time while an ordinal is free (0.1.3 does not expect the marker line), and
-the next 0.1.4 scrub adds a marked copy of it; with none free, the 0.1.3 scrub compacts in place
-and the next 0.1.4 scrub marks that part in place.
+that scrubs the same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a new snapshot
+part each time, or compacts in place when no ordinal is free (0.1.3 does not expect the marker
+line), and the next 0.1.4 scrub marks it: with a marked copy while an ordinal is free, otherwise in
+place, with the §19.8 warning.
 
 In loose files:
 

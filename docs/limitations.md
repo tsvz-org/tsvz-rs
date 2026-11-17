@@ -102,7 +102,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     every part and TSVZ.py only from the snapshot part.
   A `scrub` writes the marker and finds a part marked.
 - Why: finding the part to begin at takes a look at the start of every part, apart from the read. 0.1.4 tried
-  that look and removed it: it cost a second decode of each part's start (most on bzip2 parts and on a
+  that look in the read and removed it from the read (a scrub still uses it to find a marked part): it cost a second decode of each part's start (most on bzip2 parts and on a
   snapshot part of one large member), and leaving bzip2 out of it made the answer on such a store depend on
   the codec.
 - Revisit when: the next tsvz-rs version. The plan: the read judges a part from its first lines as it decodes
