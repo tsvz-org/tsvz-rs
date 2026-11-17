@@ -139,6 +139,24 @@ The fixture is tsvzbench's (`tsvzbench.Fixtures(B + '/fixtures', 1).get('plain',
 build each commit for such a comparison from `git archive`, touch the extracted files: the
 archive keeps commit times, and cargo skips a rebuild it believes is fresh.
 
+## Listing at every check against the change-time trust (2026-11-17)
+
+Measured for the simplify pass's item A2 (drop the change-time trust and list a store's parts at
+every check), on 0.1.4 as built against the same code listing at every check, in a Linux test VM.
+The answer, the user's of 2026-11-17, was to keep the trust.
+
+- NFS and SMB: no difference. The trust is used only on local kernel file systems; on NFS, SMB
+  and FUSE the code already lists at every check. A set/get pair is 11 RPCs on NFSv4.2, 10 on
+  NFSv3 and 17 requests on SMB in both builds (default mounts, 0 to 70 s between requests).
+- A sleeping hard disk: once the kernel has dropped the directory from its cache (an emptied
+  cache, or 10 and 60 minutes idle under memory pressure), the first `get` reads one 4 KiB block
+  when it lists and none with the trust, in 30 runs of 30. A `set` reads 3 to 4 blocks in both.
+- A store in a directory of many other files, per set/get pair on local ext4, trust against
+  listing: 100 other files 120 against 200 µs, 1,000 242 against 770 µs, 10,000 1.5 against
+  6.3 ms. The first `get` after an emptied cache reads 1, 13 and 120 blocks when it lists.
+- A quiet directory of a few files: listing adds 16 syscalls a pair, 21 to 35 µs on pairs of 80
+  to 105 µs.
+
 ## Run to run on this machine
 
 Against the 2026-10-14 results, `len 1M` went from 233-243 ms to 332-334 ms, `read 1M` from
