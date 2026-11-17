@@ -154,26 +154,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
 
-### A scrub's look at a part's start can judge an odd part wrongly, and reads a long first line whole
-- Kind: deferred
-- What the operator sees: a multi-part `scrub` finds a part marked by its first lines. It can take a gzip part
-  that begins with `#_snapshot_#` for no snapshot part: its first member holds the gzip magic bytes `1f 8b 08`
-  (in a stored block, or by chance in compressed data) in the bytes the look has read. The look has only the
-  start of the part, and takes the magic for the start of a next member after a cut one, where the read
-  decodes the whole part as one member (the second review's probe: 1 of 800 random gzip parts, none of 800 each
-  in xz, zstd and bzip2; a later check: 3 of 3,000 random 65 KB parts, with the magic at byte 8,199 to 24,684).
-  The scrub then writes one more marked copy of the part, as 0.1.3's scrub always wrote one. That copy is
-  byte for byte the same, so a later scrub judges it unmarked too and writes another while an ordinal is free;
-  once none is, each scrub compacts the parts in place, with the §19.8 warning (0.1.3 does the same once a
-  second copy takes the ordinal). A read is unaffected. A part whose first line is very long is also decoded to
-  the end of that line before the look says "no": a first line of 2 MB in an 18.7 KB gzip member was read whole.
-- Why: the look decodes a part's first page by a streaming decoder of its own, and finds where a member ends and
-  where a line ends by decoding on, where the read decodes a part as one slice.
-- Revisit when: the next tsvz-rs version. The plan: the part reader of the entry above, which decodes a member at
-  a time, serves the look too, with one rule for where a member ends.
-- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
-  noted, not asked.
-
 ### Three edges of how a loose file names its keys, left to the port of TSVZ.py's line rule
 - Kind: deferred
 - What the operator sees: three narrow cases where tsvz-rs 0.1.4 names a loose line's key differently from
@@ -188,9 +168,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     followed store lists `a`, a store opened afterwards `<BOM>a`, the key TSVZ.py reads. 0.1.3 listed `a` both
     ways.
   - A `.nsv` file whose `#_defaults_#` line begins with a NUL: `0`, then `<NUL>#_defaults_#<NUL><NUL>`, then
-    `delete 0`. tsvz-rs gives the file no stand-in key, so its width goes from one cell to three and the line
-    becomes a reset; TSVZ.py's own delete writes the same bytes. The same lines without the first NUL get the
-    bare stand-in of the first case from tsvz-rs, and none from TSVZ.py.
+    `delete 0`. The two name the file's keys differently before the delete (TSVZ.py lists `0` and
+    `#_defaults_#`, tsvz-rs `0` only) and write the same bytes after it: tsvz-rs gives the file no stand-in
+    key, so its width goes from one cell to three and the line becomes a reset, as TSVZ.py's own delete does.
+    The same lines without the first NUL get the bare stand-in of the first case from tsvz-rs, and none from
+    TSVZ.py.
 - Why: tsvz-rs names a loose line's key in several places, each by a rule of its own (the rewrite's stand-in
   key, the line kinds of a scrub, the follow state's byte-order mark), where TSVZ.py has one function; these
   cases fall between them.
