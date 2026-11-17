@@ -31,7 +31,8 @@ pub struct Framer {
     number: u64,
     consumed: u64,
     committed: u64,
-    /// A byte-order mark was removed at the start, and no member has been dropped since.
+    /// A byte-order mark was removed at the start, and no unfinished line has been dropped since
+    /// (`brk`).
     bom: bool,
 }
 

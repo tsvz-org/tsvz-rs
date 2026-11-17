@@ -328,8 +328,9 @@ impl SnapshotLines {
 /// None when those end before the verdict: with `more`, a last member that runs past `data` is
 /// only the end of what was read so far. A member cut short or corrupt before the verdict, in
 /// the middle of `data` or at the end of the part, makes it no snapshot part; so does a member
-/// that holds another member's magic bytes in its stored data, when `data` is a prefix of the
-/// part (the whole part decodes as that one member: docs/limitations.md).
+/// that runs past `data` and holds the codec's magic bytes in what was read (in a stored block,
+/// or by chance in compressed data), when `data` is a prefix of the part (the whole part decodes
+/// as that one member: docs/limitations.md).
 fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
     let mut lines = SnapshotLines::new(delimiter);
     let mut framer = Framer::new();
@@ -424,8 +425,8 @@ fn first_lines_say_no(
 /// passes its check later, and a "yes" only from first lines that come out of members that passed
 /// their checks (bzip2 gives nothing before a whole block, up to 900 kB of text). A part whose
 /// start cannot be read, or holds damage before the marker, is not one (§19.10.3); a member that
-/// holds another member's magic bytes in its stored data looks damaged here, from the part's first
-/// bytes only (docs/limitations.md).
+/// runs past the bytes read and holds the codec's magic bytes in them looks damaged here
+/// (docs/limitations.md).
 pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
     let Ok(file) = Handle::open_read(&part.path) else {
         return false;

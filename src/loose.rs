@@ -96,9 +96,9 @@ enum Kind {
     /// A deletion to both ([`deletes`]).
     Delete,
     /// A key the two may read differently (TSVZ.py strips its trailing whitespace and decodes
-    /// `<…>` tokens), or a line with a CR or a NUL that is no delimiter, which both read alike
-    /// as far as tried: the check is a cautious one. The file is then rewritten without
-    /// changing any line.
+    /// `<…>` tokens), or a line with a CR (TSVZ.py cuts a run of them before the newline,
+    /// tsvz-rs one) or with a NUL that is no delimiter (read alike as far as tried): the check
+    /// is a cautious one. The file is then rewritten without changing any line.
     Odd,
 }
 
@@ -296,8 +296,9 @@ pub(crate) fn cleared(lines: &Lines<'_>) -> Vec<u8> {
 /// a rewrite would change).
 /// When the line that set the column count goes and the next keyed line has more cells, the first
 /// remaining key, alone, takes its place, so that the file keeps one column, as in TSVZ.py,
-/// which takes the first later key that holds no value instead (`a`, `b<TAB>1`, `c`, after the
-/// delete of `a`: TSVZ.py's file begins `c`, tsvz-rs's `b`, which keeps the keys in their order).
+/// which copies there the first later key that holds no value or, when none does, the first later
+/// key (`a`, `b<TAB>1`, `c`, after the delete of `a`: TSVZ.py's file begins `c`, tsvz-rs's `b`,
+/// which keeps the keys in their order).
 #[cfg(feature = "cli")]
 pub(crate) fn without(lines: &Lines<'_>, keys: &HashSet<&str>) -> Option<Option<Vec<u8>>> {
     if !lines.one {
@@ -600,7 +601,7 @@ mod tests {
         // A key of only whitespace is a row of its own spelling, and goes by it alone.
         assert_eq!(gone("a\n  \t1\n \t2\n \nb\n", &[" "]), "a\n  \t1\nb\n");
         // The line that set one column goes: the first remaining key, alone, takes its place (TSVZ.py
-        // takes `c`, the first later key that holds no value, and so moves it to the front).
+        // copies `c`, the first later key that holds no value, to the front).
         assert_eq!(gone("a\nb\t1\nc\n", &["a"]), "b\nb\t1\nc\n");
         assert_eq!(
             gone("a\n#_defaults_#\tP\nb\n", &["a"]),

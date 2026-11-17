@@ -793,12 +793,12 @@ fn a_loose_scrub_and_clear_read_no_row() {
     assert!(over.is_empty(), "{over:?}");
 }
 
-/// A delete of a compressed loose file of more than one column reads the whole file, as a `get`
-/// does (docs/limitations.md): the damage of a member is found and said, once, with the file's
-/// name, also past its first keyed line. A first member with no keyed line, or only a header, is
-/// no matter: the read goes on into the next.
+/// A delete of a compressed loose file of more than one column reads the file as a `get` does,
+/// as far as the end of the member that holds its first keyed line (docs/limitations.md): the
+/// damage of that member is found and said, once, with the file's name. A first member with no
+/// keyed line, or only a header, is no matter: the read goes on into the next.
 #[test]
-fn a_loose_delete_reads_a_compressed_file_whole_and_says_a_damaged_member_once() {
+fn a_compressed_loose_delete_says_the_damage_of_the_member_with_its_first_key_once() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     let mut text = String::from("#key\tv1\tv2\tv3\n");
@@ -855,20 +855,20 @@ fn a_loose_delete_reads_a_compressed_file_whole_and_says_a_damaged_member_once()
 }
 
 /// A compressed loose delete decides from the file as the whole read sees it, also when a member
-/// that holds only comment lines is cut short and members of rows follow (rr014c R1). A look at
-/// the first lines alone fed the cut member's decoder the next member's bytes, and took the
-/// garbage that came out for a keyed line: at two columns it said one, and the delete failed with
-/// "the file kept changing"; at one column it said two, and the delete wrote a key alone, a row
-/// there, so a `popitem` loop never ended. The tiny files are code2's: a gzip member of random
-/// text cut inside its data and a member `z`, and the same in zstd.
+/// that holds only comment lines is cut short and members of rows follow. A look at the first
+/// lines alone fed the cut member's decoder the next member's bytes, and took the garbage that
+/// came out for a keyed line, so that it gave a wrong column count: the delete then failed with
+/// "the file kept changing", or wrote a key alone, a row at one column, so that a `popitem` loop
+/// never ended. The tiny files below: a gzip member of random text cut inside its data and a
+/// member `z`, and the same in zstd.
 #[test]
 fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_read_does() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     let gz = |t: &[u8]| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t).unwrap();
     // 600 comment lines of random words (a few with a tab), so that the member is a few KiB of
-    // dynamic Huffman codes, cut at 63 points: about one in ten of them made the garbage reach a
-    // keyed line.
+    // dynamic Huffman codes, cut at 63 points: the look failed at 5 of them at two columns and
+    // at 1 at one (counted on the build before the look was removed, 0e0e128).
     let mut x = 0x1234_5678_9abc_def1u64;
     let mut next = move || {
         x ^= x << 13;
@@ -958,8 +958,8 @@ fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_rea
     }
     for (name, bytes) in tiny {
         fs::write(dir.join(name), &bytes).unwrap();
-        // (the zstd one, read with a byte-order mark before `z`, because the dropped bytes of the
-        // cut member were three, and the next line then began at offset 3)
+        // (0e0e128 read the zstd one with a byte-order mark before `z`: the cut member's dropped
+        // bytes were three, and the next line began at offset 3)
         let before = records(dir, &["keys", name]).1;
         assert_eq!(before, "z\n", "{name}");
         let (code, _, err) = records(dir, &["delete", name, "k0"]);
@@ -996,7 +996,7 @@ fn a_one_column_delete_that_removes_no_line_writes_and_says_nothing() {
 /// rewrite that would drop the key's lines has none to drop, and would only leave a copy of the
 /// damaged bytes (`.damaged-`) and replace them by the recovered lines.
 #[test]
-fn a_one_column_delete_that_removes_no_line_leaves_a_damaged_file_and_makes_no_copy() {
+fn a_one_column_delete_copies_a_damaged_file_only_when_it_removes_a_line() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();

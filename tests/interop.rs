@@ -676,8 +676,8 @@ fn a_loose_nsv_scrub_compacts_as_its_tsv_twin_does_and_changes_nothing_tsvz_py_r
         "x\n\n#_defaults_#\0Q\0\n\0x\n"
     );
     assert_eq!(both(&py, "keys", &nsv), ("x\n".into(), "x\n".into()));
-    // A scrub that wrote every line back would pass all of the above: 55 of the 84 shrink
-    // (counted 2026-11-16 on the files without a NUL), 40 is well under that.
+    // A scrub that wrote every line back would pass all of the above: 54 of the 79 files shrink
+    // (counted 2026-11-16), 40 is well under that.
     assert!(compacted >= 40, "only {compacted} files shrank");
 }
 
