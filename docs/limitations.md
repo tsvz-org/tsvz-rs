@@ -100,8 +100,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - a snapshot part that does not restate the parts before it, which a producer must not write: tsvz-rs reads
     every part and TSVZ.py only from the snapshot part.
   A `scrub` writes the marker and finds a part marked.
-- Why: finding the part to begin at takes a look at the start of every part, apart from the read. 0.1.4 made
-  that look first and removed it: it cost a second decode of each part's start (most on bzip2 parts and on a
+- Why: finding the part to begin at takes a look at the start of every part, apart from the read. 0.1.4 tried
+  that look and removed it: it cost a second decode of each part's start (most on bzip2 parts and on a
   snapshot part of one large member), and leaving bzip2 out of it made the answer on such a store depend on
   the codec.
 - Revisit when: the next tsvz-rs version. The plan: the read judges a part from its first lines as it decodes
@@ -143,7 +143,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (228 MiB of text, 89 MiB of gzip at level 6) the delete takes 0.1 s and 94 MiB in 1 MiB members, and 0.7 to
   0.8 s and 348 MiB (the header in a member of its own) to 577 MiB (the header in the one member) as one
   member, where 0.1.3 took 0.00 s and 15 MiB (the times are from a busy host: 0.06 s and 0.5 s on a quiet
-  one). A plain file is read only as far as its first keyed line.
+  one). A plain file of more than one column is read only as far as its first keyed line.
 - Why: the read decodes a compressed part as one slice, where a damaged member's bytes run to the next member's
   start, found by looking ahead; a separate streaming look at the first lines read past a damaged member into the
   next one (0.1.4's third review), so it was removed.
@@ -173,7 +173,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   noted, not asked.
 
 ### Three edges of how a loose file names its keys, left to the port of TSVZ.py's line rule
-- Kind: deferred (0.1.5)
+- Kind: deferred
 - What the operator sees: three narrow cases where tsvz-rs 0.1.4 names a loose line's key differently from
   TSVZ.py. None is worse than 0.1.3 or loses data.
   - A one-column `delete` that leaves only `#_defaults_#` lines: `c`, `#_defaults_#<TAB>P`,
