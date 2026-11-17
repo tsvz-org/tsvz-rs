@@ -65,7 +65,9 @@ tsvz stop people.tsvz
 The handler and TSVZ.py's (`tsvz serve`, `TSVZClient`) speak the same protocol: either tool's
 commands go through either tool's handler. It serves strict stores (`.tsvz .csvz .nsvz .psvz`).
 Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode M` sets the
-socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`.
+socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
+(SMB) mount the other commands cannot read the handler's pointer file: they warn `ignoring the
+pointer file` and work on the files (deferred to 0.2.1, [docs/limitations.md](docs/limitations.md)).
 
 ## Library
 
@@ -82,10 +84,11 @@ for (key, row) in store.iter() {
 ```
 
 Appends take the same file lock as TSVZ.py: an open-file-description lock on Linux, `flock` on
-macOS. Where neither exists (Linux before 3.15, or a file system without them), it is a classic
-POSIX lock, which a multi-threaded process (`tsvz serve`, or a program that reads while it
-appends) loses for a moment when one thread closes another descriptor of the file: a record it
-or a TSVZ.py writer appends then could be lost ([docs/limitations.md](docs/limitations.md)).
+macOS. Where neither exists (the system answers `EINVAL`, as Linux before 3.15 does, or on macOS
+`ENOTSUP` or `EOPNOTSUPP`; any other error fails the write), it is a classic POSIX lock, which a
+multi-threaded process (`tsvz serve`, or a program that reads while it appends) loses for a
+moment when one thread closes another descriptor of the file: a record it or a TSVZ.py writer
+appends then could be lost ([docs/limitations.md](docs/limitations.md)).
 
 Build without the command line and C libraries with
 `default-features = false, features = ["bzip2"]` (gzip and all digests are always in).
@@ -107,13 +110,17 @@ The library changes, so a `0.1` requirement does not take 0.2.0: `tsvz::lock::Ha
 and `Writer::append_runs_at` is now `append_at`.
 
 - On macOS appends take `flock`, as TSVZ.py 5.3 and later do, instead of a classic POSIX lock;
-  the two exclude each other there, so hosts can be upgraded one at a time.
+  the two exclude each other on a Mac's local file system, so 0.1.4 and 0.2.0 can write one
+  store there while you upgrade (across a network mount this was not tried).
 - A command that reaches a handler as it stops no longer gets `the handler is stopping`: the
   handler closes the connection, so `read`, `get`, `has`, `len` and `keys` run on the files and
-  succeed (they exited 1), and any other command exits 1 saying the request may or may not have
-  been applied (nothing of it is made, as before).
-- A compressed batch that sets `#_member_size_#` is written at the member size it started with;
-  the new size applies from the next batch. Reads are unchanged.
+  succeed (before, they exited 1), and any other command exits 1 saying the request may or may
+  not have been applied. A request the handler had already received when the stop began is
+  still served and answered, for up to 5 s.
+- A compressed batch that sets `#_member_size_#` is written at the member size in force where
+  it started. A handler applies the new size from its next batch, and so do `pop`, `popitem`
+  and `setdefault` on the files; `set`, `append` and `delete` on the files write at 1 MiB, as
+  before. Reads are unchanged.
 - A scrub tried again because a writer appended meanwhile keeps every `.damaged-` copy it made.
 
 ## Upgrading to 0.1.4 from 0.1.3

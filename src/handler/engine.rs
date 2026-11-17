@@ -185,8 +185,9 @@ impl Batcher {
             };
             let durable = batch.iter().any(|e| e.durable);
             let last = batch[batch.len() - 1].seq;
-            // The whole batch at the member size in force where it starts, as TSVZ.py writes
-            // it (§16.7 is a SHOULD): a size it sets applies from the next batch.
+            // The whole batch at the member size in force where it starts, one size for a batch
+            // as TSVZ.py writes it (§16.7 is a SHOULD); a size it sets applies from the next
+            // batch (TSVZ.py's, once it has read its marker back: the layout alone differs).
             let member_size = batch[0].member_size;
             let payload: String = batch.iter().map(|e| e.payload.as_str()).collect();
             let result = Writer::open(&self.store).and_then(|w| {
@@ -466,8 +467,8 @@ impl Engine {
         f: impl FnOnce(&mut State) -> Result<R, Error>,
     ) -> (Result<R, Error>, Vec<String>) {
         let mut st = lock(&self.state);
-        // Closed: no writer thread is left to make a write (a request still running when a stop
-        // cut its connection off).
+        // Closed: the writer thread is on its way out and would not wait for a write made now
+        // (a request still running when a stop cut its connection off).
         let result = if st.closed {
             Err(Error::Refused("the handler is stopping".into()))
         } else {

@@ -13,9 +13,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   0.2.0), which also excludes 5.2's `lockf` (TSVZ's macOS CI job checked it, 2026-11-04), so it holds there too.
 - Why: tsvz-rs follows TSVZ.py; the change is a lock-layer change of its own:
   - Readers take READ: byte 0 shared on Linux, through the gate (byte 2 shared, let go of once byte 0 is held);
-    `flock` `LOCK_SH` on macOS, but on a file this thread holds the write lock on (it would wait for itself).
-  - `maint.rs` rewrites take byte 1, the gate (byte 2), then the whole file; appends move to byte 1, so they do not wait for Python
-    readers.
+    `flock` `LOCK_SH` on macOS, except on a file this thread holds the write lock on (it would wait for itself).
+  - `maint.rs` rewrites would take byte 1, the gate (byte 2), then the whole file; appends would move to byte 1, so
+    they do not wait for Python readers.
   - Tests: extend `tests/interop.rs` with "a Python READ waits for a Rust rewrite" and "a Rust reader waits for a
     Python rewrite".
 - Revisit when: someone shares a file between tsvz-rs and another writer that rewrites it.
@@ -25,16 +25,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: tsvz-rs takes TSVZ.py's write lock, an open file description lock on Linux and `flock` on
   macOS. Where the kernel or file system refuses it (Linux before 3.15 without the backport, which is CentOS 7.0 to
-  7.4, outside the targets; or a mount that refuses `flock` on macOS), the lock is a classic POSIX lock, as TSVZ.py's
-  own fallback (`lockf`) is, and the process loses it when any of its threads closes another descriptor of that
-  file. A `tsvz serve` that answers a read while its writer appends, or a program that reads a store in one thread
+  7.4, outside the targets, answering `EINVAL`; or a mount that refuses `flock` on macOS, answering `ENOTSUP`,
+  `EOPNOTSUPP` or `EINVAL`; any other error fails the write, as in TSVZ.py), the lock is a classic POSIX lock, as
+  TSVZ.py's own fallback (`lockf`) is, and the process loses it when any of its threads closes another descriptor of
+  that file. A `tsvz serve` that answers a read while its writer appends, or a program that reads a store in one thread
   while it appends in another, can then lose the lock for a moment, and a TSVZ.py writer appending at that moment
   can interleave with it, so a record could be lost. A single command (`tsvz set`, `scrub`) opens no other
   descriptor of a file it holds locked.
 - Why: 0.1.x kept every descriptor of a locked file open until the lock was released (`tsvz::lock::Handle`, a
-  process-wide table), because macOS took classic locks then. Once macOS takes `flock`, the table guards only
-  systems outside the targets, for about 350 code and 225 test lines, a CI step and four fixes so far; 0.2.0
-  removed it.
+  process-wide table), because macOS took classic locks then. Once macOS takes `flock`, the table would guard only
+  the cases above, for 278 code and 240 test lines (the measured removal; the question said about 350 and 225), a
+  CI step and four fixes so far; 0.2.0 removed it.
 - Revisit when: an operator shares a store with another writer on a system without either lock.
 - Approved: 2026-11-17, the user's pick (relayed by chief): "Switch, accept it (Recommended)".
 
@@ -199,10 +200,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A handler on a cifs (SMB) mount is unreachable for the command line
 - Kind: deferred
-- What the operator sees: while `tsvz serve` runs on a store on a cifs mount, every other `tsvz` command on that
-  store says `ignoring the pointer file ...: Permission denied (os error 13); using the files directly` and works on
-  the files, as `--x-direct` does; `tsvz::handler::Client::connect` finds no handler either. A client given the
-  socket's address itself still reaches the handler.
+- What the operator sees: while `tsvz serve` runs on a store on a cifs mount, every other routed `tsvz` command on
+  that store (`read`, `get`, `has`, `len`, `keys`, `set`, `append`, `delete`, `clear`, `scrub`, `pop`, `popitem`,
+  `setdefault`) says `ignoring the pointer file ...: Permission denied (os error 13); using the files directly` and
+  works on the files, as `--x-direct` does. `verify` and `parts` never look for a handler and work on the files.
+  `tsvz stop` fails with the same `Permission denied`, so the handler has to be stopped by a signal. A second
+  `tsvz serve` is refused (the message depends on the error cifs gives for the conflicting lock, which was not
+  measured). `tsvz::handler::Client::connect` finds no handler either. A client given the socket's address itself
+  still reaches the handler. Measured: `get` beside an idle handler.
 - Why: the handler holds its pointer file with `flock`, as TSVZ.py's does, and cifs turns that into a mandatory SMB
   byte-range lock, so another process's read of the file fails with EACCES. Found by the 0.1.4 measurements on a
   loopback SMB share (2026-11-17).
@@ -210,6 +215,78 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `flock`, and its lookup reads the file outside the `try` that catches only the open, so its command line may fail
   there rather than use the files; not run); then confirm both tools on a real cifs mount (VM 901, a test of its
   own); then fix it with TSVZ.py for both, such as by holding the lock where no reader of the pointer reads (another
-  file, or a byte range past its content).
+  file, or a byte range past its content). The test also reads in another process while the handler appends: the
+  append's whole-file lock (0.1.4 took the same) may be made mandatory on cifs too and deny that read with EACCES,
+  and then "works on the files" does not hold for a store being written.
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
+
+### A command that meets a handler just as it removes its pointer file can warn about a hard link
+- Kind: deferred
+- What the operator sees: a command that opens the pointer file just before a stopping handler removes it says
+  `ignoring the pointer file ...: has another name (a hard link), so its owner may not have put it there; using the
+  files directly`, then works on the files and exits 0. Only the text is wrong. Seen in 3 of about 48,000 `get`
+  commands in a stress run that stopped a handler under 24 clients, with 0.1.4 and with 0.2.0 alike.
+- Why: `lookup` refuses any link count but 1 (anyone may link a file they can see), and a file removed after it was
+  opened has link count 0.
+- Revisit when: 0.2.1. The plan: `lookup` treats link count 0 as no handler, without a warning.
+- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A scrub or clear can rewrite a part that was rotated away between its open and its lock
+- Kind: deferred
+- What the operator sees: when the active part is renamed away (a rotation to `.rotated`, which the part listing
+  skips) in the moment between a `scrub`, `clear` or `delete` opening it by path and taking its lock, the rewrite
+  goes into the renamed file, and the command reports success while the active part still holds the rows it meant to
+  change. From reading; the window was not reproduced.
+- Why: `maint::rewrite` opens the part by path and locks it, and compares only the stamp of the file it opened with
+  the one its caller read; `Writer::append_at` also checks, after its lock, that the path still names the file it
+  holds. 0.1.4 is the same.
+- Revisit when: 0.2.1. The plan: check `names` after the lock in `rewrite` as `append_at` does, so the rewrite is
+  refused as a change by another writer and the scrub tries again; a test with a hook that renames the part between
+  the open and the lock.
+- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A row queued behind a failing `#_write_ack_# memory` batch is acknowledged without a sync
+- Kind: deferred
+- What the operator sees: a client sends `#_write_ack_# memory` to a store whose file says `disk`, and its batch
+  fails to write (a file size limit, a full disk, an I/O error). A plain write another client sent before that
+  failure was seen is acknowledged before it is written, and written without a sync, while the file still says
+  `disk` (§21.9): a crash before the system writes it back loses a row the handler promised to sync. Rows sent after
+  the failure was seen are synced again. Checked by running (a file size limit makes the marker's batch fail); 0.1.4
+  does the same.
+- Why: `Engine::submit` takes the acknowledgement mode and the member size from the markers still queued, which the
+  failed batch never clears; the engine drops them only when it next follows the files.
+- Revisit when: 0.2.1. The plan: a queued `memory` does not relax a `disk` the store has already written, until the
+  store has followed the file; the cost is latency for rows sent in that window.
+- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A pop that is still waiting when a stop's five seconds end loses its row
+- Kind: deferred
+- What the operator sees: a `pop` or `popitem` through a handler whose batch is waiting for a sync that outlasts the
+  five seconds a stop allows (a slow disk, a flood of other writes) has queued its tombstone, which the stop writes
+  before it ends, but its connection is cut before the row reaches the client: the row is gone from the store, the
+  command exits 1 with `may or may not have been applied`, and nobody has the row. From reading; to be reproduced
+  first. 0.1.4 drains the same way.
+- Why: `finish_connections` gives requests already received `FINISH` (5 s) and then ends every connection still open;
+  a pop is the one request whose answer is the data.
+- Revisit when: 0.2.1. The plan: reproduce with a stalled sync; then wait without a limit for a request whose batch
+  is being written, keeping the five seconds for a client that does not read its answer.
+- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A pop on the files while a stopping handler has one in flight can take the same row
+- Kind: deferred
+- What the operator sees: once a stopping handler has closed its listener, a command that connects is refused and
+  works on the files. A `pop` there can read a row as live that a `pop` already in flight in the handler took, whose
+  tombstone the handler has not yet written, and take it too: two clients get the same row. The window lasts until
+  that batch is written, longer under a slow sync. From reading; to be reproduced first. 0.1.4 closes its listener
+  at the same point.
+- Why: the listener goes first and the pointer file stays until the queue is written, so a command in the window
+  finds a pointer file with nothing behind it and does what it does when a handler is gone.
+- Revisit when: 0.2.1. The plan: reproduce with a stalled batch; then hold the listener open until the queued
+  tombstones are written, so that a command in the window is closed (a write exits 1) and does not run on the files.
+- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.

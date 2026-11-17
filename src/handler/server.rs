@@ -327,10 +327,10 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
 /// How long a stop waits for the requests already read to be answered.
 const FINISH: Duration = Duration::from_secs(5);
 
-/// End the open connections as a stop does: no request is read from now on; the ones already
-/// read finish and are answered (a pop in flight has written its tombstone: its row must reach
-/// its client); then each connection ends when it reads its next line. A connection still open
-/// after [`FINISH`] (a client not reading its answer) is cut off.
+/// End the open connections as a stop does: no request sent from now on is read; the ones
+/// already received finish and are answered (a pop in flight has written its tombstone: its
+/// row must reach its client); then each connection ends when it reads its next line. A
+/// connection still open after [`FINISH`] (a client not reading its answer) is cut off.
 fn finish_connections(shared: &Shared) {
     for conn in lock(&shared.open).values() {
         let _ = conn.shutdown(std::net::Shutdown::Read);
@@ -368,8 +368,8 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>) {
     let tick = (idle / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
     while !shared.stopping.load(Ordering::SeqCst) {
         std::thread::sleep(tick);
-        // Decided under the lock that counts new connections: one counted before is served to
-        // its end, one after is closed unread (start_connection).
+        // Claimed while holding the lock that counts new connections (start_connection counts
+        // under it), so none is counted between the check that none is open and the stop.
         let activity = lock(&shared.activity);
         if activity.0 == 0 && activity.1.elapsed() >= idle {
             shared.claim(Some(format!("idle for {} s; stopping", idle.as_secs_f64())));
@@ -595,9 +595,9 @@ mod tests {
 
     #[test]
     fn a_connection_accepted_once_the_handler_is_stopping_is_closed_unread() {
-        // The stop decision and the count of a new connection are made under one lock: a
-        // connection is served to the end, or closed before anything of it is read, and its
-        // client finds the handler gone (a routed read then runs on the files).
+        // The stop flag is looked at under the lock that counts a new connection: one accepted
+        // once it is set is closed before anything of it is read, and its client finds the
+        // handler gone (a routed read then runs on the files).
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None, None).unwrap());
         let shared = shared();
