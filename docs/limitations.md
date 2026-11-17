@@ -56,7 +56,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: tsvz-rs applies the strict-store tail rule to loose files; changing it touches how a store
   follows appends (`Store::refresh` holds the tail until a newline completes it). Found in 0.1.4's
   differential runs against TSVZ.py 5.18; the other differences are in the entry below.
-- Revisit when: the next tsvz-rs version. The plan: read a loose file's tail as a line, and write a
+- Revisit when: 0.2.1. The plan: read a loose file's tail as a line, and write a
   newline before an append instead of cutting it, as TSVZ.py does.
 - Noted: 2026-11-15, in the 0.1.4 build; a deferral under the user's standing rule that deferrals
   are noted, not asked.
@@ -82,7 +82,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   0.1.4 brought the column count (and with it the width rows are padded to), deletions, rewrites and keys alone in
   line with TSVZ.py's, which was what the user asked for ("Fix both in 0.1.4"), and left the read of cells and keys
   as it was.
-- Revisit when: the next tsvz-rs version. The plan: port TSVZ.py's line rule (`_processLine`, with `_unsanitize`
+- Revisit when: 0.2.1. The plan: port TSVZ.py's line rule (`_processLine`, with `_unsanitize`
   and `_fitRow`) as one function for loose reads, with TSVZ.py as the oracle.
 - Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that deferrals are
   noted, not asked.
@@ -96,7 +96,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   any column count, so that leftover `k` did not show; tsvz-rs 0.1.4 lists it.
 - Why: the delete reads the first keyed line, then appends under the lock without checking that the
   file is still the one it read. The window is the time between the two.
-- Revisit when: the next tsvz-rs version. The plan: append only while the file still has the stamp
+- Revisit when: 0.2.1. The plan: append only while the file still has the stamp
   it was read with, and read again otherwise, as the one-column rewrite already does.
 - Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that
   deferrals are noted, not asked.
@@ -120,7 +120,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that look in the read and removed it from the read (a scrub still uses it to find a marked part): it cost a second decode of each part's start (most on bzip2 parts and on a
   snapshot part of one large member), and leaving bzip2 out of it made the answer on such a store depend on
   the codec.
-- Revisit when: the next tsvz-rs version. The plan: the read judges a part from its first lines as it decodes
+- Revisit when: 0.2.1. The plan: the read judges a part from its first lines as it decodes
   them, one rule for every codec, and a look before the read only chooses where to begin, from each part's
   first page; the read of that part confirms it, or the store is read again from part 0. It must also choose,
   for the first case, between §4.10 and TSVZ.py's start (§19.10.3 says the result is the same, which does not
@@ -143,7 +143,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     line and took no time (TSVZ.py's own delete: 1,422 MiB, 7 s).
 - Why: the rewrite keeps each line it keeps as the file has it, so it holds every line, each in its own buffer,
   until it decides which go.
-- Revisit when: the next tsvz-rs version. The plan: rewrite in two passes. The first keeps a kind and a key number
+- Revisit when: 0.2.1. The plan: rewrite in two passes. The first keeps a kind and a key number
   for each line, and each key's latest line; the second streams the file and writes the kept lines. Memory then
   follows the keys, as 0.1.3's did. A one-column delete streams the same way: one pass to see which lines go, one
   to write the rest.
@@ -164,7 +164,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: the read decodes a compressed part as one slice, where a damaged member's bytes run to the next member's
   start, found by looking ahead; a separate streaming look at the first lines read past a damaged member into the
   next one (0.1.4's third review), so it was removed.
-- Revisit when: the next tsvz-rs version. The plan: decode a part from the file a member at a time; the delete's
+- Revisit when: 0.2.1. The plan: decode a part from the file a member at a time; the delete's
   read then stops as a plain file's does, with no second decoder.
 - Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
   noted, not asked.
@@ -191,7 +191,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: tsvz-rs names a loose line's key in several places, each by a rule of its own (the rewrite's stand-in
   key, the line kinds of a scrub, the follow state's byte-order mark), where TSVZ.py has one function; these
   cases fall between them.
-- Revisit when: the next tsvz-rs version. The plan: the port of `_processLine` that "Loose reads still differ
+- Revisit when: 0.2.1. The plan: the port of `_processLine` that "Loose reads still differ
   from TSVZ.py's in six ways" plans, as one function for a line's key and kind in the read, the rewrite and the
   follow state, with TSVZ.py as the oracle; these cases go into its tests.
 - Noted: 2026-11-16, in the 0.1.4 re-review; a deferral under the user's standing rule that deferrals are

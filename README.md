@@ -30,7 +30,7 @@ into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scru
 one-part store in place. In a multi-part store it writes the parts before the active one as a
 new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
 applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
-as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to the next version. `scrub` and
+as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to 0.2.1. `scrub` and
 `clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
 Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
@@ -98,6 +98,23 @@ against TSVZ.py on random stores, with and without its handler. Rust and Python 
 share a store: they take the same file locks. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.0 from 0.1.4
+
+The library changes, so a `0.1` requirement does not take 0.2.0: `tsvz::lock::Handle` is gone
+(open a store's files with `std::fs::File`), and `tsvz::maint::snapshot` is no longer public
+(`scrub` writes snapshots). Of the `#[doc(hidden)]` internals, `lock::lock` takes the file alone
+and `Writer::append_runs_at` is now `append_at`.
+
+- On macOS appends take `flock`, as TSVZ.py 5.3 and later do, instead of a classic POSIX lock;
+  the two exclude each other there, so hosts can be upgraded one at a time.
+- A command that reaches a handler as it stops no longer gets `the handler is stopping`: the
+  handler closes the connection, so `read`, `get`, `has`, `len` and `keys` run on the files and
+  succeed (they exited 1), and any other command exits 1 saying the request may or may not have
+  been applied (nothing of it is made, as before).
+- A compressed batch that sets `#_member_size_#` is written at the member size it started with;
+  the new size applies from the next batch. Reads are unchanged.
+- A scrub tried again because a writer appended meanwhile keeps every `.damaged-` copy it made.
 
 ## Upgrading to 0.1.4 from 0.1.3
 
