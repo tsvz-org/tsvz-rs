@@ -13,7 +13,6 @@ use hashbrown::HashMap;
 use crate::codec::{self, Item, Walk};
 use crate::escape;
 use crate::frame::{Framer, Line};
-use crate::lock::Handle;
 use crate::name::{self, Codec, Format};
 use crate::parts::{self, Stamp};
 use crate::replay::{Binding, Cells, Damage, EMPTY_CELLS, Markers, Mismatch, Policy, Replay, Sink};
@@ -418,7 +417,7 @@ fn first_lines_say_no(
 /// their checks (bzip2 gives nothing before a whole block, up to 900 kB of text). A part whose
 /// start cannot be read, or holds damage before the marker, is not one (§19.10.3).
 pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
-    let Ok(file) = Handle::open_read(&part.path) else {
+    let Ok(file) = File::open(&part.path) else {
         return false;
     };
     let mut reader: &File = &file;
@@ -499,10 +498,8 @@ pub struct Store {
     /// An earlier part kept changing while the store was read (an in-place rewrite, §19.8):
     /// the read may be torn.
     torn: bool,
-    /// The last part (plain), kept open to follow what is appended to it: a follow opens no
-    /// file, so none waits to be closed while this process holds a classic lock on it
-    /// ([`Handle`]).
-    last: Option<Handle>,
+    /// The last part (plain), kept open to follow what is appended to it, with its inode.
+    last: Option<(File, u64)>,
     /// Whether its directory's timestamp shows every change of its names.
     pub(crate) dirs: parts::DirTrust,
     /// The bytes after a loose file's last newline, kept with its lines.
@@ -693,16 +690,16 @@ impl Store {
 
     /// Replay one part; `last` marks the store's last part, whose end the follow state records.
     fn read_part(&mut self, part: &parts::Part, last: bool) -> Result<(), Error> {
-        let file = Handle::open_read(&part.path).map_err(|e| Error::io(&part.path, e))?;
+        let file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
         let mut reader: &File = &file;
-        let meta = file.opened();
+        let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
         if meta.is_dir() {
             return Err(Error::io(
                 &part.path,
                 std::io::Error::from(std::io::ErrorKind::IsADirectory),
             ));
         }
-        self.follow.stamps.push(Some(Stamp::of(meta)));
+        self.follow.stamps.push(Some(Stamp::of(&meta)));
         if part.codec.is_some_and(|c| !c.supported()) {
             return Err(unsupported(part));
         }
@@ -758,7 +755,7 @@ impl Store {
             self.follow.line = framer.number();
             self.follow.tail = framer.tail().to_vec();
             self.follow.check = read_check(&file, framer.committed());
-            self.last = Some(file);
+            self.last = Some((file, meta.ino()));
         }
         Ok(())
     }
@@ -1005,14 +1002,12 @@ impl Store {
             return Ok(false); // an append only ever grows the same file
         }
         let io = |e: std::io::Error| Error::io(&path, e);
-        if self
-            .last
-            .as_ref()
-            .is_none_or(|h| h.opened().ino() != stamp.ino)
-        {
-            self.last = Some(Handle::open_read(&path).map_err(io)?);
+        if self.last.as_ref().is_none_or(|(_, ino)| *ino != stamp.ino) {
+            let file = File::open(&path).map_err(io)?;
+            let ino = file.metadata().map_err(io)?.ino();
+            self.last = Some((file, ino));
         }
-        let file = self.last.as_ref().expect("opened above");
+        let (file, _) = self.last.as_ref().expect("opened above");
         let mut check = vec![0u8; want];
         if file
             .read_exact_at(&mut check, offset - want as u64)
@@ -1234,26 +1229,27 @@ mod tests {
     }
 
     #[test]
-    fn following_appends_opens_no_file_to_close_under_a_lock() {
-        // A handler follows the files while its writer holds the lock: on macOS (classic
-        // locks) every descriptor it closed meanwhile would wait for the lock's release.
+    fn following_appends_keeps_a_classic_lock() {
+        // A handler follows the files while its writer holds the lock. Where the lock is a
+        // classic POSIX one, closing any descriptor of the file in the process releases it, so
+        // a follow must open and close none.
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsvz", b"a\t1\n");
         let mut store = Store::open(&p, Options::default()).unwrap();
-        let file = Handle::open(&p, fs::OpenOptions::new().append(true)).unwrap();
-        let guard = crate::lock::lock_classic(&file, &p).unwrap();
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let guard = crate::lock::lock_classic(&file).unwrap();
         for i in 0..3 {
-            (&*file).write_all(format!("k{i}\tv\n").as_bytes()).unwrap();
+            (&file).write_all(format!("k{i}\tv\n").as_bytes()).unwrap();
             assert_eq!(store.refresh().unwrap(), Refreshed::Followed);
+            assert!(
+                crate::lock::locked_elsewhere(&p),
+                "follow {i} released the classic lock"
+            );
         }
-        assert_eq!(
-            crate::lock::waiting_on(&p),
-            Some(0),
-            "descriptors waiting for the lock"
-        );
         drop(guard);
         assert_eq!(store.len(), 4);
     }
+
     #[test]
     fn a_loose_delimiter_must_be_one_ascii_character_other_than_a_line_break() {
         // A byte past ASCII cuts characters in two (a panic); a line break splits rows.

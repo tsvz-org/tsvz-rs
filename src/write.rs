@@ -197,43 +197,32 @@ pub(crate) fn marker_effect(r: &Record) -> Option<(String, crate::Markers)> {
     crate::replay::apply_marker(&mut m, &key, value).then_some((key, m))
 }
 
-/// `records` encoded for `format` as runs, each with the member size in force where it starts
-/// (§16.7): `member_size`, then from the record after each valid `#_member_size_#` marker on,
-/// the size it sets, as a reader replays them (a loose file carries no marker semantics, §19.10.2).
-pub(crate) fn runs(
-    records: &[Record],
-    format: Format,
-    member_size: u64,
-) -> Result<Vec<(String, u64)>, Error> {
-    let mut runs = vec![(String::new(), member_size)];
+/// `records` encoded for `format`, one after another.
+pub(crate) fn encode(records: &[Record], format: Format) -> Result<String, Error> {
+    let mut out = String::new();
     for r in records {
-        let at = runs.len() - 1;
-        encode_record(r, format, &mut runs[at].0)?;
-        if let (true, Some((key, m))) = (format.strict, marker_effect(r)) {
-            if key == "#_member_size_#" && m.member_size != runs[at].1 {
-                runs.push((String::new(), m.member_size));
-            }
-        }
+        encode_record(r, format, &mut out)?;
     }
-    runs.retain(|(run, _)| !run.is_empty());
-    Ok(runs)
+    Ok(out)
 }
 
-/// Where [`Writer::append_runs_at`] appended, the part's stamp just before and after, and
+/// Where [`Writer::append_at`] appended, the part's stamp just before and after, and
 /// the file it appended through (still open: it syncs that file even once renamed).
 #[doc(hidden)]
 pub struct Appended {
     pub part: PathBuf,
     pub before: parts::Stamp,
     pub after: parts::Stamp,
-    pub file: lock::Handle,
+    pub file: File,
 }
 
-/// Whether `path` still names the file `file` was opened as.
-fn names(path: &Path, file: &lock::Handle) -> bool {
+/// Whether `path` still names the file `file` is open on.
+fn names(path: &Path, file: &File) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let opened = file.opened();
-    std::fs::metadata(path).is_ok_and(|m| m.dev() == opened.dev() && m.ino() == opened.ino())
+    let (Ok(open), Ok(named)) = (file.metadata(), std::fs::metadata(path)) else {
+        return false;
+    };
+    named.dev() == open.dev() && named.ino() == open.ino()
 }
 
 fn stamp(file: &File) -> io::Result<parts::Stamp> {
@@ -242,10 +231,10 @@ fn stamp(file: &File) -> io::Result<parts::Stamp> {
 
 /// Appends batches of records to a store's active part (§17.7).
 ///
-/// Each append holds the write lock shared with TSVZ.py: where only a classic POSIX lock is
-/// available (macOS, and Linux without open file description locks), closing another
-/// descriptor of the part in this process releases it. A program that appends with a `Writer`
-/// should not open the store's parts by other means meanwhile.
+/// Each append holds the write lock shared with TSVZ.py (an open file description lock on
+/// Linux, `flock` on macOS). Where the kernel or file system refuses it, the lock is a classic
+/// POSIX lock, which closing any other descriptor of the part in this process releases
+/// (docs/limitations.md).
 pub struct Writer {
     store: PathBuf,
     format: Format,
@@ -308,11 +297,14 @@ impl Writer {
         self.format
     }
 
-    /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2).
+    /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2). A compressed
+    /// batch is written in members of the writer's member size, also when it sets
+    /// `#_member_size_#` itself (§16.7 is a SHOULD): the writer's size does not follow the
+    /// marker (the handler passes it on to its next batch with [`Writer::append_at`]).
     pub fn append(&mut self, records: &[Record]) -> Result<(), Error> {
-        let runs = runs(records, self.format, self.member_size as u64)?;
-        let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (r.as_bytes(), *n)).collect();
-        self.append_runs_at(&runs).map(|_| ())
+        let payload = encode(records, self.format)?;
+        self.append_at(payload.as_bytes(), self.member_size as u64)
+            .map(|_| ())
     }
 
     /// Append encoded records (each ending in `\n`) as one batch. A `#_snapshot_#` line in a
@@ -329,16 +321,14 @@ impl Writer {
                 }
             }
         }
-        self.append_runs_at(&[(payload, self.member_size as u64)])
-            .map(|_| ())
+        self.append_at(payload, self.member_size as u64).map(|_| ())
     }
 
-    /// Append encoded records as one batch: runs of them, each in members of its own size
-    /// (§16.7) on a compressed part. Says where the batch went and how the part looked, under
-    /// the lock, just before and after it: what the handler needs to tell its own appends from
-    /// other writers'.
+    /// Append encoded records as one batch, in members of `member_size` bytes on a compressed
+    /// part (§16.7). Says where the batch went and how the part looked, under the lock, just
+    /// before and after it: what the handler needs to tell its own appends from other writers'.
     #[doc(hidden)]
-    pub fn append_runs_at(&mut self, runs: &[(&[u8], u64)]) -> Result<Appended, Error> {
+    pub fn append_at(&mut self, payload: &[u8], member_size: u64) -> Result<Appended, Error> {
         // The part is locked as it was opened; when by then it is no longer the store's active
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
         // rotated away), the active part is looked up again. Only a store with no part yet is
@@ -358,34 +348,22 @@ impl Writer {
             let io = |e: io::Error| Error::io(path, e);
             let bytes: Cow<[u8]> = match part.codec {
                 Some(codec) => {
-                    let mut bytes = Vec::new();
-                    for (run, member_size) in runs {
-                        let size = usize::try_from(*member_size).unwrap_or(usize::MAX).max(1);
-                        bytes.extend(codec::encode_members(codec, run, size).ok_or_else(|| {
-                            Error::UnsupportedCodec {
-                                path: path.to_path_buf(),
-                                codec: codec.name(),
-                            }
-                        })?);
-                    }
-                    bytes.into()
+                    let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
+                    codec::encode_members(codec, payload, size)
+                        .ok_or_else(|| Error::UnsupportedCodec {
+                            path: path.to_path_buf(),
+                            codec: codec.name(),
+                        })?
+                        .into()
                 }
-                None => match runs {
-                    [(run, _)] => (*run).into(),
-                    _ => runs
-                        .iter()
-                        .map(|(r, _)| *r)
-                        .collect::<Vec<_>>()
-                        .concat()
-                        .into(),
-                },
+                None => payload.into(),
             };
             let mut options = OpenOptions::new();
             options
                 .append(true)
                 .create(create)
                 .read(part.codec.is_none());
-            let file = match lock::Handle::open(path, &options) {
+            let file = match options.open(path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !create => {
                     let e = io(e);
@@ -397,7 +375,7 @@ impl Writer {
                 }
                 Err(e) => return Err(io(e)),
             };
-            let guard = lock::lock(&file, path).map_err(io)?;
+            let guard = lock::lock(&file).map_err(io)?;
             // Still the active part: the directory kept its timestamp, and shows no name made,
             // renamed or removed since the listing (parts::DirTrust), in which part 0 was no
             // symbolic link (its target is elsewhere); else listed again.
@@ -407,17 +385,27 @@ impl Writer {
                 missing = None;
                 continue;
             }
-            let before = stamp(&file).map_err(io)?;
-            let start = match part.codec {
-                Some(_) => before.size,
-                None => {
-                    self.cut_torn_tail(&file, path).map_err(io)?;
-                    file.metadata().map_err(io)?.len()
-                }
-            };
-            self.write_batch(&file, path, &bytes, start)?;
-            let after = stamp(&file).map_err(io)?;
+            // The warning of a cut tail is sent once the lock is let go, whatever else happened:
+            // a callback that opens this part would otherwise release a classic lock
+            // (docs/limitations.md).
+            let mut cut = None;
+            let locked = (|| {
+                let before = stamp(&file).map_err(io)?;
+                let start = match part.codec {
+                    Some(_) => before.size,
+                    None => {
+                        cut = self.cut_torn_tail(&file, path).map_err(io)?;
+                        file.metadata().map_err(io)?.len()
+                    }
+                };
+                self.write_batch(&file, path, &bytes, start)?;
+                Ok::<_, Error>((before, stamp(&file).map_err(io)?))
+            })();
             drop(guard);
+            if let (Some(w), Some(warning)) = (&self.warn, &cut) {
+                w(warning);
+            }
+            let (before, after) = locked?;
             return Ok(Appended {
                 part: part.path.clone(),
                 before,
@@ -464,30 +452,27 @@ impl Writer {
 
     /// An uncommitted tail would join the first appended record, so it is cut first: TSVZ.py
     /// does that in a store, but in a loose file it ends the last line instead, and the cut here
-    /// loses that row (docs/limitations.md).
-    fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<()> {
+    /// loses that row (docs/limitations.md). Says what was cut, as the warning to send.
+    fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<Option<Warning>> {
         let size = file.metadata()?.len();
         if size == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let mut last = [0u8; 1];
         file.read_exact_at(&mut last, size - 1)?;
         if last[0] == b'\n' {
-            return Ok(());
+            return Ok(None);
         }
         let keep = last_newline_end(file, size)?;
         file.set_len(keep)?;
-        if let Some(w) = &self.warn {
-            w(&Warning {
-                part: path.to_path_buf(),
-                offset: Some(keep),
-                message: format!(
-                    "cut {} uncommitted bytes after the last newline before appending",
-                    size - keep
-                ),
-            });
-        }
-        Ok(())
+        Ok(Some(Warning {
+            part: path.to_path_buf(),
+            offset: Some(keep),
+            message: format!(
+                "cut {} uncommitted bytes after the last newline before appending",
+                size - keep
+            ),
+        }))
     }
 }
 
@@ -817,6 +802,28 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_of_a_cut_tail_is_sent_after_the_lock_is_let_go() {
+        // The callback asks, from another process, whether the part is locked: it is not, so the
+        // lock is let go before the warning is sent. The lock taken here is the open file
+        // description lock (`flock` on macOS); the classic fallback has tests of its own in
+        // lock.rs.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, b"a\t1\ntorn").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sink, part) = (seen.clone(), p.clone());
+        let mut w =
+            Writer::open(&p)
+                .unwrap()
+                .warnings(Some(std::sync::Arc::new(move |_: &Warning| {
+                    sink.lock().unwrap().push(lock::locked_elsewhere(&part))
+                })));
+        w.append(&[Record::from_args("b", &["2".into()])]).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [false], "locked while it was sent");
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n");
+    }
+
+    #[test]
     fn appends_go_to_the_last_part() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("s.tsvz"), "a\t1\n").unwrap();
@@ -855,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn records_after_a_member_size_marker_take_its_size_in_the_same_append() {
+    fn an_append_that_sets_a_member_size_is_written_at_the_size_it_started_with() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz.gz");
         let row = |k: &str| Record::from_args(k, &["v".repeat(20)]);
@@ -874,8 +881,9 @@ mod tests {
                     other => panic!("{other:?}"),
                 })
                 .collect();
-        // a, b and the marker in a 1 MiB member; then c and d, 23 bytes each, one per member.
-        assert_eq!(members, [3, 1, 1]);
+        // One batch, one member size (§16.7 is a SHOULD, as TSVZ.py takes it): all five lines in
+        // one 1 MiB member, where 30 bytes would give c and d one each.
+        assert_eq!(members, [5]);
     }
 
     /// Wait until a thread waits at the lock of `path`.
@@ -894,8 +902,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();
-        let held = lock::Handle::open(&p, OpenOptions::new().append(true)).unwrap();
-        let guard = lock::lock(&held, &p).unwrap();
+        let held = OpenOptions::new().append(true).open(&p).unwrap();
+        let guard = lock::lock(&held).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
             Writer::open(&store)
@@ -1034,8 +1042,8 @@ mod tests {
         let Some(_ahead) = kept_and_aged(&p) else {
             return;
         };
-        let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
-        let guard = lock::lock(&held, &one).unwrap();
+        let held = OpenOptions::new().append(true).open(&one).unwrap();
+        let guard = lock::lock(&held).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
             let _ahead = parts::RunAhead::by(60);
@@ -1063,8 +1071,8 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         let one = dir.path().join("s.tsvz.1");
         fs::write(&one, "b\t2\n").unwrap();
-        let held = lock::Handle::open(&one, OpenOptions::new().append(true)).unwrap();
-        let guard = lock::lock(&held, &one).unwrap();
+        let held = OpenOptions::new().append(true).open(&one).unwrap();
+        let guard = lock::lock(&held).unwrap();
         let store = p.clone();
         let writer = std::thread::spawn(move || {
             Writer::open(&store)

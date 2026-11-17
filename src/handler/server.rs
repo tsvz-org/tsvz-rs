@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -315,9 +315,8 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
             config.verbose,
         );
     }
-    refuse_queued(&listener);
-    drop(listener);
-    finish_connections(&engine, &shared);
+    drop(listener); // the clients still in its queue find their connection closed
+    finish_connections(&shared);
     engine.close();
     let _ = std::fs::remove_dir_all(&dir);
     held.release();
@@ -325,67 +324,16 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     Ok(())
 }
 
-/// Tell a client the handler is stopping, before reading anything of its request: nothing of it
-/// is made, and the client knows so.
-fn refuse(mut stream: UnixStream) {
-    refuse_within(&mut stream, Duration::from_millis(200));
-}
-
-/// [`refuse`], waiting at most `patience` in all for the client to close (a client that sends
-/// a byte now and then gets no more time), and reading at most 64 KiB of its request.
-fn refuse_within(stream: &mut UnixStream, patience: Duration) {
-    let _ = stream.write_all(&Response::failed(1, "the handler is stopping").encode());
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    // Closing with the request unread would reset the connection, and the answer with it: read
-    // and drop what the client sent, for a moment, until it closes.
-    let deadline = Instant::now() + patience;
-    let mut sink = [0u8; 4096];
-    for _ in 0..16 {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
-            break;
-        }
-        if !matches!(stream.read(&mut sink), Ok(n) if n > 0) {
-            break;
-        }
-    }
-}
-
-/// Refuse the clients still waiting in the listen queue, rather than reset them as closing the
-/// listener would: a reset leaves a client unsure whether its request was made. At most
-/// [`QUEUED`] clients, within [`REFUSING`]: clients that keep connecting cannot hold a stop.
-fn refuse_queued(listener: &UnixListener) {
-    if listener.set_nonblocking(true).is_err() {
-        return;
-    }
-    let deadline = Instant::now() + REFUSING;
-    for _ in 0..QUEUED {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        let Ok((mut stream, _)) = listener.accept() else {
-            break;
-        };
-        if stream.set_nonblocking(false).is_ok() {
-            refuse_within(&mut stream, left.min(Duration::from_millis(200)));
-        }
-    }
-}
-
-/// The most queued clients a stop refuses, and how long it spends on them.
-const QUEUED: usize = 128;
-const REFUSING: Duration = Duration::from_secs(1);
-
 /// How long a stop waits for the requests already read to be answered.
 const FINISH: Duration = Duration::from_secs(5);
 
-/// End the open connections as a stop does: requests from now on are refused; the ones already
-/// read finish and are answered (a pop in flight has written its tombstone: its row must reach
-/// its client); then each connection ends when it reads its next line. A connection still open
-/// after [`FINISH`] (a client not reading its answer) is cut off.
-fn finish_connections(engine: &Engine, shared: &Shared) {
-    engine.refuse();
+/// End the open connections as a stop does: no request sent from now on is read; the ones
+/// already read finish and are answered (a pop in flight has written its tombstone: its row
+/// must reach its client), and on Linux so do those already queued on the connection, which
+/// the shutdown leaves readable (macOS drops them); then each connection ends when it reads
+/// its next line. A connection still open after [`FINISH`] (a client not reading its answer)
+/// is cut off.
+fn finish_connections(shared: &Shared) {
     for conn in lock(&shared.open).values() {
         let _ = conn.shutdown(std::net::Shutdown::Read);
     }
@@ -422,8 +370,8 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>) {
     let tick = (idle / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
     while !shared.stopping.load(Ordering::SeqCst) {
         std::thread::sleep(tick);
-        // Decided under the lock that counts new connections: one counted before is served to
-        // its end, one after is refused (start_connection).
+        // Claimed while holding the lock that counts new connections (start_connection counts
+        // under it), so none is counted between the check that none is open and the stop.
         let activity = lock(&shared.activity);
         if activity.0 == 0 && activity.1.elapsed() >= idle {
             shared.claim(Some(format!("idle for {} s; stopping", idle.as_secs_f64())));
@@ -433,7 +381,8 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>) {
 
 /// Serve `stream` on a thread of its own, made by `builder`. The connection is counted and
 /// registered here, as it is accepted: the idle timeout never sees an accepted connection as
-/// none, and a stop always ends it. When no thread can be made (a task limit, no memory), the
+/// none, and a stop always ends it; one accepted once the handler is stopping is closed unread,
+/// as a client finds a handler gone. When no thread can be made (a task limit, no memory), the
 /// connection is closed, the fact is reported, and the handler keeps serving:
 /// `std::thread::spawn` would panic, and the release build aborts on panic.
 fn start_connection(
@@ -447,8 +396,6 @@ fn start_connection(
     {
         let mut activity = lock(&shared.activity);
         if shared.stopping.load(Ordering::SeqCst) {
-            drop(activity);
-            refuse(stream);
             return false;
         }
         activity.0 += 1;
@@ -649,9 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_accepted_once_the_handler_is_stopping_is_told_so_not_served() {
-        // The stop decision and the count of a new connection are made under one lock: a
-        // connection is served to the end, or refused before anything of it is read.
+    fn a_connection_accepted_once_the_handler_is_stopping_is_closed_unread() {
+        // The stop flag is looked at under the lock that counts a new connection: one accepted
+        // once it is set is closed before anything of it is read, and its client finds the
+        // handler gone (a routed read then runs on the files).
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("s.tsvz"), None, None).unwrap());
         let shared = shared();
@@ -667,9 +615,9 @@ mod tests {
             info,
             false
         ));
-        let mut answer = String::new();
-        client.read_to_string(&mut answer).unwrap();
-        assert_eq!(answer, "#1\tthe handler is stopping\n");
+        let mut answer = Vec::new();
+        let _ = client.read_to_end(&mut answer); // the end of the connection, or a reset
+        assert!(answer.is_empty(), "answered {answer:?}");
         assert_eq!(lock(&shared.activity).0, 0, "never counted");
         assert!(lock(&shared.open).is_empty());
         engine.close();
@@ -678,56 +626,6 @@ mod tests {
             b"",
             "nothing written"
         );
-    }
-
-    #[test]
-    fn a_client_sending_slowly_cannot_hold_a_refusal() {
-        // The wait is one deadline, not a timeout per read that a trickle of bytes renews.
-        let (mut client, mut end) = UnixStream::pair().unwrap();
-        let trickle = std::thread::spawn(move || {
-            for _ in 0..40 {
-                if client.write_all(b"x").is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
-        let started = Instant::now();
-        refuse_within(&mut end, Duration::from_millis(200));
-        let took = started.elapsed();
-        drop(end);
-        trickle.join().unwrap();
-        assert!(took < Duration::from_millis(600), "held for {took:?}");
-    }
-
-    #[test]
-    fn refusing_the_queued_clients_ends_even_when_they_keep_coming() {
-        // A client connecting again and again must not keep a handler from stopping.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s");
-        let listener = UnixListener::bind(&path).unwrap();
-        let flooding = Arc::new(AtomicBool::new(true));
-        let flood = {
-            let (path, flooding) = (path.clone(), flooding.clone());
-            std::thread::spawn(move || {
-                while flooding.load(Ordering::SeqCst) {
-                    if let Ok(mut c) = UnixStream::connect(&path) {
-                        let _ = c.write_all(b"len\n"); // and keep it open, unread
-                        std::mem::forget(c);
-                    }
-                }
-            })
-        };
-        std::thread::sleep(Duration::from_millis(50));
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            refuse_queued(&listener);
-            let _ = done.send(());
-        });
-        let ended = finished.recv_timeout(Duration::from_secs(3));
-        flooding.store(false, Ordering::SeqCst);
-        flood.join().unwrap();
-        assert!(ended.is_ok(), "refusing queued clients never ended");
     }
 
     #[test]

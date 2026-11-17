@@ -8,13 +8,13 @@
 //! are waited for outside it.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::handler::protocol::{Request, Response};
-use crate::lock::Handle;
 use crate::maint::{self, Outcome};
 use crate::name::{self, Format};
 use crate::ops::{self, Out, Plan};
@@ -34,8 +34,11 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Entry {
     seq: u64,
-    /// The request's records, encoded, in runs of one member size each (§16.7).
-    runs: Vec<(String, u64)>,
+    /// The request's records, encoded.
+    payload: String,
+    /// The member size in force where the entry lands (§16.7): the first entry's is its
+    /// batch's.
+    member_size: u64,
     durable: bool,
     /// A request waits for its outcome.
     waited: bool,
@@ -58,7 +61,7 @@ struct Queue {
     foreign: u64,
     /// Each part a batch was appended to without an fsync since, by path and inode, with the
     /// file it was appended through.
-    unsynced: Vec<(PathBuf, u64, Handle)>,
+    unsynced: Vec<(PathBuf, u64, File)>,
     /// A sync of a part left behind that failed, until a flush reports it.
     sync_error: Option<String>,
     /// Syncs of parts left behind under way, which a flush waits for.
@@ -78,15 +81,17 @@ struct Batcher {
 }
 
 impl Batcher {
-    /// Queue `runs` (records encoded for the store, each ending in `\n`, with their member
-    /// sizes); its sequence number. A `waited` entry's outcome is kept for [`Batcher::wait`].
-    fn submit(&self, runs: Vec<(String, u64)>, durable: bool, waited: bool) -> u64 {
+    /// Queue `payload` (records encoded for the store, each ending in `\n`), to land where
+    /// `member_size` is in force; its sequence number. A `waited` entry's outcome is kept for
+    /// [`Batcher::wait`].
+    fn submit(&self, payload: String, member_size: u64, durable: bool, waited: bool) -> u64 {
         let mut q = lock(&self.queue);
         q.submitted += 1;
         let seq = q.submitted;
         q.entries.push(Entry {
             seq,
-            runs,
+            payload,
+            member_size,
             durable,
             waited,
         });
@@ -180,19 +185,14 @@ impl Batcher {
             };
             let durable = batch.iter().any(|e| e.durable);
             let last = batch[batch.len() - 1].seq;
-            // Each write keeps the member size in force where it lands; neighbours of one size
-            // share members.
-            let mut runs: Vec<(Vec<u8>, u64)> = Vec::new();
-            for (run, size) in batch.iter().flat_map(|e| &e.runs) {
-                match runs.last_mut() {
-                    Some((bytes, s)) if s == size => bytes.extend_from_slice(run.as_bytes()),
-                    _ => runs.push((run.as_bytes().to_vec(), *size)),
-                }
-            }
-            let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (&r[..], *n)).collect();
+            // The whole batch at the member size in force where it starts, one size for a batch
+            // as TSVZ.py writes it (§16.7 is a SHOULD); a size it sets applies from the next
+            // batch (TSVZ.py's, once it has read its marker back: the layout alone differs).
+            let member_size = batch[0].member_size;
+            let payload: String = batch.iter().map(|e| e.payload.as_str()).collect();
             let result = Writer::open(&self.store).and_then(|w| {
                 let mut w = w.fsync(durable).warnings(self.log.clone()).dirs(dirs);
-                let appended = w.append_runs_at(&runs);
+                let appended = w.append_at(payload.as_bytes(), member_size);
                 dirs = w.dirs_known();
                 appended
             });
@@ -213,7 +213,7 @@ impl Batcher {
                         q.foreign += 1;
                     }
                     let (part, ino) = (appended.part.clone(), appended.after.ino);
-                    let listed = |(p, i, _): &(PathBuf, u64, Handle)| *p == part && *i == ino;
+                    let listed = |(p, i, _): &(PathBuf, u64, File)| *p == part && *i == ino;
                     // Parts other than this one get no more of our batches: they are synced
                     // and let go below, so that open files do not pile up until stop.
                     let (this, others): (Vec<_>, Vec<_>) = std::mem::take(&mut q.unsynced)
@@ -284,7 +284,7 @@ impl Batcher {
 }
 
 /// Fsync each of `files`; the first error, once every one was tried.
-fn sync(files: &[(PathBuf, u64, Handle)]) -> Result<(), Error> {
+fn sync(files: &[(PathBuf, u64, File)]) -> Result<(), Error> {
     let mut first = Ok(());
     for (part, _, file) in files {
         if let Err(e) = file.sync_data() {
@@ -467,6 +467,8 @@ impl Engine {
         f: impl FnOnce(&mut State) -> Result<R, Error>,
     ) -> (Result<R, Error>, Vec<String>) {
         let mut st = lock(&self.state);
+        // Closed: the writer thread is on its way out and would not wait for a write made now
+        // (a request still running when a stop cut its connection off).
         let result = if st.closed {
             Err(Error::Refused("the handler is stopping".into()))
         } else {
@@ -551,10 +553,10 @@ impl Engine {
             .or(queued(st.queued_member_size, reflected))
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
-        let runs = crate::write::runs(records, self.format, member_size)?;
+        let payload = crate::write::encode(records, self.format)?;
         let durable = sync || ack == Some("disk");
         let waited = durable || written;
-        let seq = self.batcher.submit(runs, durable, waited);
+        let seq = self.batcher.submit(payload, member_size, durable, waited);
         for (key, m) in records.iter().filter_map(crate::write::marker_effect) {
             match key.as_str() {
                 "#_write_ack_#" => st.queued_ack = Some((seq, m.write_ack)),
@@ -806,12 +808,6 @@ impl Engine {
         self.batcher.flush().map_err(Error::Refused)
     }
 
-    /// Refuse every request from now on ("the handler is stopping"); requests already past that
-    /// point finish, and the writer thread goes on writing what they queue.
-    pub fn refuse(&self) {
-        lock(&self.state).closed = true;
-    }
-
     /// Answer no more requests; write and fsync everything queued, and end the writer thread.
     pub fn close(&self) {
         lock(&self.state).closed = true;
@@ -1038,14 +1034,14 @@ mod tests {
         // Markers queued but not yet written (the writer waits for the lock) govern what follows.
         e.batcher.barrier(); // written, so that the writer next takes the entry below alone
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock(&file, &p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
         submit(&marker("#_WRITE_ACK_#", "Memory"));
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
         }
         submit(&marker("#_member_size_#", "7"));
         assert!(!submit(&data()).waited, "#_write_ack_# memory, queued");
-        let last_size = || lock(&e.batcher.queue).entries.last().unwrap().runs[0].1;
+        let last_size = || lock(&e.batcher.queue).entries.last().unwrap().member_size;
         assert_eq!(last_size(), 7);
         submit(&marker("#_member_size_#", "zero")); // invalid: ignored, as a reader ignores it
         submit(&data());
@@ -1055,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn each_write_in_a_batch_keeps_the_member_size_in_force_where_it_lands() {
+    fn a_batch_is_written_at_the_member_size_in_force_where_it_starts() {
         use crate::codec::{Item, encode_members, for_each_item};
         use crate::name::Codec;
         let dir = tempfile::tempdir().unwrap();
@@ -1073,32 +1069,29 @@ mod tests {
             values: vec!["v".into()],
         };
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock(&file, &p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
         submit(&[row("blocker".into())]); // the writer takes it, then waits for the lock
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // One batch: 200 rows and the marker under 1 MiB, then rows under 64 bytes, the last
-        // two in one request after a marker of its own.
+        // One batch: 200 rows, a marker that sets 64 bytes, and a row of 43 bytes, all at the
+        // 1 MiB in force where it starts.
         submit(
             &(0..200)
                 .map(|i| row(format!("k{i:03}")))
                 .collect::<Vec<_>>(),
         );
-        submit(&[Record::Marker {
-            key: "#_member_size_#".into(),
-            values: vec!["64".into()],
-        }]);
         submit(&[
-            row("x".repeat(40)),
             Record::Marker {
                 key: "#_member_size_#".into(),
-                values: vec![String::new()], // back to 1 MiB
+                values: vec!["64".into()],
             },
-            row("y".repeat(40)),
-            row("z".repeat(40)),
+            row("x".repeat(40)),
         ]);
         drop(held);
+        assert_eq!(ask(&e, "len").lines, ["202"]);
+        // The next batch takes the size the last one set: a member per 43-byte row.
+        submit(&[row("y".repeat(40)), row("z".repeat(40))]);
         assert_eq!(ask(&e, "len").lines, ["204"]);
         let data = fs::read(&p).unwrap();
         let mut members = Vec::new();
@@ -1108,35 +1101,7 @@ mod tests {
             }
             true
         });
-        // The blocker; the 200 rows and the 64 marker; the x row with the empty marker; then
-        // the y and z rows, together again.
-        assert_eq!(members, [1, 201, 2, 2]);
-    }
-
-    #[test]
-    fn a_follow_while_the_writer_holds_a_classic_lock_keeps_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("s.tsvz");
-        fs::write(&p, "a\t1\n").unwrap();
-        let e = engine(dir.path(), "s.tsvz");
-        append(&p, b"b\t2\n"); // another writer: the next submit follows the files
-        // The writer thread mid-append, under a classic POSIX lock (macOS).
-        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock_classic(&file, &p).unwrap();
-        let mut st = lock(&e.state);
-        let row = Record::Data {
-            key: "c".into(),
-            values: vec!["3".into()],
-        };
-        e.submit(&mut st, Instant::now(), &[row], false, None, false)
-            .unwrap();
-        drop(st);
-        assert!(
-            crate::lock::locked_elsewhere(&p),
-            "the follow's descriptor took the writer's lock with it"
-        );
-        drop(held);
-        assert_eq!(ask(&e, "keys").lines, ["a", "b", "c"]);
+        assert_eq!(members, [1, 202, 1, 1]);
     }
 
     #[test]
@@ -1202,7 +1167,7 @@ mod tests {
         e.batcher.barrier();
         assert!(!submit(&data("y")).waited);
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let held = crate::lock::lock(&file, &p).unwrap(); // y waits for the lock
+        let held = crate::lock::lock(&file).unwrap(); // y waits for the lock
         assert!(!submit(&data("z")).waited);
         (&file).write_all(b"#_write_ack_#\tdisk\n").unwrap(); // before y is written
         drop(held);

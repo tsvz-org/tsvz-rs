@@ -30,7 +30,7 @@ into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scru
 one-part store in place. In a multi-part store it writes the parts before the active one as a
 new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
 applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
-as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to the next version. `scrub` and
+as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to 0.2.1. `scrub` and
 `clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
 Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
@@ -65,7 +65,10 @@ tsvz stop people.tsvz
 The handler and TSVZ.py's (`tsvz serve`, `TSVZClient`) speak the same protocol: either tool's
 commands go through either tool's handler. It serves strict stores (`.tsvz .csvz .nsvz .psvz`).
 Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode M` sets the
-socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`.
+socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
+(SMB) mount the other commands cannot read the handler's pointer file: they warn `ignoring the
+pointer file` and work on the files, and `tsvz stop` fails: stop the handler with a signal or let
+`--x-idle-timeout` do it (deferred to 0.2.1, [docs/limitations.md](docs/limitations.md)).
 
 ## Library
 
@@ -81,11 +84,12 @@ for (key, row) in store.iter() {
 # Ok::<(), tsvz::Error>(())
 ```
 
-Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
-available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
-process loses when it closes any other descriptor of the same file. The library opens a store's
-files as `tsvz::lock::Handle`s, which it closes only once it holds no such lock on them; a
-program that opens a store's files itself while it writes should do the same.
+Appends take the same kind of file lock as TSVZ.py (an open-file-description lock on Linux,
+`flock` on macOS), and the two exclude each other. Where the system refuses it (Linux before
+3.15, or a file system without it), it is a classic POSIX lock, which a multi-threaded process
+(`tsvz serve`, or a program that reads while it appends) loses for a moment when one thread
+closes another descriptor of the file: a record it or a TSVZ.py writer appends then could be
+lost ([docs/limitations.md](docs/limitations.md)).
 
 Build without the command line and C libraries with
 `default-features = false, features = ["bzip2"]` (gzip and all digests are always in).
@@ -95,9 +99,33 @@ Build without the command line and C libraries with
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
 every codec, every digest and multi-part scrub claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
-share a store: they take the same file locks. Where the specification leaves a choice open,
+share a store: their file locks exclude each other. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.0 from 0.1.4
+
+The library changes, so a `0.1` requirement does not take 0.2.0: `tsvz::lock::Handle` is gone
+(open a store's files with `std::fs::File`), and `tsvz::maint::snapshot` is no longer public
+(`scrub` writes snapshots). Of the `#[doc(hidden)]` internals, `lock::lock` takes the file alone
+and `Writer::append_runs_at` is now `append_at`.
+
+- On macOS appends take `flock`, as TSVZ.py 5.3 and later do, instead of a classic POSIX lock;
+  the two exclude each other on a Mac's local file system, so 0.1.4 and 0.2.0 can write one
+  store there while you upgrade (across a network mount this was not tried).
+- A routed command that reaches a handler as it stops no longer gets `the handler is stopping`.
+  A request the handler had received before the stop is served and answered, for up to 5 s (on
+  Linux this includes one it had not yet read; macOS drops that one). For any other the handler
+  closes the connection: `read`, `get`, `has`, `len` and `keys` run on the files and succeed
+  (before, they exited 1), and any other routed command exits 1 saying the request may or may
+  not have been applied. A command that comes once the handler has closed its socket works on
+  the files, with a warning, as before.
+- A compressed batch that sets `#_member_size_#` is written at the member size in force where
+  it started. A handler applies the new size from its next batch, and so do `pop`, `popitem`
+  and `setdefault` on the files; `set`, `append` and `delete` on the files write at 1 MiB, as
+  before (TSVZ.py writes a `delete` of a key it strips at the size in force; only the members'
+  layout differs). Reads are unchanged.
+- A scrub tried again because a writer appended meanwhile keeps every `.damaged-` copy it made.
 
 ## Upgrading to 0.1.4 from 0.1.3
 

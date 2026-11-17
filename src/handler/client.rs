@@ -19,6 +19,12 @@ use crate::{Error, Record, WarnFn, Warning};
 /// so is every later call on it: connect again. A client never falls back to the files: open
 /// a [`crate::Store`] for that.
 ///
+/// A write to a handler that has hung up is [`Error::HandlerLost`] only while the program ignores
+/// SIGPIPE, as a Rust program does when it starts. A program that has set SIGPIPE back to its
+/// default should ignore it around calls on a `Client`: std protects a Unix socket's writes only
+/// on Linux and only from Rust 1.90, so elsewhere (macOS) and on earlier Rust the program would
+/// be ended by the signal.
+///
 /// ```no_run
 /// use tsvz::handler::Client;
 /// use tsvz::Record;

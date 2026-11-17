@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -119,6 +119,75 @@ fn store(dir: &Path, content: &str) -> PathBuf {
     p
 }
 
+/// The pointer file of `store` naming a socket this test listens on: a stand-in for a handler,
+/// to do with a connection what a real one does only when the timing allows.
+fn stand_in_handler(dir: &Path, store: &Path) -> UnixListener {
+    let sock = dir.join("sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let at = pointer::path_of(store);
+    fs::write(
+        &at,
+        format!(
+            "tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t{}\n",
+            sock.display(),
+            pointer::hostname(),
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&at, fs::Permissions::from_mode(0o644)).unwrap();
+    listener
+}
+
+/// The next connection to a stand-in handler, with a limit on every wait for its request: a
+/// command that never connects or never sends fails the test, it does not leave it hanging. 10 s
+/// is how long `Served::start` gives a process to start.
+fn accept_within_10s(listener: &UnixListener) -> UnixStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((conn, _)) => {
+                conn.set_nonblocking(false).unwrap(); // macOS passes the listener's mode on
+                conn.set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                return conn;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "no command connected");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+}
+
+/// Make a command's standard output a socket nobody reads, so that its writes fail with EPIPE as
+/// they do to a closed pipe. The pair is made in the forked child, just before it execs: no
+/// other process can hold the read end. A pair made by the test, with both ends close-on-exec,
+/// was still held by a child that another test of this binary was forking at that moment (a
+/// command got a reader and printed, in 1 of 120 runs of the binary), and a `pipe(2)` without
+/// that flag in 3 of 120.
+fn unread_stdout(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child, before exec, and calls only socketpair,
+    // close and dup2, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut fds = [0; 2];
+            if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(fds[0]);
+            if libc::dup2(fds[1], 1) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(fds[1]);
+            Ok(())
+        })
+    }
+}
+
 #[test]
 fn a_client_that_hangs_up_before_its_answer_leaves_the_handler_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -224,26 +293,20 @@ fn a_quiet_handler_still_reports_writes_that_fail() {
 #[test]
 fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
     // The handler deletes the row before the command prints it: a row that cannot be printed
-    // (here to a pipe nobody reads) is put back, not lost.
-    use std::os::fd::{FromRawFd, OwnedFd};
+    // (here to a socket nobody reads) is put back, not lost.
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "a\t1\nb\t2\n");
     let _served = Served::start(&s, &[]);
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two new descriptors into fds.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are new and owned here alone.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    drop(read);
     for op in [&["pop", "s.tsvz", "a"][..], &["popitem", "s.tsvz"][..]] {
-        let out = tsvz()
-            .current_dir(dir.path())
-            .args(op)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(write.try_clone().unwrap()))
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
+        let out = unread_stdout(
+            tsvz()
+                .current_dir(dir.path())
+                .args(op)
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped()),
+        )
+        .output()
+        .unwrap();
         assert_eq!(out.status.code(), Some(1), "{op:?}: {}", text(&out.stderr));
         assert!(
             text(&out.stderr).contains("it was put back"),
@@ -338,24 +401,18 @@ fn a_client_cannot_send_a_request_inside_a_marker_key() {
 
 #[test]
 fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
-    use std::os::fd::{FromRawFd, OwnedFd};
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "<#>_x_#\tkeep me\na\t1\n");
     let _served = Served::start(&s, &[]);
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two new descriptors into fds.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are new and owned here alone.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    drop(read);
-    let out = tsvz()
-        .current_dir(dir.path())
-        .args(["popitem", "s.tsvz", "first"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write))
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let out = unread_stdout(
+        tsvz()
+            .current_dir(dir.path())
+            .args(["popitem", "s.tsvz", "first"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .output()
+    .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("it was put back"),
@@ -368,7 +425,9 @@ fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
 #[test]
 fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     // A pop answered after its tombstone is written must reach its client, or not be made:
-    // a stop lets requests already read finish and answer, and refuses the ones after.
+    // a stop lets requests already read finish and answer, and closes the connections after.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let rows = 100_000;
     let mut content = String::from("#_write_ack_#\tdisk\n");
@@ -377,19 +436,27 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     }
     let s = store(dir.path(), &content);
     let mut served = Served::start(&s, &[]);
+    let popped = Arc::new(AtomicUsize::new(0));
     let consumers: Vec<_> = (0..4)
         .map(|_| {
             let mut client = tsvz::handler::Client::connect(&s).unwrap();
+            let popped = popped.clone();
             std::thread::spawn(move || {
                 let mut got = Vec::new();
                 while let Ok(Some(row)) = client.popitem(false) {
                     got.push(row[0].clone());
+                    popped.fetch_add(1, Ordering::SeqCst);
                 }
                 got
             })
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
+    // Stopped once the consumers are under way, however long that takes on a busy host.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while popped.load(Ordering::SeqCst) <= 10 {
+        assert!(Instant::now() < deadline, "the consumers never got going");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
     assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
     let answered: Vec<String> = consumers
@@ -410,6 +477,86 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
         answered.len()
     );
     assert!(lost.is_empty(), "deleted and never answered: {lost:?}");
+}
+
+#[test]
+fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
+    // A handler that stops closes the connections it will not serve, as TSVZ.py's does: a routed
+    // read then runs on the files; a write is not redone there, and exits 1 saying so. A stand-in
+    // handler closes them here, so that the moment is not left to chance.
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "k\tv\n");
+    let (code, direct, _) = cli(dir.path(), &["--x-direct", "get", "s.tsvz", "k"], b"");
+    assert_eq!(code, 0);
+    let listener = stand_in_handler(dir.path(), &s);
+    let closer = std::thread::spawn(move || {
+        // The read's connection: closed once its request came, unanswered.
+        let conn = accept_within_10s(&listener);
+        let mut request = String::new();
+        BufReader::new(&conn).read_line(&mut request).unwrap();
+        drop(conn);
+        // The write's: closed before its request comes.
+        drop(accept_within_10s(&listener));
+    });
+    let (code, out, err) = cli(dir.path(), &["get", "s.tsvz", "k"], b"");
+    assert_eq!((code, out.as_str()), (0, direct.as_str()), "{err}");
+    assert!(err.contains("using the files directly"), "{err}");
+    // `set -` sends once its input ends: here after its connection was closed.
+    let mut child = tsvz()
+        .current_dir(dir.path())
+        .args(["set", "s.tsvz", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    closer.join().unwrap();
+    child.stdin.take().unwrap().write_all(b"k\tw\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("may or may not have been applied"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(&s).unwrap(), "k\tv\n", "not redone");
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_named_when_the_handler_has_hung_up() {
+    // `pop` took the row and cannot print it (a socket nobody reads), and the handler has hung up
+    // since, so the row cannot be put back either: the command exits 1 naming the row, not ended
+    // by SIGPIPE. A stand-in handler shuts its end for reading before it answers, so that the
+    // put-back fails whatever the timing.
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let listener = stand_in_handler(dir.path(), &s);
+    let handler = std::thread::spawn(move || {
+        let conn = accept_within_10s(&listener);
+        let mut request = String::new();
+        BufReader::new(&conn).read_line(&mut request).unwrap();
+        conn.shutdown(std::net::Shutdown::Read).unwrap();
+        (&conn).write_all(b"a\t1\n#0\n").unwrap();
+    });
+    let out = unread_stdout(
+        tsvz()
+            .current_dir(dir.path())
+            .args(["pop", "s.tsvz", "a"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .output()
+    .unwrap();
+    handler.join().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("could not be printed nor put back")
+            && text(&out.stderr).contains("a\t1"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]

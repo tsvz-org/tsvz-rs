@@ -96,14 +96,12 @@ fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
             .any(|(j, c)| c.is_empty() && m.defaults.get(j).is_some_and(|d| !d.is_empty())))
 }
 
-/// The snapshot content of §19.2.3 for a store read whole, as TSVZ.py writes it: the header
-/// comment, the markers, then one fully resolved row per live key, padded with empty cells to
-/// the width of the final defaults; the compensating layout of §19.4 when a row would not read
-/// back the same. For a loose file: its header comment and its rows, which is not what `scrub`
-/// writes there (it keeps the file's lines in their places, `#_defaults_#` lines included).
-pub fn snapshot(s: &Store) -> String {
-    let f = s.format();
-    let d = f.delimiter;
+/// The snapshot content of §19.2.3 for a strict store read whole, as TSVZ.py writes it: the
+/// header comment, the markers, then one fully resolved row per live key, padded with empty
+/// cells to the width of the final defaults; the compensating layout of §19.4 when a row would
+/// not read back the same. (A loose file's scrub keeps its lines instead: `loose::scrub`.)
+pub(crate) fn snapshot(s: &Store) -> String {
+    let d = s.format().delimiter;
     let m = s.markers();
     let rows: Vec<(&str, Vec<String>)> = s
         .iter()
@@ -119,17 +117,6 @@ pub fn snapshot(s: &Store) -> String {
     if let Some(h) = s.header() {
         out.push_str(h);
         out.push('\n');
-    }
-    if !f.strict {
-        for (k, cells) in &rows {
-            out.push_str(k);
-            for c in cells {
-                out.push(d as char);
-                out.push_str(c);
-            }
-            out.push('\n');
-        }
-        return out;
     }
     let compensate = !rows.iter().all(|(k, cells)| round_trips(k, cells, m));
     preamble(&mut out, m, d, compensate, true);
@@ -261,13 +248,17 @@ pub(crate) fn rewrite(
         })?,
         _ => content.to_vec(),
     };
-    let file = lock::Handle::open(path, OpenOptions::new().read(true).write(true)).map_err(io)?;
-    let _guard = lock::lock(&file, path).map_err(io)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    let _guard = lock::lock(&file).map_err(io)?;
     if Stamp::of(&file.metadata().map_err(io)?) != expect {
         return Ok(None);
     }
     let mut old = Vec::new();
-    (&*file).read_to_end(&mut old).map_err(io)?;
+    (&file).read_to_end(&mut old).map_err(io)?;
     if old == raw {
         return Ok(Some(false));
     }
@@ -391,11 +382,15 @@ fn match_owner(copy: &File, part: &std::fs::Metadata) -> io::Result<()> {
 /// sync it, before a rewrite drops the damage (§4.10, §16.6), as TSVZ.py does.
 fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     let io = |e: io::Error| Error::io(path, e);
-    let file = lock::Handle::open(path, OpenOptions::new().read(true).write(true)).map_err(io)?;
-    let _guard = lock::lock(&file, path).map_err(io)?;
-    // The copy is readable by whoever could read the part, and writable by its owner only: the
-    // part's read bits plus owner write, never its setuid, setgid, sticky or execute bits, nor
-    // write access for others (the umask still applies on top).
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    let guard = lock::lock(&file).map_err(io)?;
+    // The copy is readable by whoever could read the part, and writable by its owner only when
+    // the part is: its read bits and owner write bit (`mode & 0o644`), never its setuid, setgid,
+    // sticky or execute bits, nor write access for others (the umask still applies on top).
     let part = file.metadata().map_err(io)?;
     let mode = part.permissions().mode() & 0o644;
     let first = PathBuf::from(format!("{}.damaged-{}", path.display(), local_timestamp()));
@@ -417,13 +412,16 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         }
     };
     let copied = match_owner(&copy, &part)
-        .and_then(|()| io::copy(&mut &*file, &mut copy))
+        .and_then(|()| io::copy(&mut &file, &mut copy))
         .and_then(|_| copy.sync_all());
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&target);
         return Err(Error::io(&target, e));
     }
     sync_dir(&target);
+    // Told once the lock is let go: a callback that opens the part would release a classic lock
+    // (docs/limitations.md).
+    drop(guard);
     if let Some(w) = &options.warnings {
         w(&Warning {
             part: path.to_path_buf(),
@@ -584,8 +582,8 @@ fn metas(parts: &[parts::Part]) -> Result<Vec<std::fs::Metadata>, Error> {
         .collect()
 }
 
-/// One attempt of [`scrub`]; `backed_up` is the copy of a damaged part made by an attempt,
-/// and `told` whether the in-place warning was given.
+/// One attempt of [`scrub`]; `backed_up` holds the copies of a damaged part the attempts made,
+/// each kept (TSVZ.py keeps every one), and `told` whether the in-place warning was given.
 fn attempt(
     store: &Path,
     options: &Options,
@@ -694,15 +692,8 @@ fn attempt(
     if s.damaged() || s.stopped().is_some() {
         copy = match backed_up.last() {
             Some((at, path)) if *at == before[before.len() - 1] => Some(path.clone()),
-            last => {
+            _ => {
                 let path = read!(backup(&target.path, options), Step::Again);
-                // A copy of the part as it was before (appends since) holds nothing more.
-                if let Some((_, old)) = last {
-                    if starts_with_file(&path, old) {
-                        let _ = std::fs::remove_file(old);
-                        backed_up.pop();
-                    }
-                }
                 backed_up.push((before[before.len() - 1], path.clone()));
                 Some(path)
             }
@@ -827,26 +818,6 @@ fn attempt(
 /// The metadata of `path`.
 fn stamp_meta(path: &Path) -> Result<std::fs::Metadata, Error> {
     std::fs::metadata(path).map_err(|e| Error::io(path, e))
-}
-
-/// Whether the file `whole` begins with the bytes of the file `start` (an older copy of a part
-/// that was only appended to since).
-fn starts_with_file(whole: &Path, start: &Path) -> bool {
-    use std::io::Read;
-    let (Ok(mut a), Ok(mut b)) = (File::open(whole), File::open(start)) else {
-        return false;
-    };
-    let (mut x, mut y) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
-    loop {
-        let n = match b.read(&mut y) {
-            Ok(0) => return true,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        if a.read_exact(&mut x[..n]).is_err() || x[..n] != y[..n] {
-            return false;
-        }
-    }
 }
 
 /// Write the snapshot of `prefix` (read whole as `s`) as the new part `ordinal`, between it and
@@ -1774,6 +1745,25 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_of_a_backup_is_sent_after_the_lock_is_let_go() {
+        // The callback asks, from another process, whether the part is locked: it is not, so the
+        // lock is let go before the warning is sent. The lock taken here is the open file
+        // description lock (`flock` on macOS); the classic fallback has tests of its own in
+        // lock.rs.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n\0\0c\t3\n").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sink, part) = (seen.clone(), p.clone());
+        let mut options = opts();
+        options.warnings = Some(std::sync::Arc::new(move |_: &Warning| {
+            sink.lock().unwrap().push(lock::locked_elsewhere(&part))
+        }));
+        backup(&p, &options).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [false], "locked while it was sent");
+    }
+
+    #[test]
     fn clear_keeps_header_and_markers_without_a_version_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
@@ -2032,17 +2022,6 @@ mod tests {
         let like = fs::metadata(&theirs).unwrap();
         assert!(new_snapshot(&theirs, &like).is_err());
         assert_eq!(fs::read(&theirs).unwrap(), b"another scrub's\n");
-    }
-
-    #[test]
-    fn a_copy_of_a_part_appended_to_since_holds_nothing_more() {
-        let dir = tempfile::tempdir().unwrap();
-        let (old, new) = (dir.path().join("old"), dir.path().join("new"));
-        fs::write(&old, "a\t1\n\0\0").unwrap();
-        fs::write(&new, "a\t1\n\0\0b\t2\n").unwrap();
-        assert!(starts_with_file(&new, &old));
-        fs::write(&new, "c\t3\n").unwrap(); // rewritten in place, not appended to
-        assert!(!starts_with_file(&new, &old));
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 use std::io::{BufWriter, Write};
 
-use crate::cli::Ctx;
 use crate::cli::output::{Printer, stdout_error};
 use crate::cli::write::bulk;
+use crate::cli::{Ctx, NoSigpipe};
 use crate::handler::protocol::{Response, decode, decode_fields, field};
 use crate::handler::{Client, pointer};
 use crate::ops::{Out, protocol_record};
@@ -101,7 +101,11 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
     } else {
         None
     };
-    match client.send(&line, records.as_deref()) {
+    let sent = {
+        let _sigpipe = NoSigpipe::new(); // a handler that closed the connection must not end this process
+        client.send(&line, records.as_deref())
+    };
+    match sent {
         Ok(response)
             if matches!(op.as_str(), "pop" | "popitem")
                 && response.status == 0
@@ -115,25 +119,6 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
             None
         }
         Err(e) => Some(Err(e)),
-    }
-}
-
-/// SIGPIPE ignored while this lives, so that writing to a closed pipe fails instead of ending
-/// the process; its default action is restored after.
-struct NoSigpipe;
-
-impl NoSigpipe {
-    fn new() -> NoSigpipe {
-        // SAFETY: the command line runs one thread; this only changes SIGPIPE's action.
-        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-        NoSigpipe
-    }
-}
-
-impl Drop for NoSigpipe {
-    fn drop(&mut self) {
-        // SAFETY: as above.
-        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
 }
 
@@ -166,7 +151,11 @@ fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i3
     // As `read --format records` prints it: given to `set STORE -`, it is the same row again.
     let row = &response.lines[0];
     let store = ctx.store.display();
-    match client.send(&line, None) {
+    let put_back = {
+        let _sigpipe = NoSigpipe::new();
+        client.send(&line, None)
+    };
+    match put_back {
         Ok(r) if r.status == 0 && r.lines.first() == Some(row) => {
             diag!("tsvz: {store}: the row taken could not be printed; it was put back");
         }
