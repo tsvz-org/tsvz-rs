@@ -1,11 +1,11 @@
 //! The write lock shared with TSVZ.py: an exclusive lock on the whole file that belongs to the
 //! open file description, of the kind TSVZ.py 5.3 and later take: an open file description lock
-//! on Linux, `flock` elsewhere. It excludes every lock TSVZ.py takes (on Linux its appends lock
-//! byte 1, its readers byte 0), so an append here also waits for its readers. Closing another
-//! descriptor of the file never releases it, and two descriptors exclude each other in one
-//! process as in two. Where the kernel or the file system refuses it (Linux before 3.15), a
-//! classic POSIX lock, behind an in-process gate: the process loses that one when it closes any
-//! descriptor of the file (docs/limitations.md). Readers take no lock.
+//! on Linux, `flock` elsewhere. It excludes every lock TSVZ.py takes on the store file (on Linux
+//! its appends lock byte 1, its readers byte 0), so an append here also waits for its readers.
+//! Closing another descriptor of the file never releases it, and two descriptors exclude each
+//! other in one process as in two. Where the kernel or the file system refuses it (Linux before
+//! 3.15), a classic POSIX lock, behind an in-process gate: the process loses that one when it
+//! closes any descriptor of the file (docs/limitations.md). Readers take no lock.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -33,10 +33,12 @@ fn gate() -> (MutexGuard<'static, Held>, &'static Condvar) {
 }
 
 /// Take the write lock on `file` (open for writing); waits as long as another descriptor holds
-/// it, in this process or another. A second call on the same open file description (a
-/// `try_clone` of the file, or one `File` used by two threads) is not another descriptor: the
-/// lock is granted at once, and the first guard's drop releases it for both. Nothing in the
-/// crate does that; each caller opens its own `File`.
+/// it, in this process or another. With the open file description lock or `flock`, a second
+/// call on the same open file description (a `try_clone` of the file, or one `File` used by two
+/// threads) is not another descriptor: the lock is granted at once, and the first guard's drop
+/// releases it for both. With the classic fallback the second call waits at the in-process gate
+/// until the first guard is dropped. Nothing in the crate does either; each caller opens its own
+/// `File`.
 pub fn lock(file: &File) -> io::Result<Guard<'_>> {
     #[cfg(test)]
     let _waiting = Waiting::on(file)?;
