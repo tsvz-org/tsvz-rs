@@ -34,8 +34,11 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Entry {
     seq: u64,
-    /// The request's records, encoded, in runs of one member size each (§16.7).
-    runs: Vec<(String, u64)>,
+    /// The request's records, encoded.
+    payload: String,
+    /// The member size in force where the entry lands (§16.7): the first entry's is its
+    /// batch's.
+    member_size: u64,
     durable: bool,
     /// A request waits for its outcome.
     waited: bool,
@@ -78,15 +81,17 @@ struct Batcher {
 }
 
 impl Batcher {
-    /// Queue `runs` (records encoded for the store, each ending in `\n`, with their member
-    /// sizes); its sequence number. A `waited` entry's outcome is kept for [`Batcher::wait`].
-    fn submit(&self, runs: Vec<(String, u64)>, durable: bool, waited: bool) -> u64 {
+    /// Queue `payload` (records encoded for the store, each ending in `\n`), to land where
+    /// `member_size` is in force; its sequence number. A `waited` entry's outcome is kept for
+    /// [`Batcher::wait`].
+    fn submit(&self, payload: String, member_size: u64, durable: bool, waited: bool) -> u64 {
         let mut q = lock(&self.queue);
         q.submitted += 1;
         let seq = q.submitted;
         q.entries.push(Entry {
             seq,
-            runs,
+            payload,
+            member_size,
             durable,
             waited,
         });
@@ -180,19 +185,13 @@ impl Batcher {
             };
             let durable = batch.iter().any(|e| e.durable);
             let last = batch[batch.len() - 1].seq;
-            // Each write keeps the member size in force where it lands; neighbours of one size
-            // share members.
-            let mut runs: Vec<(Vec<u8>, u64)> = Vec::new();
-            for (run, size) in batch.iter().flat_map(|e| &e.runs) {
-                match runs.last_mut() {
-                    Some((bytes, s)) if s == size => bytes.extend_from_slice(run.as_bytes()),
-                    _ => runs.push((run.as_bytes().to_vec(), *size)),
-                }
-            }
-            let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (&r[..], *n)).collect();
+            // The whole batch at the member size in force where it starts, as TSVZ.py writes
+            // it (§16.7 is a SHOULD): a size it sets applies from the next batch.
+            let member_size = batch[0].member_size;
+            let payload: String = batch.iter().map(|e| e.payload.as_str()).collect();
             let result = Writer::open(&self.store).and_then(|w| {
                 let mut w = w.fsync(durable).warnings(self.log.clone()).dirs(dirs);
-                let appended = w.append_runs_at(&runs);
+                let appended = w.append_at(payload.as_bytes(), member_size);
                 dirs = w.dirs_known();
                 appended
             });
@@ -551,10 +550,10 @@ impl Engine {
             .or(queued(st.queued_member_size, reflected))
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
-        let runs = crate::write::runs(records, self.format, member_size)?;
+        let payload = crate::write::encode(records, self.format)?;
         let durable = sync || ack == Some("disk");
         let waited = durable || written;
-        let seq = self.batcher.submit(runs, durable, waited);
+        let seq = self.batcher.submit(payload, member_size, durable, waited);
         for (key, m) in records.iter().filter_map(crate::write::marker_effect) {
             match key.as_str() {
                 "#_write_ack_#" => st.queued_ack = Some((seq, m.write_ack)),
@@ -1045,7 +1044,7 @@ mod tests {
         }
         submit(&marker("#_member_size_#", "7"));
         assert!(!submit(&data()).waited, "#_write_ack_# memory, queued");
-        let last_size = || lock(&e.batcher.queue).entries.last().unwrap().runs[0].1;
+        let last_size = || lock(&e.batcher.queue).entries.last().unwrap().member_size;
         assert_eq!(last_size(), 7);
         submit(&marker("#_member_size_#", "zero")); // invalid: ignored, as a reader ignores it
         submit(&data());
@@ -1055,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn each_write_in_a_batch_keeps_the_member_size_in_force_where_it_lands() {
+    fn a_batch_is_written_at_the_member_size_in_force_where_it_starts() {
         use crate::codec::{Item, encode_members, for_each_item};
         use crate::name::Codec;
         let dir = tempfile::tempdir().unwrap();
@@ -1078,27 +1077,24 @@ mod tests {
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // One batch: 200 rows and the marker under 1 MiB, then rows under 64 bytes, the last
-        // two in one request after a marker of its own.
+        // One batch: 200 rows, a marker that sets 64 bytes, and a row of 43 bytes, all at the
+        // 1 MiB in force where it starts.
         submit(
             &(0..200)
                 .map(|i| row(format!("k{i:03}")))
                 .collect::<Vec<_>>(),
         );
-        submit(&[Record::Marker {
-            key: "#_member_size_#".into(),
-            values: vec!["64".into()],
-        }]);
         submit(&[
-            row("x".repeat(40)),
             Record::Marker {
                 key: "#_member_size_#".into(),
-                values: vec![String::new()], // back to 1 MiB
+                values: vec!["64".into()],
             },
-            row("y".repeat(40)),
-            row("z".repeat(40)),
+            row("x".repeat(40)),
         ]);
         drop(held);
+        assert_eq!(ask(&e, "len").lines, ["202"]);
+        // The next batch takes the size the last one set: a member per 43-byte row.
+        submit(&[row("y".repeat(40)), row("z".repeat(40))]);
         assert_eq!(ask(&e, "len").lines, ["204"]);
         let data = fs::read(&p).unwrap();
         let mut members = Vec::new();
@@ -1108,9 +1104,7 @@ mod tests {
             }
             true
         });
-        // The blocker; the 200 rows and the 64 marker; the x row with the empty marker; then
-        // the y and z rows, together again.
-        assert_eq!(members, [1, 201, 2, 2]);
+        assert_eq!(members, [1, 202, 1, 1]);
     }
 
     #[test]

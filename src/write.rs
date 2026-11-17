@@ -197,29 +197,16 @@ pub(crate) fn marker_effect(r: &Record) -> Option<(String, crate::Markers)> {
     crate::replay::apply_marker(&mut m, &key, value).then_some((key, m))
 }
 
-/// `records` encoded for `format` as runs, each with the member size in force where it starts
-/// (§16.7): `member_size`, then from the record after each valid `#_member_size_#` marker on,
-/// the size it sets, as a reader replays them (a loose file carries no marker semantics, §19.10.2).
-pub(crate) fn runs(
-    records: &[Record],
-    format: Format,
-    member_size: u64,
-) -> Result<Vec<(String, u64)>, Error> {
-    let mut runs = vec![(String::new(), member_size)];
+/// `records` encoded for `format`, one after another.
+pub(crate) fn encode(records: &[Record], format: Format) -> Result<String, Error> {
+    let mut out = String::new();
     for r in records {
-        let at = runs.len() - 1;
-        encode_record(r, format, &mut runs[at].0)?;
-        if let (true, Some((key, m))) = (format.strict, marker_effect(r)) {
-            if key == "#_member_size_#" && m.member_size != runs[at].1 {
-                runs.push((String::new(), m.member_size));
-            }
-        }
+        encode_record(r, format, &mut out)?;
     }
-    runs.retain(|(run, _)| !run.is_empty());
-    Ok(runs)
+    Ok(out)
 }
 
-/// Where [`Writer::append_runs_at`] appended, the part's stamp just before and after, and
+/// Where [`Writer::append_at`] appended, the part's stamp just before and after, and
 /// the file it appended through (still open: it syncs that file even once renamed).
 #[doc(hidden)]
 pub struct Appended {
@@ -310,11 +297,13 @@ impl Writer {
         self.format
     }
 
-    /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2).
+    /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2). A compressed
+    /// batch is written in members of the writer's member size, also when it sets
+    /// `#_member_size_#` itself (§16.7 is a SHOULD): the size it sets applies from the next one.
     pub fn append(&mut self, records: &[Record]) -> Result<(), Error> {
-        let runs = runs(records, self.format, self.member_size as u64)?;
-        let runs: Vec<(&[u8], u64)> = runs.iter().map(|(r, n)| (r.as_bytes(), *n)).collect();
-        self.append_runs_at(&runs).map(|_| ())
+        let payload = encode(records, self.format)?;
+        self.append_at(payload.as_bytes(), self.member_size as u64)
+            .map(|_| ())
     }
 
     /// Append encoded records (each ending in `\n`) as one batch. A `#_snapshot_#` line in a
@@ -331,16 +320,14 @@ impl Writer {
                 }
             }
         }
-        self.append_runs_at(&[(payload, self.member_size as u64)])
-            .map(|_| ())
+        self.append_at(payload, self.member_size as u64).map(|_| ())
     }
 
-    /// Append encoded records as one batch: runs of them, each in members of its own size
-    /// (§16.7) on a compressed part. Says where the batch went and how the part looked, under
-    /// the lock, just before and after it: what the handler needs to tell its own appends from
-    /// other writers'.
+    /// Append encoded records as one batch, in members of `member_size` bytes on a compressed
+    /// part (§16.7). Says where the batch went and how the part looked, under the lock, just
+    /// before and after it: what the handler needs to tell its own appends from other writers'.
     #[doc(hidden)]
-    pub fn append_runs_at(&mut self, runs: &[(&[u8], u64)]) -> Result<Appended, Error> {
+    pub fn append_at(&mut self, payload: &[u8], member_size: u64) -> Result<Appended, Error> {
         // The part is locked as it was opened; when by then it is no longer the store's active
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
         // rotated away), the active part is looked up again. Only a store with no part yet is
@@ -360,27 +347,15 @@ impl Writer {
             let io = |e: io::Error| Error::io(path, e);
             let bytes: Cow<[u8]> = match part.codec {
                 Some(codec) => {
-                    let mut bytes = Vec::new();
-                    for (run, member_size) in runs {
-                        let size = usize::try_from(*member_size).unwrap_or(usize::MAX).max(1);
-                        bytes.extend(codec::encode_members(codec, run, size).ok_or_else(|| {
-                            Error::UnsupportedCodec {
-                                path: path.to_path_buf(),
-                                codec: codec.name(),
-                            }
-                        })?);
-                    }
-                    bytes.into()
+                    let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
+                    codec::encode_members(codec, payload, size)
+                        .ok_or_else(|| Error::UnsupportedCodec {
+                            path: path.to_path_buf(),
+                            codec: codec.name(),
+                        })?
+                        .into()
                 }
-                None => match runs {
-                    [(run, _)] => (*run).into(),
-                    _ => runs
-                        .iter()
-                        .map(|(r, _)| *r)
-                        .collect::<Vec<_>>()
-                        .concat()
-                        .into(),
-                },
+                None => payload.into(),
             };
             let mut options = OpenOptions::new();
             options
@@ -857,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn records_after_a_member_size_marker_take_its_size_in_the_same_append() {
+    fn an_append_that_sets_a_member_size_is_written_at_the_size_it_started_with() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz.gz");
         let row = |k: &str| Record::from_args(k, &["v".repeat(20)]);
@@ -876,8 +851,9 @@ mod tests {
                     other => panic!("{other:?}"),
                 })
                 .collect();
-        // a, b and the marker in a 1 MiB member; then c and d, 23 bytes each, one per member.
-        assert_eq!(members, [3, 1, 1]);
+        // One batch, one member size (§16.7 is a SHOULD, as TSVZ.py takes it): all five lines in
+        // one 1 MiB member, where 30 bytes would give c and d one each.
+        assert_eq!(members, [5]);
     }
 
     /// Wait until a thread waits at the lock of `path`.

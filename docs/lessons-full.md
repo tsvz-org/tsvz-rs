@@ -54,3 +54,17 @@ entries go last, in the same commit as the change:
   `flock`), as the program you share the file with does; a lock that any close in the process releases
   cannot be kept by bookkeeping in a library, since every open of the file in the process would have to
   go through it.
+
+## 2026-11-17 One member size per batch
+- Changed: a compressed batch is written at one member size, also when it sets `#_member_size_#`: a
+  handler's batch at the size in force where it starts, `Writer::append` at the writer's size; the size
+  the batch sets applies from the next one. 0.1.x split a batch into runs at each such marker, so the
+  records after it took its size at once.
+- Why we had to change: the runs cost about 45 code and 110 test lines, in the writer and the handler's
+  batcher, for a case only a store being set up meets (a client that sets the member size and writes in
+  the same batch); §16.7 is a SHOULD, and TSVZ.py writes a batch at one size (the user's pick
+  2026-11-17, "Both (Recommended)").
+- Original design was wrong because: it honoured a SHOULD at a finer grain than the reference
+  implementation, record by record, where the batch is the unit a writer already has.
+- Lesson: honour a SHOULD at the grain the other implementation does, and the unit your writer already
+  has; a finer grain is state kept for a case that no reader can tell apart.
