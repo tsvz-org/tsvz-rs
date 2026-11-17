@@ -417,6 +417,289 @@ fn loose_files_by_the_simple_rule() {
 }
 
 #[test]
+fn a_one_column_loose_file_holds_keys_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // As TSVZ.py reads it: the first keyed line sets the column count; at one column a key
+    // alone is a row, and nothing can delete, so a delete rewrites the file.
+    fs::write(dir.join("hosts.tsv"), "#hosts\nh1\nh2\nh3\nh2\n").unwrap();
+    assert_eq!(records(dir, &["keys", "hosts.tsv"]).1, "h1\nh2\nh3\n");
+    assert_eq!(records(dir, &["delete", "hosts.tsv", "h2", "h9"]).0, 0);
+    assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh1\nh3\n");
+    assert_eq!(
+        records(dir, &["pop", "hosts.tsv", "h1"]),
+        (0, "h1\n".into(), String::new())
+    );
+    assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\n");
+    assert_eq!(records(dir, &["set", "hosts.tsv", "h4"]).0, 0);
+    assert_eq!(records(dir, &["scrub", "hosts.tsv"]).0, 0);
+    assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\nh4\n");
+    // A missing file is made, and tsvz-rs holds nothing in it (TSVZ.py writes one empty line; the
+    // two read alike): in a file with no keyed line yet, a key alone would make it one column,
+    // and a row.
+    assert_eq!(records(dir, &["delete", "new.tsv", "k"]).0, 0);
+    assert_eq!(file(dir, "new.tsv"), "");
+    assert_eq!(records(dir, &["keys", "new.tsv"]).1, "");
+}
+
+#[test]
+fn a_loose_delete_decides_from_the_column_count_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // More than one column: a key alone deletes, and one is appended for each key asked, live
+    // or not, as TSVZ.py appends it, and also without the whitespace at its end, which TSVZ.py
+    // strips when it reads a key and tsvz-rs does not.
+    fs::write(dir.join("m.tsv"), "b\t1\nc\t3\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "b ", "zz"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("appended 3 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nb\nb \nzz\n");
+    // tsvz-rs reads the deletion as TSVZ.py does: `b` is gone. A row it reads as `b ` goes too.
+    assert_eq!(records(dir, &["keys", "m.tsv"]).1, "c\n");
+    fs::write(dir.join("w.tsv"), "b \t1\nc\t3\n").unwrap();
+    assert_eq!(records(dir, &["delete", "w.tsv", "b "]).0, 0);
+    assert_eq!(records(dir, &["keys", "w.tsv"]).1, "c\n");
+    // A reset of the defaults is a line there too.
+    fs::write(dir.join("d.tsv"), "#_defaults_#\tX\tY\na\t1\nb\t2\n").unwrap();
+    assert_eq!(records(dir, &["delete", "d.tsv", "#_defaults_#"]).0, 0);
+    assert_eq!(
+        file(dir, "d.tsv"),
+        "#_defaults_#\tX\tY\na\t1\nb\t2\n#_defaults_#\n"
+    );
+    // pop and popitem delete the same way.
+    fs::write(dir.join("p.tsv"), "a\t1\nb\t2\n").unwrap();
+    assert_eq!(records(dir, &["pop", "p.tsv", "a"]).1, "a\t1\n");
+    assert_eq!(records(dir, &["popitem", "p.tsv"]).1, "b\t2\n");
+    assert_eq!(file(dir, "p.tsv"), "a\t1\nb\t2\na\nb\n");
+    // No keyed line yet: nothing is written, and an empty file stays empty.
+    for (name, text) in [("e.tsv", ""), ("c.tsv", "#h\n\n#c\n")] {
+        fs::write(dir.join(name), text).unwrap();
+        assert_eq!(records(dir, &["delete", name, "k", "#_defaults_#"]).0, 0);
+        assert_eq!(file(dir, name), text);
+    }
+    // One column: the lines of the keys go, whether or not the key as given has whitespace at
+    // its end.
+    fs::write(dir.join("o.tsv"), "#h\na\nb \nc\nb\n").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", "b\t"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
+    // A reset of the defaults there would be a row, to TSVZ.py too: none is written.
+    assert_eq!(records(dir, &["delete", "o.tsv", "#_defaults_#"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nc\n");
+}
+
+#[test]
+fn a_loose_delete_writes_a_blank_key_as_given_and_says_what_the_head_says_once() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // A key of only whitespace is a row to tsvz-rs, which reads a key whole (TSVZ.py skips such
+    // a line): at more than one column its given spelling is the tombstone, and nothing is
+    // written for the name TSVZ.py would read, which is empty. A tab is no key a loose file can
+    // hold, and is refused, as in 0.1.3.
+    fs::write(dir.join("m.tsv"), "b\t1\n \t2\nc\t3\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "\t"]);
+    assert!(
+        code == 1 && err.contains("holds the delimiter"),
+        "{code} {err}"
+    );
+    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\n");
+    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", " ", "zz"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("appended 2 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\n \nzz\n");
+    assert_eq!(records(dir, &["keys", "m.tsv"]).1, "b\nc\n");
+    // At one column the lines whose key is only whitespace go.
+    fs::write(dir.join("o.tsv"), "a\n \nb\n").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\nb\n");
+}
+
+/// What the read of the head warns of is said once, though a file of one column is read again
+/// from the start.
+#[test]
+fn a_loose_delete_says_what_the_head_warns_of_once() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let warned = |name: &str, bytes: &[u8]| {
+        fs::write(dir.join(name), bytes).unwrap();
+        records(dir, &["delete", name, "zz"])
+            .2
+            .matches("line 1 is not valid UTF-8")
+            .count()
+    };
+    assert_eq!(warned("w1.tsv", b"#\xff\na\nb\n"), 1);
+    assert_eq!(warned("w2.tsv", b"#\xff\na\t1\n"), 1);
+    assert_eq!(warned("w3.tsv", b"#\xff\n"), 1);
+}
+
+/// What the read of a compressed file's head says is said once, with the file's name, whether
+/// the head finds a keyed line (and the read stops there) or not (and the whole file is read).
+#[test]
+fn a_compressed_loose_delete_says_its_warnings_once_and_names_the_file() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &[u8]| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t).unwrap();
+    for (name, bytes) in [
+        ("w4.tsv.gz", gz(b"#\xff\na\t1\n")),
+        ("w5.tsv.gz", [gz(b"#\xff\n"), gz(b"a\t1\n")].concat()),
+        ("w6.tsv.gz", gz(b"#\xff\n")),
+        ("w7.tsv.gz", gz(b"#\xff\na\nb\n")),
+    ] {
+        fs::write(dir.join(name), bytes).unwrap();
+        let (code, _, err) = records(dir, &["delete", name, "zz"]);
+        assert_eq!(code, 0, "{name}: {err}");
+        assert_eq!(err.lines().count(), 1, "{name}: {err}");
+        assert!(
+            err.contains(&format!("{name}: line 1 is not valid UTF-8")),
+            "{name}: {err}"
+        );
+    }
+}
+
+/// A file whose only rows have a key of only whitespace has no keyed line (TSVZ.py skips them),
+/// and tsvz-rs lists them: a delete of such a key still writes it, which sets no column count, so
+/// that a `popitem` loop ends. A key that is not blank is not written there.
+#[test]
+fn a_blank_key_is_deleted_in_a_file_with_no_keyed_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    for text in [" \t5\n", "#h\n \n\x0b\t2\n"] {
+        fs::write(dir.join("n.tsv"), text).unwrap();
+        let rows = records(dir, &["len", "n.tsv"]).1;
+        let rows: usize = rows.trim().parse().unwrap();
+        for _ in 0..rows {
+            assert_eq!(records(dir, &["popitem", "n.tsv"]).0, 0, "{text:?}");
+        }
+        assert_eq!(records(dir, &["popitem", "n.tsv"]).0, 3, "{text:?}");
+        assert_eq!(records(dir, &["keys", "n.tsv"]).1, "", "{text:?}");
+    }
+    fs::write(dir.join("z.tsv"), " \t5\n").unwrap();
+    assert_eq!(records(dir, &["delete", "z.tsv", "zz"]).0, 0);
+    assert_eq!(file(dir, "z.tsv"), " \t5\n");
+}
+
+/// At one column too, a key of only whitespace is deleted by its own spelling: TSVZ.py skips such
+/// lines, and tsvz-rs reads each spelling as a row of its own, as a row at more than one column.
+/// A delete of one used to take every line whose key is only whitespace.
+#[test]
+fn a_one_column_delete_of_a_blank_key_takes_that_spelling_only() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("o.tsv"), "a\n  \t1\n \t2\n \nb\n").unwrap();
+    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\n  \n \nb\n");
+    assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\n  \t1\nb\n");
+    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\n  \nb\n");
+    assert_eq!(records(dir, &["delete", "o.tsv", "  "]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\nb\n");
+}
+
+/// `popitem` until the file is empty: it ends within as many calls as there are keys, so a loop
+/// that drains a file ends. A row whose key is only whitespace is one of them.
+#[test]
+fn popitem_drains_a_loose_file_with_a_blank_key() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    for (name, text, rows) in [
+        ("m.tsv", " \t2\na\t1\nb\t3\n", 3),
+        ("o.tsv", "a\n \nb\n", 3),
+    ] {
+        fs::write(dir.join(name), text).unwrap();
+        let mut popped = Vec::new();
+        for _ in 0..rows {
+            let (code, out, err) = records(dir, &["popitem", name]);
+            assert_eq!((code, err.as_str()), (0, ""), "{name}");
+            popped.push(out);
+        }
+        popped.sort();
+        popped.dedup();
+        assert_eq!(popped.len(), rows, "{name}: each call pops another row");
+        assert_eq!(records(dir, &["popitem", name]).0, 3, "{name}: then empty");
+        assert_eq!(records(dir, &["keys", name]).1, "", "{name}");
+    }
+}
+
+#[test]
+fn a_loose_delete_of_more_than_one_column_reads_no_further_than_its_first_keyed_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // Line 2 holds bytes that are no UTF-8: a read of it warns, and one that stops at line 1 does
+    // not get there.
+    fs::write(dir.join("m.tsv"), b"a\t1\n\xff\t2\n").unwrap();
+    let (code, _, err) = records(dir, &["delete", "m.tsv", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert!(
+        records(dir, &["len", "m.tsv"])
+            .2
+            .contains("line 2 is not valid UTF-8")
+    );
+}
+
+#[test]
+fn a_loose_row_of_blank_cells_is_a_deletion_but_at_one_column() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("t.tsv"), "a\t1\nb\t2\nb\t\t \n").unwrap();
+    assert_eq!(records(dir, &["keys", "t.tsv"]).1, "a\n");
+    assert_eq!(records(dir, &["set", "t.tsv", "a", ""]).0, 0);
+    assert_eq!(records(dir, &["len", "t.tsv"]).1, "0\n");
+    fs::write(dir.join("one.tsv"), "a\nb\t\n").unwrap();
+    assert_eq!(records(dir, &["read", "one.tsv"]).1, "a\nb\t\n");
+}
+
+#[test]
+fn a_loose_scrub_and_clear_keep_what_tsvz_py_reads() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // #_defaults_# lines stay in place (TSVZ.py fills the empty cells after them); a key's
+    // last line takes its first one's place only where no such line lies between them.
+    let text = "#h\tx\ty\n#_defaults_#\tP\tQ\na\t1\t\nb\t\t2\n#c\na\t3\t\n#_defaults_#\tR\nb\t\t4\nc\t\t\n";
+    fs::write(dir.join("t.tsv"), text).unwrap();
+    assert_eq!(records(dir, &["scrub", "t.tsv"]).0, 0);
+    assert_eq!(
+        file(dir, "t.tsv"),
+        "#h\tx\ty\n#_defaults_#\tP\tQ\na\t3\t\nb\t\t2\n#_defaults_#\tR\nb\t\t4\n"
+    );
+    assert_eq!(records(dir, &["clear", "t.tsv"]).0, 0);
+    assert_eq!(
+        file(dir, "t.tsv"),
+        "#h\tx\ty\n#_defaults_#\tP\tQ\n#_defaults_#\tR\n"
+    );
+}
+
+#[test]
+fn a_loose_rewrite_keeps_the_bytes_after_the_last_newline() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // TSVZ.py reads that line as a row; tsvz-rs does not list it (docs/limitations.md), but
+    // a scrub and a one-column delete leave it where it is.
+    fs::write(dir.join("s.tsv"), "#h\na\t1\na\t2\nb\t9").unwrap();
+    assert_eq!(records(dir, &["scrub", "s.tsv"]).0, 0);
+    assert_eq!(file(dir, "s.tsv"), "#h\na\t2\nb\t9");
+    fs::write(dir.join("o.tsv"), "a\nb\nc\nd").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", "b"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "a\nc\nd");
+    // A key with whitespace at its end names the key without it, as TSVZ.py reads it.
+    fs::write(dir.join("w.tsv"), "a \nb\nc\n").unwrap();
+    assert_eq!(records(dir, &["delete", "w.tsv", "a "]).0, 0);
+    assert_eq!(file(dir, "w.tsv"), "b\nc\n");
+}
+
+#[test]
+fn a_loose_rewrite_keeps_the_lines_it_keeps_as_they_are() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    // CRLF lines stay CRLF, in a scrub, a delete and a clear alike.
+    fs::write(dir.join("a.tsv"), "#h\r\na\t1\r\nb\t2\r\n\r\na\t3\r\n").unwrap();
+    assert_eq!(records(dir, &["scrub", "a.tsv"]).0, 0);
+    assert_eq!(file(dir, "a.tsv"), "#h\r\na\t3\r\nb\t2\r\n");
+    fs::write(dir.join("o.tsv"), "#h\r\na\r\nb\r\nc\r\n").unwrap();
+    assert_eq!(records(dir, &["delete", "o.tsv", "b"]).0, 0);
+    assert_eq!(file(dir, "o.tsv"), "#h\r\na\r\nc\r\n");
+    assert_eq!(records(dir, &["clear", "a.tsv"]).0, 0);
+    assert_eq!(file(dir, "a.tsv"), "#h\r\n");
+}
+
+#[test]
 fn the_delimiter_option() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
@@ -480,6 +763,265 @@ fn many_small_compressed_members_read_in_bounded_memory() {
         "reading a {} KiB part of 10,000 members peaked at {kib} KiB",
         part.len() / 1024
     );
+}
+
+/// A loose `scrub` and `clear` work on the lines they keep and read no row. On this file (11.7
+/// MiB, the shape of a 228 MiB one measured the same way, 2026-11-16) the test build peaked at
+/// 3.0 and 5.8 times its size for `clear` and `scrub`; with every row also built, at 8.2 and 11.5
+/// times. So 7 and 9 times are between the two.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_loose_scrub_and_clear_read_no_row() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let mut text = String::from("#key\tv1\tv2\tv3\n");
+    for i in 0..200_000u64 {
+        let x = i
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        text.push_str(&format!("key{i:07}\t{x:016x}\t{x:016x}\tsome text here\n"));
+    }
+    let size = text.len() as i64 / 1024;
+    let mut over = Vec::new();
+    for (op, times) in [("clear", 7), ("scrub", 9)] {
+        fs::write(dir.join("big.tsv"), &text).unwrap();
+        let (_, kib) = peak_rss_kib(dir, &[op, "big.tsv"]);
+        if kib >= times * size {
+            over.push(format!("a loose {op} of {size} KiB peaked at {kib} KiB"));
+        }
+    }
+    assert!(over.is_empty(), "{over:?}");
+}
+
+/// A delete of a compressed loose file of more than one column reads the whole file into memory as a
+/// `get` does, and decodes it as far as the end of the member that holds its first keyed line (docs/limitations.md): the
+/// damage of that member is found and said, once, with the file's name. A first member with no
+/// keyed line, or only a header, is no matter: the read goes on into the next.
+#[test]
+fn a_compressed_loose_delete_says_the_damage_of_the_member_with_its_first_key_once() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let mut text = String::from("#key\tv1\tv2\tv3\n");
+    for i in 0..20_000u64 {
+        let x = i
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        text.push_str(&format!("key{i:07}\t{x:016x}\t{x:016x}\tsome text here\n"));
+    }
+    let mut member = tsvz::codec::encode_member(tsvz::name::Codec::Gzip, text.as_bytes()).unwrap();
+    assert!(member.len() > 1 << 16, "{} bytes", member.len());
+    let whole = member.clone();
+    fs::write(dir.join("ok.tsv.gz"), &whole).unwrap();
+    let middle = member.len() / 2;
+    member[middle] ^= 0xff;
+    fs::write(dir.join("big.tsv.gz"), &member).unwrap();
+    assert!(
+        records(dir, &["len", "big.tsv.gz"]).2.contains("corrupt"),
+        "a read of the whole damaged member says so"
+    );
+    let says_once = |name: &str| {
+        let (code, _, err) = records(dir, &["delete", name, "key0000005"]);
+        assert_eq!(code, 0, "{name}: {err}");
+        assert_eq!(err.lines().count(), 1, "{name}: {err}");
+        assert!(err.contains(&format!("{name}: ")), "{name}: {err}");
+        assert!(err.contains("corrupt"), "{name}: {err}");
+    };
+    says_once("big.tsv.gz");
+    // The same delete of the undamaged file: the key is gone, and the others are not.
+    assert_eq!(records(dir, &["delete", "ok.tsv.gz", "key0000005"]).0, 0);
+    assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000005"]).0, 3);
+    assert_eq!(records(dir, &["has", "ok.tsv.gz", "key0000006"]).0, 0);
+    // A header that a member holds alone, as a `clear` and a later write leave a file, and rows in a
+    // damaged member.
+    let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    let rows = &text[text.find('\n').unwrap() + 1..];
+    let mut second = gz(rows);
+    let middle = second.len() / 2;
+    second[middle] ^= 0xff;
+    fs::write(
+        dir.join("hdr.tsv.gz"),
+        [gz("#key\tv1\tv2\tv3\n"), second].concat(),
+    )
+    .unwrap();
+    says_once("hdr.tsv.gz");
+    // A first member with no keyed line: the read goes on into the next.
+    fs::write(
+        dir.join("two.tsv.gz"),
+        [gz("#h\n"), gz("a\t1\nb\t2\n")].concat(),
+    )
+    .unwrap();
+    assert_eq!(records(dir, &["delete", "two.tsv.gz", "a"]).0, 0);
+    assert_eq!(records(dir, &["keys", "two.tsv.gz"]).1, "b\n");
+}
+
+/// A compressed loose delete decides from the file as the whole read sees it, also when a member
+/// that holds only comment lines is cut short and members of rows follow. A look at the first
+/// lines alone fed the cut member's decoder the next member's bytes, and took the garbage that
+/// came out for a keyed line, so that it gave a wrong column count: the delete then failed with
+/// "the file kept changing", or decided from a wrong column count (in the files that found it, a key
+/// alone written at one column, so that a `popitem` loop never ended). The tiny files below: a gzip member cut inside its data and a
+/// member `z`, and the same in zstd.
+#[test]
+fn a_compressed_loose_delete_after_a_cut_comment_member_decides_as_the_whole_read_does() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &[u8]| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t).unwrap();
+    // 600 comment lines of random words (about half with a tab), so that the member is a few KiB of
+    // dynamic Huffman codes, cut at 63 points: the look failed at 5 of them at two columns and
+    // at 1 at one (counted on the build before the look was removed, 0e0e128).
+    let mut x = 0x1234_5678_9abc_def1u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let words = [
+        "alpha", "beta", "gamma", "delta", "x", "yy", "zzz", "key", "\t", "0", "17",
+    ];
+    let mut comments = String::new();
+    for _ in 0..600 {
+        comments.push('#');
+        for _ in 0..3 + next() % 12 {
+            comments.push_str(words[(next() % words.len() as u64) as usize]);
+            comments.push(' ');
+        }
+        comments.push('\n');
+    }
+    let member = gz(comments.as_bytes());
+    for one in [false, true] {
+        let rows: String = (0..200)
+            .map(|i| match one {
+                true => format!("k{i}x{}\n", next() % 1000),
+                false => format!("k{i}\t{:016x}\n", next()),
+            })
+            .collect();
+        let tail = gz(rows.as_bytes());
+        let name = "c.tsv.gz";
+        for i in 1..64 {
+            let cut = member.len() * i / 64;
+            fs::write(dir.join(name), [&member[..cut], &tail[..]].concat()).unwrap();
+            let why = format!("one column {one}, cut at {cut} of {} bytes", member.len());
+            let keys = records(dir, &["keys", name]).1;
+            assert_eq!(keys.lines().count(), 200, "{why}");
+            let key = keys.lines().nth(7).unwrap().to_string();
+            assert!(key.starts_with("k7"), "{why}: {key}");
+            let (code, _, err) = records(dir, &["delete", name, &key]);
+            assert_eq!(code, 0, "{why}: {err}");
+            assert_eq!(err.matches("cut short").count(), 1, "{why}: {err}");
+            assert_eq!(
+                records(dir, &["has", name, &key]).0,
+                3,
+                "{why}: still there"
+            );
+            let keys = records(dir, &["keys", name]).1;
+            assert_eq!(keys.lines().count(), 199, "{why}: a key alone is now a row");
+            // A `popitem` loop ends: it empties the file in as many calls as it has keys.
+            if one && i % 16 == 0 {
+                for n in 0..199 {
+                    let (code, out, _) = records(dir, &["popitem", name]);
+                    assert_eq!(code, 0, "{why}: popitem {n}");
+                    assert!(!out.is_empty(), "{why}: popitem {n}");
+                }
+                assert_eq!(records(dir, &["popitem", name]).0, 3, "{why}: then empty");
+            }
+            for e in fs::read_dir(dir).unwrap() {
+                let e = e.unwrap().path();
+                if e.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("damaged-")
+                {
+                    fs::remove_file(e).unwrap();
+                }
+            }
+        }
+    }
+    // The tiny files: a member cut inside its data, then a member `z`.
+    let hex = |s: &str| -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    };
+    let mut tiny = vec![(
+        "t.tsv.gz",
+        hex(concat!(
+            "1f8b08000000000000ff05c16d9381400000e0cffc8bb45d87a9bb3aed184d3b8d954aa7a1440c66bd2c",
+            "75251179f9f5f73c1f8b08000000000000ffabe202009d6adc7402000000"
+        )),
+    )];
+    if tsvz::name::Codec::Zstd.supported() {
+        tiny.push((
+            "t.tsv.zst",
+            hex("28b52ffd2419c900006b300928b52ffd24021100007a0a10007838"),
+        ));
+    }
+    for (name, bytes) in tiny {
+        fs::write(dir.join(name), &bytes).unwrap();
+        // (0e0e128 read the zstd one with a byte-order mark before `z`: the cut member's dropped
+        // bytes were three, and the next line began at offset 3)
+        let before = records(dir, &["keys", name]).1;
+        assert_eq!(before, "z\n", "{name}");
+        let (code, _, err) = records(dir, &["delete", name, "k0"]);
+        assert_eq!(code, 0, "{name}: {err}");
+        assert_eq!(
+            records(dir, &["keys", name]).1,
+            before,
+            "{name}: k0 became a row"
+        );
+    }
+}
+
+/// A delete of a key that is not there changes nothing: a compressed file of one column too,
+/// whose bytes a rewrite would change (here it holds two members, which one member replaces).
+#[test]
+fn a_one_column_delete_that_removes_no_line_writes_and_says_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("o.tsv"), "#h\na\nb \nc\nb\n").unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "o.tsv", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""), "nothing was rewritten");
+    assert_eq!(file(dir, "o.tsv"), "#h\na\nb \nc\nb\n");
+    let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    let bytes = [gz("#h\na\n"), gz("b\n")].concat();
+    fs::write(dir.join("c.tsv.gz"), &bytes).unwrap();
+    let (code, _, err) = records(dir, &["-v", "delete", "c.tsv.gz", "zz"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(fs::read(dir.join("c.tsv.gz")).unwrap(), bytes);
+    assert_eq!(records(dir, &["delete", "c.tsv.gz", "a"]).0, 0);
+    assert_eq!(records(dir, &["keys", "c.tsv.gz"]).1, "b\n");
+}
+
+/// A delete of a key that is not there writes nothing in a damaged compressed file either: the
+/// rewrite that would drop the key's lines has none to drop, and would only leave a copy of the
+/// damaged bytes (`.damaged-`) and replace them by the recovered lines.
+#[test]
+fn a_one_column_delete_copies_a_damaged_file_only_when_it_removes_a_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = |t: &str| tsvz::codec::encode_member(tsvz::name::Codec::Gzip, t.as_bytes()).unwrap();
+    let mut second = gz(&"b\nc\n".repeat(20));
+    let middle = second.len() / 2;
+    second[middle] ^= 0xff;
+    let bytes = [gz("#h\na\n"), second].concat();
+    fs::write(dir.join("d.tsv.gz"), &bytes).unwrap();
+    assert!(
+        records(dir, &["keys", "d.tsv.gz"]).2.contains("corrupt"),
+        "the file is damaged"
+    );
+    let (code, _, _) = records(dir, &["delete", "d.tsv.gz", "zz"]);
+    assert_eq!(code, 0);
+    assert_eq!(fs::read(dir.join("d.tsv.gz")).unwrap(), bytes);
+    let names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["d.tsv.gz"], "no copy of the damaged part");
+    // A key that is there is deleted, and the damaged bytes are kept beside the rewrite.
+    let (code, _, err) = records(dir, &["delete", "d.tsv.gz", "a"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("damaged-"), "{err}");
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
 }
 
 #[test]

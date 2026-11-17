@@ -383,9 +383,8 @@ const PROTOCOL: Format = Format {
 };
 
 /// A record as a line of the handler protocol, without its `\n` (§21.4): a marker key as
-/// written, a data key with `<#>` for a leading `#`, values §13-encoded with TAB.
-/// A record as a protocol line; refused as `encode_record` refuses it (a marker record whose
-/// key is not a marker key), since it could not be sent as one line.
+/// written, a data key with `<#>` for a leading `#`, values §13-encoded with TAB. Refused as
+/// `encode_record` refuses it (a marker record whose key is not a marker key).
 pub fn protocol_record(record: &Record) -> Result<String, Error> {
     let mut line = String::new();
     encode_record(record, PROTOCOL, &mut line)?;

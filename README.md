@@ -27,15 +27,25 @@ tsvz --help
 
 Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz, zstd) and split
 into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
-one-part store in place; in a multi-part store it writes the parts before the active one as a
-new part between them and the active one (§19.2), linked in whole so that readers never see a
-part being rewritten, or, when no ordinal is free there, compacts them into the last of them in
-place (§19.8); then it applies the store's `#_rotate_#` (`keep`, `rename` or `delete`) to the
-parts the snapshot holds. Writers keep appending to the active part throughout. `scrub`, and
-`clear` of a one-part store, refuse parts that declare a spec version newer than the one tsvz
-implements (§6.3, §19.4, §19.8). A snapshot part that other parts precede begins with
-`#_snapshot_#` (§19.10), and a read begins at the last such part instead of replaying the parts
-before it; `verify` still replays every part.
+one-part store in place. In a multi-part store it writes the parts before the active one as a
+new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
+applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
+as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to the next version. `scrub` and
+`clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
+
+Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
+except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
+unterminated last line, reads `#_defaults_#` lines as comments (it fills no empty cell from
+them), keeps the whitespace at the end of a key or a cell and decodes neither, and keeps the empty
+cells at the end of a row longer than the file's column count. A rewrite writes each line it keeps
+as the file has it, but for three things: a byte-order mark an unterminated first line loses, the
+key a one-column `delete` puts where the line that set the column count went, and the blank
+`#_defaults_#` line a `clear` may write before the defaults it keeps. `scrub` keeps the lines a
+read depends on (a key's last line may take the place of its first, where nothing TSVZ.py reads
+changes), and `clear` the `#_defaults_#` lines in force
+([docs/silent-choices.md](docs/silent-choices.md)). One more limit an operator can meet: a
+`delete` of a loose file that runs at the very moment of a `clear` of it can leave the key as a
+row.
 
 ## Handler
 
@@ -71,9 +81,6 @@ for (key, row) in store.iter() {
 # Ok::<(), tsvz::Error>(())
 ```
 
-A read begins at the store's last snapshot part (§19.10.3); `Options { full_history: true,
-..Options::default() }` replays every part, as `verify` always does.
-
 Appends take the same file locks as TSVZ.py. Where open-file-description locks are not
 available (macOS, or an old Linux kernel), the lock is a classic POSIX record lock, which the
 process loses when it closes any other descriptor of the same file. The library opens a store's
@@ -86,11 +93,42 @@ Build without the command line and C libraries with
 ## Conformance and compatibility
 
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
-every codec, every digest, multi-part scrub and snapshot skipping claimed, and is checked
+every codec, every digest and multi-part scrub claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
 share a store: they take the same file locks. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.1.4 from 0.1.3
+
+In strict stores (`.tsvz .csvz .nsvz .psvz`) a read replays every part, as before; a multi-part
+`scrub` writes snapshot parts that carry a `#_snapshot_#` line (the first, or the second after a
+header comment; it also makes one marked copy of a part a 0.1.3 scrub wrote), and a writer now
+refuses `#_snapshot_#` (§19.10.2; 0.1.3 accepted it and wrote it as a record). Upgrade every host
+that scrubs the same multi-part store: a 0.1.3 scrub after a 0.1.4 one writes a new snapshot
+part each time, or compacts in place when no ordinal is free (0.1.3 does not expect the marker
+line), and the next 0.1.4 scrub marks it: with a marked copy while an ordinal is free, otherwise in
+place, with the §19.8 warning.
+
+In loose files:
+
+- A key alone is a row when the file's first keyed line has one column; `delete`, `pop` and
+  `popitem` there rewrite the file without the key's lines. With more columns they append a key
+  alone for each key asked, as before, and also without the whitespace at its end when it has
+  some (TSVZ.py strips it when it reads a key; tsvz-rs does not).
+- A row whose cells are all blank is a deletion, as in TSVZ.py, but in a file of one column,
+  where it is a row: in any other file `tsvz set f.tsv k ''` deletes `k`, and a file holding
+  `k<TAB>` reads without `k`.
+- Line 1's byte-order mark is part of its key, as TSVZ.py reads it (`keys` lists it, where 0.1.3
+  dropped it); the NULs at the start of a line are dropped; a key that only begins with
+  `#_defaults_#` is a key.
+- `scrub` keeps each line it keeps as the file has it, `#_defaults_#` lines included, and an
+  unterminated last line (0.1.3's `scrub` dropped it); `clear` keeps the `#_defaults_#` lines in
+  force, so that rows written later read to TSVZ.py with the defaults they had (a file of one
+  column keeps none: rows written there later read without them).
+
+The library's documented API does not change (of the `#[doc(hidden)]` internals, `codec::member`
+and `codec::Member` are gone, and `frame::Line` has one field more, `bom`).
 
 ## License
 

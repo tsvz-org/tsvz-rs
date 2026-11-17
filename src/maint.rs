@@ -8,6 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::escape;
+use crate::loose;
 use crate::name::Codec;
 use crate::parts::{self, Stamp};
 use crate::replay::{DEFAULT_MEMBER_SIZE, Markers, Policy, SPEC_VERSION};
@@ -98,7 +99,8 @@ fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
 /// The snapshot content of §19.2.3 for a store read whole, as TSVZ.py writes it: the header
 /// comment, the markers, then one fully resolved row per live key, padded with empty cells to
 /// the width of the final defaults; the compensating layout of §19.4 when a row would not read
-/// back the same. A loose file keeps its header comment and its rows.
+/// back the same. For a loose file: its header comment and its rows, which is not what `scrub`
+/// writes there (it keeps the file's lines in their places, `#_defaults_#` lines included).
 pub fn snapshot(s: &Store) -> String {
     let f = s.format();
     let d = f.delimiter;
@@ -213,11 +215,8 @@ fn restating_snapshot(s: &Store, deleted: &[String]) -> String {
 /// `content`, for a part that other parts precede, begun with `#_snapshot_#` after its header
 /// comment (§19.10.2): it reads alone as those parts and it do, and a reader that implements
 /// §19.10 begins there instead of replaying them (§19.10.3). The scrub's guards check that it
-/// reads so, both alone and after them. A loose file has no markers (§5.2).
+/// reads so, both alone and after them.
 fn marked(s: &Store, content: String) -> String {
-    if !s.format().strict {
-        return content;
-    }
     let at = s.header().map_or(0, |h| h.len() + 1);
     let mut out = String::with_capacity(content.len() + 13);
     out.push_str(&content[..at]);
@@ -424,11 +423,7 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         let _ = std::fs::remove_file(&target);
         return Err(Error::io(&target, e));
     }
-    if let Some(dir) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
+    sync_dir(&target);
     if let Some(w) = &options.warnings {
         w(&Warning {
             part: path.to_path_buf(),
@@ -455,14 +450,13 @@ fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
 }
 
 /// A whole read for a rewrite: never past a part it cannot read, since what it writes would
-/// lose that part's rows, and every part replayed, those before a snapshot part too (§19.10.3):
-/// what is written must read the same to a reader that replays them.
+/// lose that part's rows.
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
         verify: false,
         skip_unreadable: false,
-        full_history: true,
+        lines: true,
         ..options.clone()
     }
 }
@@ -728,22 +722,24 @@ fn attempt(
         Some(earlier)
     };
     // With no part before it (a one-part store, or part 0), there is nothing to skip: the
-    // content is TSVZ.py's, unmarked.
-    let content = match &earlier {
-        None => snapshot(&s),
-        Some(earlier) => match read!(
+    // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), and
+    // the bytes after its last newline, which TSVZ.py reads as a line.
+    let content = match (&earlier, s.loose_lines()) {
+        (_, Some((lines, tail))) => [loose::scrub(&lines), tail.to_vec()].concat(),
+        (None, None) => snapshot(&s).into_bytes(),
+        (Some(earlier), None) => match read!(
             live_after_any_prefix(store, options, others, earlier),
             Step::Again
         ) {
-            Some(deleted) => marked(&s, restating_snapshot(&s, &deleted)),
+            Some(deleted) => marked(&s, restating_snapshot(&s, &deleted)).into_bytes(),
             None => return Ok(Step::Again(None)), // the parts changed under the read
         },
     };
     // A one-part scrub with no room for the copy (it is how a full disk gets room back)
-    // rewrites in place without one, as TSVZ.py does, where the file system overwrites in
-    // place: the rewrite reserves its length first, so it still changes nothing when even
+    // rewrites in place without one (TSVZ.py never writes one), where the file system overwrites
+    // in place: the rewrite reserves its length first, so it still changes nothing when even
     // that does not fit. A copy-on-write one gives no such promise: refused there.
-    let recovery = match write_recovery(store, &target.path, content.as_bytes()) {
+    let recovery = match write_recovery(store, &target.path, &content) {
         Ok(path) => Some(path),
         Err(e) if !multi && no_room(&e) && overwrites_in_place(&target.path) => {
             if let Some(w) = &options.warnings {
@@ -793,7 +789,7 @@ fn attempt(
     };
     let written = rewrite(
         &target.path,
-        content.as_bytes(),
+        &content,
         before[before.len() - 1],
         target.codec,
         s.markers().member_size,
@@ -902,8 +898,7 @@ fn snapshot_part(
     // One that other parts precede must also carry #_snapshot_# (a part a 0.1.3 scrub wrote does
     // not), or readers would go on replaying them: such a part gets a marked copy, once.
     let others = &prefix[..prefix.len() - 1];
-    let marked =
-        !s.format().strict || others.is_empty() || crate::store::is_snapshot_part(last, s.format());
+    let marked = others.is_empty() || crate::store::is_snapshot_part(last, s.format());
     let size = std::fs::metadata(&last.path).map(|m| m.len());
     if marked && size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
         if others.is_empty() || action == "keep" {
@@ -1048,11 +1043,6 @@ fn fill_snapshot(
     file.sync_all().map_err(io)
 }
 
-/// The variant extension of a store path as it is spelled (`tsvz`, `CSV`, …).
-fn variant_ext(store: &Path) -> String {
-    stem_and_ext(store).1
-}
-
 /// A store path's name without its codec suffix, split at its variant extension: `s.tsvz.gz`
 /// → (`s`, `tsvz`).
 fn stem_and_ext(store: &Path) -> (String, String) {
@@ -1078,7 +1068,7 @@ fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, 
             part.display(),
             local_timestamp(),
             std::process::id(),
-            variant_ext(store)
+            stem_and_ext(store).1
         ));
         // Taken (another host's scrub, same second and pid): the next number.
         match OpenOptions::new()
@@ -1377,11 +1367,7 @@ fn narrow_mode(target: &Path, prefix: &[parts::Part]) -> Result<Option<u32>, Err
 }
 
 fn sync_dir(path: &Path) {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if let Ok(d) = File::open(dir) {
+    if let Ok(d) = File::open(parts::dir_of(path)) {
         let _ = d.sync_all();
     }
 }
@@ -1495,24 +1481,23 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 store.display()
             )));
         }
-        let mut content = String::new();
-        if let Some(h) = s.header() {
-            content.push_str(h);
-            content.push('\n');
-        }
-        if s.format().strict {
-            preamble(
-                &mut content,
-                s.markers(),
-                s.format().delimiter,
-                false,
-                false,
-            );
-        }
+        let content = match s.loose_lines() {
+            Some((lines, _)) => loose::cleared(&lines),
+            None => {
+                let mut content = String::new();
+                if let Some(h) = s.header() {
+                    content.push_str(h);
+                    content.push('\n');
+                }
+                let d = s.format().delimiter;
+                preamble(&mut content, s.markers(), d, false, false);
+                content.into_bytes()
+            }
+        };
         let part = &s.parts()[0];
         match rewrite(
             &part.path,
-            content.as_bytes(),
+            &content,
             before,
             part.codec,
             s.markers().member_size,
@@ -1525,6 +1510,148 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
     }
     Err(Error::Refused(format!(
         "{}: clear skipped: the store kept changing while it was being cleared; nothing was written",
+        store.display()
+    )))
+}
+
+/// What a loose delete did.
+#[cfg(feature = "cli")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LooseDelete {
+    /// Tombstones appended (this many): each key asked as TSVZ.py names it, when it has a name,
+    /// and, where that differs, as given; with no keyed line yet, only a key of only whitespace,
+    /// which has no name, as given.
+    Appended(usize),
+    /// The file rewritten without the lines of the keys asked.
+    Rewrote,
+    /// Nothing written.
+    Nothing,
+}
+
+/// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
+/// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
+/// deletion, appended for each key asked, live or not, as TSVZ.py names it (without the
+/// whitespace at its end, unless nothing is left of it) and, where that differs, as given; one
+/// column, where a key alone is a row and no line can delete, a rewrite without the lines of the
+/// keys ([`loose::without`]); no keyed line yet, nothing, since a key alone would set one column
+/// and be a row (but a key of only whitespace, which sets none, is written as given). A plain
+/// file is read only as far as its first keyed line, and a compressed one into memory whole (docs/
+/// limitations.md); the whole file is read for a rewrite, at one column only. A missing file is
+/// created (§20.2.2).
+#[cfg(feature = "cli")]
+pub(crate) fn delete_loose(
+    store: &Path,
+    options: &Options,
+    keys: &[String],
+) -> Result<LooseDelete, Error> {
+    // Each key as TSVZ.py reads a line's key, without the whitespace at its end, and as given:
+    // tsvz-rs, which reads a key whole, deletes the row of either. A key with nothing left names
+    // no row to TSVZ.py, which skips such lines; tsvz-rs reads such a row, by its given spelling,
+    // at one column too: the line of that spelling goes, and no other.
+    use std::sync::{Arc, Mutex};
+    let asked: Vec<(&str, &str)> = keys
+        .iter()
+        .map(|k| (k.as_str(), k.trim_end_matches(loose::py_space)))
+        .collect();
+    for _ in 0..ATTEMPTS {
+        let Some(part) = parts::list(store)?.into_iter().next() else {
+            Writer::open(store)?
+                .warnings(options.warnings.clone())
+                .delimiter(options.delimiter)
+                .append(&[])?;
+            return Ok(LooseDelete::Nothing);
+        };
+        let before = stamp(&part.path)?;
+        // The head's warnings are held: at one column the whole read below says them again.
+        let held: Arc<Mutex<Vec<Warning>>> = Arc::default();
+        let hold: crate::WarnFn = {
+            let held = held.clone();
+            Arc::new(move |w: &Warning| held.lock().unwrap().push(w.clone()))
+        };
+        let head = Store::open(
+            store,
+            Options {
+                scope: Scope::KeysOnly,
+                verify: false,
+                skip_unreadable: false,
+                head: true,
+                warnings: Some(hold),
+                ..options.clone()
+            },
+        )?;
+        let say = || {
+            for w in held.lock().unwrap().iter() {
+                options.warnings.iter().for_each(|f| f(w));
+            }
+        };
+        let one = head.one_column();
+        if one != Some(true) {
+            say();
+            // More than one column: a tombstone for each key. No keyed line yet: a key alone would
+            // set one column and be a row, so none, but for a key with nothing left of it, which
+            // TSVZ.py skips (it sets no column count) and tsvz-rs reads as a row: its tombstone
+            // deletes that row, so that a `popitem` loop drains a file that holds only such rows
+            // (without it the row stays, and `popitem` returns it again).
+            let all = one == Some(false);
+            let tombstones: Vec<crate::write::Record> = asked
+                .iter()
+                .flat_map(|&(given, name)| {
+                    let named = (all && !name.is_empty()).then_some(name);
+                    let as_given = (given != name && (all || name.is_empty())).then_some(given);
+                    named.into_iter().chain(as_given)
+                })
+                .map(|key| crate::write::Record::Tombstone {
+                    key: key.to_string(),
+                })
+                .collect();
+            if tombstones.is_empty() && !all {
+                return Ok(LooseDelete::Nothing);
+            }
+            Writer::open(store)?
+                .warnings(options.warnings.clone())
+                .delimiter(options.delimiter)
+                .append(&tombstones)?;
+            return Ok(LooseDelete::Appended(tombstones.len()));
+        }
+        let s = Store::open(store, whole(options))?;
+        if s.incomplete() {
+            return Err(Error::Refused(format!(
+                "{}: delete skipped: the file could not be read whole; nothing was written",
+                store.display()
+            )));
+        }
+        let (lines, tail) = s
+            .loose_lines()
+            .expect("a loose file read whole keeps its lines");
+        // a key is named without the whitespace at its end, one of only whitespace as given
+        let gone: std::collections::HashSet<&str> = asked
+            .iter()
+            .map(|&(given, name)| if name.is_empty() { given } else { name })
+            .collect();
+        let content = match loose::without(&lines, &gone) {
+            None => continue, // the file changed since its first line was read
+            Some(None) => return Ok(LooseDelete::Nothing), // no line is one of the keys
+            Some(Some(content)) => content,
+        };
+        if s.damaged() {
+            backup(&part.path, options)?;
+        }
+        let content = [content, tail.to_vec()].concat();
+        match rewrite(
+            &part.path,
+            &content,
+            before,
+            part.codec,
+            DEFAULT_MEMBER_SIZE,
+            None,
+        )? {
+            None => continue, // another writer committed after the read
+            Some(true) => return Ok(LooseDelete::Rewrote),
+            Some(false) => return Ok(LooseDelete::Nothing),
+        }
+    }
+    Err(Error::Refused(format!(
+        "{}: delete skipped: the file kept changing while it was being rewritten; nothing was written",
         store.display()
     )))
 }
@@ -2604,12 +2731,21 @@ mod tests {
     #[test]
     fn a_snapshot_part_that_other_parts_precede_begins_with_the_snapshot_marker() {
         // §19.10.2, after the header comment: a reader that implements §19.10 begins there and
-        // reads as one that replays every part does (§19.10.3).
-        let full = Options {
-            full_history: true,
-            ..opts()
+        // reads as one that replays every part does (§19.10.3). `from` is what such a reader
+        // reads: the snapshot part (as part 0) and the parts after it.
+        let read = |p: &Path| trimmed_rows(&Store::open(p, opts()).unwrap());
+        let from = |dir: &Path, snapshot: &str, after: &[&str]| {
+            let copy = tempfile::tempdir().unwrap();
+            fs::copy(dir.join(snapshot), copy.path().join("s.tsvz")).unwrap();
+            for (i, name) in after.iter().enumerate() {
+                fs::copy(
+                    dir.join(name),
+                    copy.path().join(format!("s.tsvz.{}", i + 1)),
+                )
+                .unwrap();
+            }
+            read(&copy.path().join("s.tsvz"))
         };
-        let read = |p: &Path, o: &Options| trimmed_rows(&Store::open(p, o.clone()).unwrap());
         for (rotate, part0) in [
             ("keep", "#h\na\t1\nb\t2\n"),
             ("rename", "#h\n#_rotate_#\trename\na\t1\nb\t2\n"),
@@ -2619,15 +2755,19 @@ mod tests {
             fs::write(&p, part0).unwrap();
             fs::write(dir.path().join("s.tsvz.2"), "a\nc\t3\n").unwrap();
             fs::write(dir.path().join("s.tsvz.8"), "z\t9\n").unwrap();
-            let before = read(&p, &full);
+            let before = read(&p);
             assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written, "{rotate}");
             let snapshot = fs::read_to_string(dir.path().join("s.tsvz.5")).unwrap();
             assert!(
                 snapshot.starts_with("#h\n#_snapshot_#\n#_version_#\t1\n"),
                 "{rotate}: {snapshot:?}"
             );
-            assert_eq!(read(&p, &opts()), before, "{rotate}");
-            assert_eq!(read(&p, &full), before, "{rotate}");
+            assert_eq!(read(&p), before, "{rotate}");
+            assert_eq!(
+                from(dir.path(), "s.tsvz.5", &["s.tsvz.8"]),
+                before,
+                "{rotate}"
+            );
             if rotate == "keep" {
                 assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged, "run again");
             }
@@ -2639,15 +2779,15 @@ mod tests {
         fs::write(&p, "a\t1\n").unwrap();
         fs::write(dir.path().join("s.tsvz.1"), "a\nb\t2\n").unwrap();
         fs::write(dir.path().join("s.tsvz.2"), "z\t9\n").unwrap();
-        let before = read(&p, &full);
+        let before = read(&p);
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
         let compacted = fs::read_to_string(dir.path().join("s.tsvz.1")).unwrap();
         assert!(
             compacted.starts_with("#_snapshot_#\n#_version_#\t1\n"),
             "{compacted:?}"
         );
-        assert_eq!(read(&p, &opts()), before);
-        assert_eq!(read(&p, &full), before);
+        assert_eq!(read(&p), before);
+        assert_eq!(from(dir.path(), "s.tsvz.1", &["s.tsvz.2"]), before);
         // With no part before the one compacted (a one-part store, or part 0): TSVZ.py's
         // content, unmarked.
         for others in [&[][..], &["s.tsvz.1"][..]] {
@@ -2663,6 +2803,32 @@ mod tests {
                 "{others:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_scrub_keeps_the_rows_of_every_part_also_those_before_a_snapshot_part() {
+        // The snapshot part restates nothing of part 0, against §19.10.2: a reader that begins
+        // at it never sees `a`, but one that replays every part does (§19.10.3, as tsvz-rs
+        // does), and what a scrub writes must read the same to both.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1"), "#_snapshot_#\nb\t2\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.5"), "c\t3\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let snapshot = fs::read_to_string(dir.path().join("s.tsvz.3")).unwrap();
+        assert!(
+            snapshot.contains("a\t1\n") && snapshot.contains("b\t2\n"),
+            "{snapshot:?}"
+        );
+        let keys = |p: &Path| -> Vec<String> {
+            Store::open(p, opts())
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .collect()
+        };
+        assert_eq!(keys(&p), ["a", "b", "c"]);
     }
 
     #[test]
@@ -2691,6 +2857,48 @@ mod tests {
         assert!(copy.starts_with("#h\n#_snapshot_#\n"), "{copy:?}");
         assert_eq!(rows(&p), before);
         assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Unchanged, "once");
+    }
+
+    #[test]
+    fn a_scrub_of_a_copy_that_holds_the_gzip_magic_writes_it_once() {
+        // The copy a scrub writes is a compressed part the next scrub looks at. When that part's
+        // first member held `1f 8b 08` in what the look had read, the look judged it unmarked
+        // (a magic in a member that runs past what was read took for the next member's start),
+        // so each scrub wrote another copy of the whole store (32 to 39 KB here) while an
+        // ordinal was free, then compacted it in place with the §19.8 warning. Seed 25 is one of
+        // 3 of 3,000 such stores; if an encoder change loses the magic, pick another seed.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        let (mut x, mut state) = (26u64.wrapping_mul(0x9E37_79B9_7F4A_7C15), String::new());
+        for i in 0..2700 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state.push_str(&format!("k{i}\t{x:016x}\n"));
+        }
+        fs::write(&p, state).unwrap();
+        let part1 = crate::codec::encode_member(crate::name::Codec::Gzip, b"z\t0\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1.gz"), part1).unwrap();
+        fs::write(dir.path().join("s.tsvz.5"), "y\t9\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let copy = dir.path().join("s.tsvz.3.gz");
+        let bytes = fs::read(&copy).unwrap();
+        let at = memchr::memmem::find(&bytes[1..], crate::name::Codec::Gzip.magic());
+        assert!(
+            at.is_some_and(|i| 2 * (i + 4) < bytes.len()),
+            "{at:?} of {} bytes",
+            bytes.len()
+        );
+        let written = files(dir.path());
+        for scrub_no in 2..=4 {
+            assert_eq!(
+                scrub(&p, &opts()).unwrap(),
+                Outcome::Unchanged,
+                "{scrub_no}"
+            );
+            assert_eq!(files(dir.path()), written, "{scrub_no}");
+        }
+        assert_eq!(fs::read(&copy).unwrap(), bytes);
     }
 
     #[test]

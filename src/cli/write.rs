@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::cli::Ctx;
 use crate::cli::output::{Printer, stdout_error};
 use crate::escape::is_marker_key;
+use crate::maint;
 use crate::ops::{self, Out, Plan};
 use crate::write::{Record, Writer};
 use crate::{Error, Scope};
@@ -46,8 +47,20 @@ pub(crate) fn delete(ctx: &mut Ctx) -> Result<i32, Error> {
             .map(|k| Record::from_args(k, &[]))
             .collect()
     };
+    if !ctx.format.strict {
+        let keys: Vec<String> = records
+            .into_iter()
+            .map(|r| match r {
+                Record::Data { key, .. }
+                | Record::Tombstone { key }
+                | Record::Marker { key, .. } => key,
+            })
+            .collect();
+        delete_loose(ctx, &keys)?;
+        return Ok(0);
+    }
     let d = ctx.format.delimiter;
-    if ctx.format.strict && ops::delete_needs_store(&records, d) {
+    if ops::delete_needs_store(&records, d) {
         records = match ctx.open(Scope::KeysOnly, false) {
             Ok(store) if store.incomplete() => {
                 diag!(
@@ -68,6 +81,17 @@ pub(crate) fn delete(ctx: &mut Ctx) -> Result<i32, Error> {
     writer(ctx, None)?.append(&records)?;
     ctx.info(&format!("appended {} tombstones", records.len()));
     Ok(0)
+}
+
+/// Delete `keys` from a loose file (`maint::delete_loose`).
+fn delete_loose(ctx: &Ctx, keys: &[String]) -> Result<(), Error> {
+    let options = ctx.options(Scope::All, false);
+    match maint::delete_loose(&ctx.store, &options, keys)? {
+        maint::LooseDelete::Appended(n) => ctx.info(&format!("appended {n} tombstones")),
+        maint::LooseDelete::Rewrote => ctx.info("rewrote the file without the lines of those keys"),
+        maint::LooseDelete::Nothing => {}
+    }
+    Ok(())
 }
 
 /// Standard input read as records in the store's variant (§20.3.1).
@@ -110,7 +134,11 @@ fn carry_out(ctx: &mut Ctx, plan: Plan) -> Result<i32, Error> {
             member_size,
         } => {
             print(ctx, &key, &cells)?;
-            writer(ctx, Some(member_size))?.append(&records)?;
+            if ctx.format.strict {
+                writer(ctx, Some(member_size))?.append(&records)?;
+            } else {
+                delete_loose(ctx, &[key])?;
+            }
             Ok(0)
         }
         Plan::Put {

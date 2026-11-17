@@ -175,9 +175,19 @@ pub struct Replay {
     /// The first committed line of the first part, when it is a comment (§19.2.3c).
     pub header: Option<String>,
     /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
-    /// set by the first data row, as TSVZ.py sets it, to the count of the defaults then active
-    /// when there are any, else to that row's written cells. None before any data row.
+    /// set by the first data row to the count of the defaults then active when there are any,
+    /// else to that row's written cells. None before any data row. A loose file's is that of its
+    /// first keyed line ([`crate::loose::keyed`]), a deletion or a `#_defaults_#` line included,
+    /// as TSVZ.py sets it.
     pub width: Option<usize>,
+    /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
+    /// line.
+    pub(crate) one_column: Option<bool>,
+    /// A loose file's committed lines, without their `\n`, kept for a rewrite that keeps them
+    /// ([`crate::loose`]); None unless asked for.
+    pub(crate) lines: Option<Vec<Vec<u8>>>,
+    /// Stop reading a loose file at its first keyed line.
+    pub(crate) head: bool,
     first_line: bool,
     part: PathBuf,
     warn: Option<WarnFn>,
@@ -295,6 +305,9 @@ impl Replay {
             newest: 1,
             header: None,
             width: None,
+            one_column: None,
+            lines: None,
+            head: false,
             first_line: false,
             part: PathBuf::new(),
             warn,
@@ -367,6 +380,18 @@ impl Replay {
                 }
             }
         }
+        // A loose file's line 1 begins with its byte-order mark, as TSVZ.py reads it (§5.2: the
+        // data semantics of a loose file are implementation-defined); the framer drops it (§4.7).
+        let marked: Vec<u8>;
+        let mark: &[u8] = if !self.format.strict && first && line.bom {
+            b"\xef\xbb\xbf"
+        } else {
+            b""
+        };
+        if !mark.is_empty() {
+            marked = [mark, body].concat();
+            body = &marked;
+        }
         let text = String::from_utf8_lossy(body);
         if matches!(text, Cow::Owned(_)) {
             self.warn(
@@ -380,7 +405,12 @@ impl Replay {
         if self.format.strict {
             self.strict_line(&text, line, first, sink);
         } else {
+            if let Some(lines) = &mut self.lines {
+                // As the file has it, but for its `\n`: a rewrite keeps the lines it keeps.
+                lines.push([mark, &line.raw[..line.raw.len() - 1]].concat());
+            }
             self.loose_line(&text, first, sink);
+            return !(self.head && self.one_column.is_some());
         }
         true
     }
@@ -490,7 +520,7 @@ impl Replay {
             sink.delete(&key); // a tombstone (§7.6, §7.8)
             return;
         };
-        self.set_width(rest);
+        self.set_width(Some(rest));
         let binding = self.binding();
         let mut cells = Cells::default();
         if sink.wants_cells(&key) {
@@ -504,36 +534,46 @@ impl Replay {
         sink.put(&key, cells, &binding);
     }
 
-    /// Set the width at the first data row, whose value fields are `rest` (see `width`).
-    fn set_width(&mut self, rest: &str) {
+    /// Set the width at the first data row (a loose file's first keyed line), whose value fields
+    /// are `rest` (none for a loose key alone, see `width`).
+    fn set_width(&mut self, rest: Option<&str>) {
         if self.width.is_none() {
-            let written = memchr::memchr_iter(self.format.delimiter, rest.as_bytes()).count() + 1;
+            let written = rest.map_or(0, |r| {
+                memchr::memchr_iter(self.format.delimiter, r.as_bytes()).count() + 1
+            });
             let defaults = self.markers.defaults.len();
             self.width = Some(if defaults > 0 { defaults } else { written });
         }
     }
 
-    /// A loose file: lines split on the delimiter, no markers, escaping or stripping (§5.2).
+    /// A loose file: lines split on the delimiter, no markers, escaping or stripping (§5.2). A key
+    /// alone, or with only blank cells, is a deletion, but a row in a one-column file, as TSVZ.py
+    /// reads it ([`crate::loose`]).
     fn loose_line(&mut self, text: &str, first: bool, sink: &mut dyn Sink) {
-        if text.starts_with('#') {
+        let d = self.format.delimiter;
+        let text = crate::loose::body(text);
+        if self.one_column.is_none() && crate::loose::keyed(text, d) {
+            self.one_column = Some(!text.as_bytes().contains(&d));
+            self.set_width(split_first(text, d).1);
+        }
+        if crate::loose::is_comment(text, d) {
             if first {
                 self.header = Some(text.to_string());
             }
             return;
         }
-        let (key, rest) = split_first(text, self.format.delimiter);
+        let (key, rest) = split_first(text, d);
         if key.is_empty() {
             return;
         }
-        let Some(rest) = rest else {
+        if crate::loose::deletes(rest, d, self.one_column == Some(true)) {
             sink.delete(key);
             return;
-        };
-        self.set_width(rest);
+        }
         let binding = self.binding();
         let mut cells = Cells::default();
-        if sink.wants_cells(key) {
-            for field in rest.split(self.format.delimiter as char) {
+        if let (true, Some(rest)) = (sink.wants_cells(key), rest) {
+            for field in rest.split(d as char) {
                 cells.push(field);
             }
         }
@@ -805,14 +845,126 @@ mod tests {
                 strict: false,
             },
             false,
-            b"#h,dr\nk,x<lt>,y \n#_defaults_#,d\nb\nk2, \n",
+            b"#h,dr\nk,x<lt>,y \n#_defaults_#,d\nb\nk2, \nk3,\n",
         );
         assert_eq!(r.header.as_deref(), Some("#h,dr"));
         assert!(r.markers.defaults.is_empty());
+        assert_eq!(table(&rows), vec![row("k", &["x<lt>", "y "])]);
+    }
+
+    #[test]
+    fn a_loose_key_alone_is_a_row_in_a_one_column_file() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        let (r, rows, _) = run(loose, false, b"#h\na\nb\t1\nc\t\na\nd\t \n");
+        assert_eq!(r.width, Some(0));
+        let cells = table(&rows);
+        assert_eq!(
+            cells,
+            vec![
+                row("a", &[]),
+                row("b", &["1"]),
+                row("c", &[""]),
+                row("d", &[" "])
+            ]
+        );
+        // The first keyed line, a #_defaults_# line included, sets the column count.
+        let (_, rows, _) = run(loose, false, b"#_defaults_#\tP\na\nb\t1\nb\t\n");
+        assert!(table(&rows).is_empty());
+    }
+
+    #[test]
+    fn a_loose_files_width_is_that_of_its_first_keyed_line_a_deletion_included() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        for (text, width) in [
+            (&b"k\t\t\na\t1\n"[..], 2),
+            (b"#h\n\nk\t \nb\t2\t3\t4\n", 1),
+            (b"a\t1\nb\t2\t3\n", 1),
+            (b"#_defaults_#\tP\tQ\na\t1\n", 2),
+            (b"#h\nk\nb\t2\t3\n", 0),
+            // a blank key is no keyed line
+            (b" \t1\t2\nk\t3\n", 1),
+        ] {
+            let (r, ..) = run(loose, false, text);
+            assert_eq!(r.width, Some(width), "{:?}", String::from_utf8_lossy(text));
+        }
+    }
+
+    #[test]
+    fn a_loose_files_byte_order_mark_is_part_of_line_1() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        // As TSVZ.py reads it: a keyed line, so its column count is the file's, and a key.
+        let (r, rows, _) = run(loose, false, b"\xef\xbb\xbf#h\na\t1\nb\n");
+        assert_eq!(r.one_column, Some(true));
         assert_eq!(
             table(&rows),
-            vec![row("k", &["x<lt>", "y "]), row("k2", &[" "])]
+            vec![row("\u{feff}#h", &[]), row("a", &["1"]), row("b", &[])]
         );
+        // Only line 1 begins with it.
+        let (r, rows, _) = run(loose, false, b"\xef\xbb\xbfa\t1\n#h\nb\t2\n");
+        assert_eq!(r.one_column, Some(false));
+        assert_eq!(
+            table(&rows),
+            vec![row("\u{feff}a", &["1"]), row("b", &["2"])]
+        );
+    }
+
+    #[test]
+    fn a_loose_line_is_read_without_the_nuls_at_its_start() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        // A line of only NULs is empty: it sets no column count and is no key.
+        let (r, rows, _) = run(loose, false, b"\0\na\tb\nc\t\n");
+        assert_eq!(r.one_column, Some(false));
+        assert_eq!(table(&rows), vec![row("a", &["b"])]);
+        let (_, rows, _) = run(loose, false, b"\0\0\0a\t1\n\0\t2\na\t2\n");
+        assert_eq!(table(&rows), vec![row("a", &["2"])]);
+    }
+
+    #[test]
+    fn a_loose_key_that_only_begins_with_the_defaults_key_is_a_key() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        // As TSVZ.py reads it: only a first cell that is `#_defaults_#` is the defaults line.
+        let (r, rows, _) = run(
+            loose,
+            false,
+            b"#_defaults_#x\t1\n#_defaults_# \tP\na\t\tq\n#_defaults_#\n",
+        );
+        assert_eq!(r.one_column, Some(false));
+        assert_eq!(
+            table(&rows),
+            vec![row("#_defaults_#x", &["1"]), row("a", &["", "q"])]
+        );
+    }
+
+    #[test]
+    fn a_loose_files_lines_are_kept_as_the_file_has_them() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        let mut replay = Replay::new(loose, false, None);
+        replay.lines = Some(Vec::new());
+        replay.begin_part(Path::new("s.tsv"), true);
+        let mut rows = Rows::default();
+        Framer::new().push(b"\xef\xbb\xbfa\t1\r\n#c\r\r\n\nb\t2\n", &mut |l| {
+            replay.line(l, &mut rows)
+        });
+        let kept: Vec<&[u8]> = replay.lines.iter().flatten().map(|l| &l[..]).collect();
+        assert_eq!(kept, [&b"\xef\xbb\xbfa\t1\r"[..], b"#c\r\r", b"", b"b\t2"]);
     }
 
     #[test]
@@ -832,6 +984,13 @@ mod tests {
         let mut keys = Keys(Vec::new());
         Framer::new().push(b"a\tx\ty\n", &mut |l| replay.line(l, &mut keys));
         assert_eq!(keys.0, vec![("a".to_string(), 0)]);
+    }
+
+    #[test]
+    fn a_replay_tells_its_format() {
+        // Public in 0.1.3, so kept (a ^0.1.3 requirement admits this version).
+        let r = Replay::new(TSVZ, false, None);
+        assert!(r.format().strict && r.format().delimiter == b'\t');
     }
 
     #[test]
