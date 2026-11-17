@@ -2860,6 +2860,48 @@ mod tests {
     }
 
     #[test]
+    fn a_scrub_of_a_copy_that_holds_the_gzip_magic_writes_it_once() {
+        // The copy a scrub writes is a compressed part the next scrub looks at. When that part's
+        // first member held `1f 8b 08` in what the look had read, the look judged it unmarked
+        // (a magic in a member that runs past what was read took for the next member's start),
+        // so each scrub wrote another copy of the whole store (32 to 39 KB here) while an
+        // ordinal was free, then compacted it in place with the §19.8 warning. Seed 25 is one of
+        // 3 of 3,000 such stores; if an encoder change loses the magic, pick another seed.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        let (mut x, mut state) = (26u64.wrapping_mul(0x9E37_79B9_7F4A_7C15), String::new());
+        for i in 0..2700 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state.push_str(&format!("k{i}\t{x:016x}\n"));
+        }
+        fs::write(&p, state).unwrap();
+        let part1 = crate::codec::encode_member(crate::name::Codec::Gzip, b"z\t0\n").unwrap();
+        fs::write(dir.path().join("s.tsvz.1.gz"), part1).unwrap();
+        fs::write(dir.path().join("s.tsvz.5"), "y\t9\n").unwrap();
+        assert_eq!(scrub(&p, &opts()).unwrap(), Outcome::Written);
+        let copy = dir.path().join("s.tsvz.3.gz");
+        let bytes = fs::read(&copy).unwrap();
+        let at = memchr::memmem::find(&bytes[1..], crate::name::Codec::Gzip.magic());
+        assert!(
+            at.is_some_and(|i| 2 * (i + 4) < bytes.len()),
+            "{at:?} of {} bytes",
+            bytes.len()
+        );
+        let written = files(dir.path());
+        for scrub_no in 2..=4 {
+            assert_eq!(
+                scrub(&p, &opts()).unwrap(),
+                Outcome::Unchanged,
+                "{scrub_no}"
+            );
+            assert_eq!(files(dir.path()), written, "{scrub_no}");
+        }
+        assert_eq!(fs::read(&copy).unwrap(), bytes);
+    }
+
+    #[test]
     fn every_state_a_rotation_after_a_snapshot_part_can_leave_reads_as_the_store() {
         // Cut short (newest first), a rotation leaves the oldest parts, then the snapshot part.
         for (p0, p2) in [

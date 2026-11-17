@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use hashbrown::HashMap;
 
-use crate::codec::{self, Item};
+use crate::codec::{self, Item, Walk};
 use crate::escape;
 use crate::frame::{Framer, Line};
 use crate::lock::Handle;
@@ -325,30 +325,22 @@ impl SnapshotLines {
 
 /// What the members at the start of the compressed bytes `data` say: whether the part is a
 /// snapshot part, judged only from members that passed their checks, as TSVZ.py reads a part.
-/// None when those end before the verdict: with `more`, a last member that runs past `data` is
-/// only the end of what was read so far. A member cut short or corrupt before the verdict, in
-/// the middle of `data` or at the end of the part, makes it no snapshot part; so does a member
-/// that runs past `data` and holds the codec's magic bytes in what was read (in a stored block,
-/// or by chance in compressed data), when `data` is a prefix of the part (the whole part decodes
-/// as that one member: docs/limitations.md).
+/// None when those end before the verdict and the part may go on: the bytes end between members,
+/// or, with `more`, in a member that runs past `data` (it is not split at a codec magic found
+/// inside it: that is its own bytes, or the part's damage, which only the whole member shows). A
+/// member that is corrupt, or cut short at the end of the part, before the verdict makes it no
+/// snapshot part.
 fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
     let mut lines = SnapshotLines::new(delimiter);
     let mut framer = Framer::new();
-    let mut damaged = false;
-    codec::for_each_item(codec, data, &mut |item| match item {
-        Item::Data(out) => framer.push(&out, &mut |l| lines.line(l)),
-        // the last item when the member runs to the end of `data`; a Break follows it otherwise,
-        // and then it was a damaged member in the middle
-        Item::CutShort { .. } if more => true,
-        Item::CutShort { .. } | Item::Corrupt { .. } | Item::Break => {
-            damaged = true;
-            false
-        }
+    let walk = codec::for_each_complete_member(codec, data, &mut |out| {
+        framer.push(out, &mut |l| lines.line(l))
     });
-    match lines.verdict {
-        Some(verdict) => Some(verdict),
-        None if damaged => Some(false),
-        None => None,
+    match (lines.verdict, walk) {
+        (Some(verdict), _) => Some(verdict),
+        (None, Walk::Bad) => Some(false),
+        (None, Walk::Short) if !more => Some(false),
+        (None, _) => None,
     }
 }
 
@@ -424,9 +416,7 @@ fn first_lines_say_no(
 /// one a piece at a time: a "no" comes as soon as its lines show it, whether or not their member
 /// passes its check later, and a "yes" only from first lines that come out of members that passed
 /// their checks (bzip2 gives nothing before a whole block, up to 900 kB of text). A part whose
-/// start cannot be read, or holds damage before the marker, is not one (§19.10.3); a member that
-/// runs past the bytes read and holds the codec's magic bytes in them looks damaged here
-/// (docs/limitations.md).
+/// start cannot be read, or holds damage before the marker, is not one (§19.10.3).
 pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
     let Ok(file) = Handle::open_read(&part.path) else {
         return false;
@@ -1473,6 +1463,61 @@ mod tests {
         bad[n - 8] ^= 1;
         write(dir.path(), "big.tsvz.1.gz", &bad);
         assert!(!part_1_is_snapshot_part(&dir.path().join("big.tsvz")));
+    }
+
+    #[test]
+    fn a_member_that_runs_past_the_look_is_not_split_at_a_codec_magic_in_what_was_read() {
+        // §16.6 rule 2 ends a damaged member's bytes at the next magic, but a member that only
+        // runs past the bytes the look has read is not damaged, and a magic in them is its own
+        // bytes: in a stored block the data, in compressed data any three bytes. A part whose
+        // first member held `1f 8b 08` in what the look had read was no snapshot part to it for
+        // that (3 of 3,000 random 65 KB gzip parts did).
+        let mut content = b"#_snapshot_#\nm\t\x1f\x8b\x08\n".to_vec();
+        content.extend(noise("", 600).bytes());
+        let mut member = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        member.write_all(&content).unwrap(); // stored blocks keep the row's bytes as they are
+        let part = member.finish().unwrap();
+        let at = memchr::memmem::find(&part[1..], Codec::Gzip.magic()).unwrap() + 1;
+        assert!(at + 3 < SNAPSHOT_HINT as usize && part.len() as u64 > 3 * SNAPSHOT_HINT);
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "s.tsvz", b"a\t1\n");
+        write(dir.path(), "s.tsvz.1.gz", &part);
+        assert!(part_1_is_snapshot_part(&dir.path().join("s.tsvz")));
+        // Each read of the look: read on until the member is whole, then its own verdict.
+        let say = |data: &[u8], more| compressed_verdict(Codec::Gzip, data, b'\t', more);
+        for len in [at + 3, SNAPSHOT_HINT as usize + 1, part.len() - 1] {
+            assert_eq!(say(&part[..len], true), None, "{len}");
+        }
+        assert_eq!(say(&part, true), Some(true));
+        assert_eq!(say(&part, false), Some(true));
+        // A member cut short at the end of the part is no snapshot part: nothing to read on.
+        assert_eq!(say(&part[..part.len() - 1], false), Some(false));
+        // Nor is one whose check fails, found when its end is read.
+        let mut bad = part.clone();
+        let n = bad.len();
+        bad[n - 8] ^= 1;
+        assert_eq!(say(&bad, true), Some(false));
+        write(dir.path(), "s.tsvz.1.gz", &bad);
+        assert!(!part_1_is_snapshot_part(&dir.path().join("s.tsvz")));
+    }
+
+    #[test]
+    fn a_member_that_is_not_valid_in_what_was_read_is_settled_at_once() {
+        // More of the part cannot make bytes that are already wrong right, so the look says no
+        // without reading on, as it did: a snapshot part's first member begins wrong (here, its
+        // first byte), and the part goes on past what was read.
+        use crate::codec::encode_member;
+        for codec in [Codec::Gzip, Codec::Bzip2, Codec::Xz, Codec::Zstd] {
+            if !codec.supported() {
+                continue;
+            }
+            let mut part = encode_member(codec, noise("#_snapshot_#\n", 20000).as_bytes()).unwrap();
+            assert!(part.len() as u64 > 2 * SNAPSHOT_HINT, "{codec:?}");
+            let first_page = |part: &[u8]| compressed_verdict(codec, &part[..4097], b'\t', true);
+            assert_eq!(first_page(&part), None, "{codec:?} valid, runs on");
+            part[0] ^= 1;
+            assert_eq!(first_page(&part), Some(false), "{codec:?}");
+        }
     }
 
     /// Rows of pseudo-random hex, which compress little: `n` of them after `head`.
