@@ -162,6 +162,32 @@ fn accept_within_10s(listener: &UnixListener) -> UnixStream {
     }
 }
 
+/// Make a command's standard output a socket nobody reads, so that its writes fail with EPIPE as
+/// they do to a closed pipe. The pair is made in the forked child, just before it execs: no
+/// other process can hold the read end. A pair made by the test, with both ends close-on-exec,
+/// was still held by a child that another test of this binary was forking at that moment (a
+/// command got a reader and printed, in 1 of 120 runs of the binary), and a `pipe(2)` without
+/// that flag in 3 of 120.
+fn unread_stdout(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child, before exec, and calls only socketpair,
+    // close and dup2, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut fds = [0; 2];
+            if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(fds[0]);
+            if libc::dup2(fds[1], 1) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(fds[1]);
+            Ok(())
+        })
+    }
+}
+
 #[test]
 fn a_client_that_hangs_up_before_its_answer_leaves_the_handler_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -267,26 +293,20 @@ fn a_quiet_handler_still_reports_writes_that_fail() {
 #[test]
 fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
     // The handler deletes the row before the command prints it: a row that cannot be printed
-    // (here to a pipe nobody reads) is put back, not lost.
-    use std::os::fd::{FromRawFd, OwnedFd};
+    // (here to a socket nobody reads) is put back, not lost.
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "a\t1\nb\t2\n");
     let _served = Served::start(&s, &[]);
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two new descriptors into fds.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are new and owned here alone.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    drop(read);
     for op in [&["pop", "s.tsvz", "a"][..], &["popitem", "s.tsvz"][..]] {
-        let out = tsvz()
-            .current_dir(dir.path())
-            .args(op)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(write.try_clone().unwrap()))
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
+        let out = unread_stdout(
+            tsvz()
+                .current_dir(dir.path())
+                .args(op)
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped()),
+        )
+        .output()
+        .unwrap();
         assert_eq!(out.status.code(), Some(1), "{op:?}: {}", text(&out.stderr));
         assert!(
             text(&out.stderr).contains("it was put back"),
@@ -381,24 +401,18 @@ fn a_client_cannot_send_a_request_inside_a_marker_key() {
 
 #[test]
 fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
-    use std::os::fd::{FromRawFd, OwnedFd};
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "<#>_x_#\tkeep me\na\t1\n");
     let _served = Served::start(&s, &[]);
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two new descriptors into fds.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are new and owned here alone.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    drop(read);
-    let out = tsvz()
-        .current_dir(dir.path())
-        .args(["popitem", "s.tsvz", "first"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write))
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let out = unread_stdout(
+        tsvz()
+            .current_dir(dir.path())
+            .args(["popitem", "s.tsvz", "first"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .output()
+    .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("it was put back"),
@@ -511,12 +525,11 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
 
 #[test]
 fn a_row_taken_and_not_printed_is_named_when_the_handler_has_hung_up() {
-    // `pop` took the row and cannot print it (a pipe nobody reads), and the handler has hung up
+    // `pop` took the row and cannot print it (a socket nobody reads), and the handler has hung up
     // since, so the row cannot be put back either: the command exits 1 naming the row, not ended
     // by SIGPIPE. A stand-in handler shuts its end for reading before it answers, so that the
     // put-back fails whatever the timing.
     use std::io::BufRead;
-    use std::os::fd::{FromRawFd, OwnedFd};
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "a\t1\n");
     let listener = stand_in_handler(dir.path(), &s);
@@ -527,20 +540,15 @@ fn a_row_taken_and_not_printed_is_named_when_the_handler_has_hung_up() {
         conn.shutdown(std::net::Shutdown::Read).unwrap();
         (&conn).write_all(b"a\t1\n#0\n").unwrap();
     });
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two new descriptors into fds.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are new and owned here alone.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    drop(read);
-    let out = tsvz()
-        .current_dir(dir.path())
-        .args(["pop", "s.tsvz", "a"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write))
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let out = unread_stdout(
+        tsvz()
+            .current_dir(dir.path())
+            .args(["pop", "s.tsvz", "a"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .output()
+    .unwrap();
     handler.join().unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(

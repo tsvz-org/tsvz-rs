@@ -1746,8 +1746,10 @@ mod tests {
 
     #[test]
     fn the_warning_of_a_backup_is_sent_after_the_lock_is_let_go() {
-        // A callback that reads the part opens and closes it, which releases a classic lock
-        // held on it: the lock is let go first.
+        // The callback asks, from another process, whether the part is locked: it is not, so the
+        // lock is let go before the warning is sent. The lock taken here is the open file
+        // description lock (`flock` on macOS); the classic fallback has tests of its own in
+        // lock.rs.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n\0\0c\t3\n").unwrap();
