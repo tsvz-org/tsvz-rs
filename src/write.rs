@@ -384,17 +384,26 @@ impl Writer {
                 missing = None;
                 continue;
             }
-            let before = stamp(&file).map_err(io)?;
-            let start = match part.codec {
-                Some(_) => before.size,
-                None => {
-                    self.cut_torn_tail(&file, path).map_err(io)?;
-                    file.metadata().map_err(io)?.len()
-                }
-            };
-            self.write_batch(&file, path, &bytes, start)?;
-            let after = stamp(&file).map_err(io)?;
+            // The warning of a cut tail is sent once the lock is let go, whatever else happened: a
+            // callback that opens this part would otherwise release a classic lock (docs/limitations.md).
+            let mut cut = None;
+            let locked = (|| {
+                let before = stamp(&file).map_err(io)?;
+                let start = match part.codec {
+                    Some(_) => before.size,
+                    None => {
+                        cut = self.cut_torn_tail(&file, path).map_err(io)?;
+                        file.metadata().map_err(io)?.len()
+                    }
+                };
+                self.write_batch(&file, path, &bytes, start)?;
+                Ok::<_, Error>((before, stamp(&file).map_err(io)?))
+            })();
             drop(guard);
+            if let (Some(w), Some(warning)) = (&self.warn, &cut) {
+                w(warning);
+            }
+            let (before, after) = locked?;
             return Ok(Appended {
                 part: part.path.clone(),
                 before,
@@ -441,30 +450,27 @@ impl Writer {
 
     /// An uncommitted tail would join the first appended record, so it is cut first: TSVZ.py
     /// does that in a store, but in a loose file it ends the last line instead, and the cut here
-    /// loses that row (docs/limitations.md).
-    fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<()> {
+    /// loses that row (docs/limitations.md). Says what was cut, as the warning to send.
+    fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<Option<Warning>> {
         let size = file.metadata()?.len();
         if size == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let mut last = [0u8; 1];
         file.read_exact_at(&mut last, size - 1)?;
         if last[0] == b'\n' {
-            return Ok(());
+            return Ok(None);
         }
         let keep = last_newline_end(file, size)?;
         file.set_len(keep)?;
-        if let Some(w) = &self.warn {
-            w(&Warning {
-                part: path.to_path_buf(),
-                offset: Some(keep),
-                message: format!(
-                    "cut {} uncommitted bytes after the last newline before appending",
-                    size - keep
-                ),
-            });
-        }
-        Ok(())
+        Ok(Some(Warning {
+            part: path.to_path_buf(),
+            offset: Some(keep),
+            message: format!(
+                "cut {} uncommitted bytes after the last newline before appending",
+                size - keep
+            ),
+        }))
     }
 }
 
@@ -791,6 +797,26 @@ mod tests {
             .append(&[])
             .unwrap();
         assert_eq!(fs::read(dir.path().join("e.tsvz")).unwrap(), b"");
+    }
+
+    #[test]
+    fn the_warning_of_a_cut_tail_is_sent_after_the_lock_is_let_go() {
+        // A callback that reads the store opens and closes the part, which releases a classic
+        // lock held on it: the lock is let go first.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, b"a\t1\ntorn").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sink, part) = (seen.clone(), p.clone());
+        let mut w =
+            Writer::open(&p)
+                .unwrap()
+                .warnings(Some(std::sync::Arc::new(move |_: &Warning| {
+                    sink.lock().unwrap().push(lock::locked_elsewhere(&part))
+                })));
+        w.append(&[Record::from_args("b", &["2".into()])]).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [false], "locked while it was sent");
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n");
     }
 
     #[test]

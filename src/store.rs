@@ -1229,6 +1229,28 @@ mod tests {
     }
 
     #[test]
+    fn following_appends_keeps_a_classic_lock() {
+        // A handler follows the files while its writer holds the lock. Where the lock is a
+        // classic POSIX one, closing any descriptor of the file in the process releases it, so
+        // a follow must open and close none.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        let mut store = Store::open(&p, Options::default()).unwrap();
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let guard = crate::lock::lock_classic(&file).unwrap();
+        for i in 0..3 {
+            (&file).write_all(format!("k{i}\tv\n").as_bytes()).unwrap();
+            assert_eq!(store.refresh().unwrap(), Refreshed::Followed);
+            assert!(
+                crate::lock::locked_elsewhere(&p),
+                "follow {i} released the classic lock"
+            );
+        }
+        drop(guard);
+        assert_eq!(store.len(), 4);
+    }
+
+    #[test]
     fn a_loose_delimiter_must_be_one_ascii_character_other_than_a_line_break() {
         // A byte past ASCII cuts characters in two (a panic); a line break splits rows.
         let dir = tempfile::tempdir().unwrap();

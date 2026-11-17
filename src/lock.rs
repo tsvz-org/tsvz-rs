@@ -1,10 +1,11 @@
 //! The write lock shared with TSVZ.py: an exclusive lock on the whole file that belongs to the
-//! open file description, as TSVZ.py 5.3 and later take it: an open file description lock on
-//! Linux, `flock` elsewhere. Closing another descriptor of the file never releases it, and two
-//! descriptors exclude each other in one process as in two. Where the kernel or the file system
-//! refuses it (Linux before 3.15), a classic POSIX lock, behind an in-process gate: the process
-//! loses that one when it closes any descriptor of the file (docs/limitations.md). Readers take
-//! no lock.
+//! open file description, of the kind TSVZ.py 5.3 and later take: an open file description lock
+//! on Linux, `flock` elsewhere. It excludes every lock TSVZ.py takes (on Linux its appends lock
+//! byte 1, its readers byte 0), so an append here also waits for its readers. Closing another
+//! descriptor of the file never releases it, and two descriptors exclude each other in one
+//! process as in two. Where the kernel or the file system refuses it (Linux before 3.15), a
+//! classic POSIX lock, behind an in-process gate: the process loses that one when it closes any
+//! descriptor of the file (docs/limitations.md). Readers take no lock.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -32,7 +33,10 @@ fn gate() -> (MutexGuard<'static, Held>, &'static Condvar) {
 }
 
 /// Take the write lock on `file` (open for writing); waits as long as another descriptor holds
-/// it, in this process or another.
+/// it, in this process or another. A second call on the same open file description (a
+/// `try_clone` of the file, or one `File` used by two threads) is not another descriptor: the
+/// lock is granted at once, and the first guard's drop releases it for both. Nothing in the
+/// crate does that; each caller opens its own `File`.
 pub fn lock(file: &File) -> io::Result<Guard<'_>> {
     #[cfg(test)]
     let _waiting = Waiting::on(file)?;
@@ -46,7 +50,7 @@ pub fn lock(file: &File) -> io::Result<Guard<'_>> {
 }
 
 /// [`lock`] by a classic POSIX lock, behind the in-process gate.
-fn lock_classic(file: &File) -> io::Result<Guard<'_>> {
+pub(crate) fn lock_classic(file: &File) -> io::Result<Guard<'_>> {
     let meta = file.metadata()?;
     let id = (meta.dev(), meta.ino());
     let (mut held, cv) = gate();
@@ -171,12 +175,50 @@ impl Drop for Waiting {
     }
 }
 
-/// How many threads are taking the lock of `path` (one holds it, the others wait): for tests.
+/// How many threads are inside [`lock`] for `path`, waiting for it (the holder has left it): for
+/// tests.
 #[cfg(test)]
 pub(crate) fn waiters_on(path: &std::path::Path) -> usize {
     let meta = std::fs::metadata(path).unwrap();
     let id = (meta.dev(), meta.ino());
     WAITING.lock().unwrap().iter().filter(|w| **w == id).count()
+}
+
+/// Whether another process would find `path` locked now (a child process tries to lock it): for
+/// tests. Panics when the child cannot open the file, which says nothing about its lock.
+#[cfg(test)]
+pub(crate) fn locked_elsewhere(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the child only calls async-signal-safe functions (open, fcntl, _exit).
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        // SAFETY: as above; `c` was made before the fork, and `fl` is a plain struct.
+        unsafe {
+            let fd = libc::open(c.as_ptr(), libc::O_RDWR);
+            if fd < 0 {
+                libc::_exit(2);
+            }
+            let mut fl: libc::flock = std::mem::zeroed();
+            fl.l_type = libc::F_WRLCK as _;
+            fl.l_whence = libc::SEEK_SET as _;
+            libc::_exit(if libc::fcntl(fd, libc::F_SETLK, &fl) != 0 {
+                1
+            } else {
+                0
+            });
+        }
+    }
+    let mut status = 0;
+    // SAFETY: waits for the child made above.
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
+    match libc::WEXITSTATUS(status) {
+        0 => false,
+        1 => true,
+        n => panic!("the child could not open {}: {n}", path.display()),
+    }
 }
 
 #[cfg(test)]
@@ -185,35 +227,11 @@ mod tests {
     use std::fs::OpenOptions;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    /// Whether another process would find `path` locked now (a child process tries to lock it).
-    fn locked_elsewhere(path: &Path) -> bool {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: the child only calls async-signal-safe functions (open, fcntl, _exit).
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork");
-        if pid == 0 {
-            // SAFETY: as above; `c` and `fl` were made before the fork.
-            unsafe {
-                let fd = libc::open(c.as_ptr(), libc::O_RDWR);
-                let mut fl: libc::flock = std::mem::zeroed();
-                fl.l_type = libc::F_WRLCK as _;
-                fl.l_whence = libc::SEEK_SET as _;
-                let busy = fd < 0 || libc::fcntl(fd, libc::F_SETLK, &fl) != 0;
-                libc::_exit(if busy { 1 } else { 0 });
-            }
-        }
-        let mut status = 0;
-        // SAFETY: waits for the child made above.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status));
-        libc::WEXITSTATUS(status) == 1
-    }
+    use std::time::{Duration, Instant};
 
     /// Lock `second` on a thread while `first` holds `guard`: the thread gets it only once the
-    /// guard is dropped.
+    /// guard is dropped. Waits until the thread is counted as waiting, not for a time that a
+    /// busy host may not give it; a lock that does not exclude lets it through at once.
     fn excludes(
         guard: Guard<'_>,
         second: &Path,
@@ -223,10 +241,23 @@ mod tests {
         let (p2, o2) = (second.to_path_buf(), order.clone());
         let t = std::thread::spawn(move || {
             let file = OpenOptions::new().append(true).open(&p2).unwrap();
+            let waiting = Waiting::on(&file).unwrap(); // `lock_classic` does not count itself
             let _g = take(&file).unwrap();
+            drop(waiting);
             o2.lock().unwrap().push("second");
         });
-        std::thread::sleep(Duration::from_millis(150));
+        // 10 s: how long the other tests give a thread to get going.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiters_on(second) == 0 && !t.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the thread never came to the lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Counted, it is a few instructions from blocking; a lock that let it through would
+        // have it done well within this.
+        std::thread::sleep(Duration::from_millis(50));
         order.lock().unwrap().push("first");
         drop(guard);
         t.join().unwrap();
@@ -250,6 +281,9 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let file = OpenOptions::new().append(true).open(&path).unwrap();
         let guard = lock(&file).unwrap();
+        if guard.classic.is_some() {
+            return; // no open file description lock here: a classic one goes with any close
+        }
         drop(File::open(&path).unwrap());
         assert!(locked_elsewhere(&path), "the lock went with the close");
         drop(guard);

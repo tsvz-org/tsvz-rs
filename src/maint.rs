@@ -387,10 +387,10 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         .write(true)
         .open(path)
         .map_err(io)?;
-    let _guard = lock::lock(&file).map_err(io)?;
-    // The copy is readable by whoever could read the part, and writable by its owner only: the
-    // part's read bits plus owner write, never its setuid, setgid, sticky or execute bits, nor
-    // write access for others (the umask still applies on top).
+    let guard = lock::lock(&file).map_err(io)?;
+    // The copy is readable by whoever could read the part, and writable by its owner only when
+    // the part is: its read bits and owner write bit (`mode & 0o644`), never its setuid, setgid,
+    // sticky or execute bits, nor write access for others (the umask still applies on top).
     let part = file.metadata().map_err(io)?;
     let mode = part.permissions().mode() & 0o644;
     let first = PathBuf::from(format!("{}.damaged-{}", path.display(), local_timestamp()));
@@ -419,6 +419,9 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         return Err(Error::io(&target, e));
     }
     sync_dir(&target);
+    // Told once the lock is let go: a callback that opens the part would release a classic lock
+    // (docs/limitations.md).
+    drop(guard);
     if let Some(w) = &options.warnings {
         w(&Warning {
             part: path.to_path_buf(),
@@ -1739,6 +1742,23 @@ mod tests {
             1,
             "the copy is not a part"
         );
+    }
+
+    #[test]
+    fn the_warning_of_a_backup_is_sent_after_the_lock_is_let_go() {
+        // A callback that reads the part opens and closes it, which releases a classic lock
+        // held on it: the lock is let go first.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n\0\0c\t3\n").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sink, part) = (seen.clone(), p.clone());
+        let mut options = opts();
+        options.warnings = Some(std::sync::Arc::new(move |_: &Warning| {
+            sink.lock().unwrap().push(lock::locked_elsewhere(&part))
+        }));
+        backup(&p, &options).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [false], "locked while it was sent");
     }
 
     #[test]
