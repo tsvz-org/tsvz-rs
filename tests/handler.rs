@@ -369,6 +369,8 @@ fn a_put_back_keeps_a_data_key_shaped_like_a_marker_a_data_key() {
 fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     // A pop answered after its tombstone is written must reach its client, or not be made:
     // a stop lets requests already read finish and answer, and closes the connections after.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let rows = 100_000;
     let mut content = String::from("#_write_ack_#\tdisk\n");
@@ -377,19 +379,27 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     }
     let s = store(dir.path(), &content);
     let mut served = Served::start(&s, &[]);
+    let popped = Arc::new(AtomicUsize::new(0));
     let consumers: Vec<_> = (0..4)
         .map(|_| {
             let mut client = tsvz::handler::Client::connect(&s).unwrap();
+            let popped = popped.clone();
             std::thread::spawn(move || {
                 let mut got = Vec::new();
                 while let Ok(Some(row)) = client.popitem(false) {
                     got.push(row[0].clone());
+                    popped.fetch_add(1, Ordering::SeqCst);
                 }
                 got
             })
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
+    // Stopped once the consumers are under way, however long that takes on a busy host.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while popped.load(Ordering::SeqCst) <= 10 {
+        assert!(Instant::now() < deadline, "the consumers never got going");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
     assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
     let answered: Vec<String> = consumers
