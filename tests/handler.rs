@@ -119,6 +119,49 @@ fn store(dir: &Path, content: &str) -> PathBuf {
     p
 }
 
+/// The pointer file of `store` naming a socket this test listens on: a stand-in for a handler,
+/// to do with a connection what a real one does only when the timing allows.
+fn stand_in_handler(dir: &Path, store: &Path) -> UnixListener {
+    let sock = dir.join("sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let at = pointer::path_of(store);
+    fs::write(
+        &at,
+        format!(
+            "tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t{}\n",
+            sock.display(),
+            pointer::hostname(),
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&at, fs::Permissions::from_mode(0o644)).unwrap();
+    listener
+}
+
+/// The next connection to a stand-in handler, with a limit on every wait for its request: a
+/// command that never connects or never sends fails the test, it does not leave it hanging. 10 s
+/// is how long `Served::start` gives a process to start.
+fn accept_within_10s(listener: &UnixListener) -> UnixStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((conn, _)) => {
+                conn.set_nonblocking(false).unwrap(); // macOS passes the listener's mode on
+                conn.set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                return conn;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "no command connected");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+}
+
 #[test]
 fn a_client_that_hangs_up_before_its_answer_leaves_the_handler_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -432,28 +475,15 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
     let s = store(dir.path(), "k\tv\n");
     let (code, direct, _) = cli(dir.path(), &["--x-direct", "get", "s.tsvz", "k"], b"");
     assert_eq!(code, 0);
-    let sock = dir.path().join("sock");
-    let listener = UnixListener::bind(&sock).unwrap();
-    let at = pointer::path_of(&s);
-    fs::write(
-        &at,
-        format!(
-            "tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t{}\n",
-            sock.display(),
-            pointer::hostname(),
-            std::process::id()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&at, fs::Permissions::from_mode(0o644)).unwrap();
+    let listener = stand_in_handler(dir.path(), &s);
     let closer = std::thread::spawn(move || {
         // The read's connection: closed once its request came, unanswered.
-        let (conn, _) = listener.accept().unwrap();
+        let conn = accept_within_10s(&listener);
         let mut request = String::new();
         BufReader::new(&conn).read_line(&mut request).unwrap();
         drop(conn);
         // The write's: closed before its request comes.
-        drop(listener.accept().unwrap());
+        drop(accept_within_10s(&listener));
     });
     let (code, out, err) = cli(dir.path(), &["get", "s.tsvz", "k"], b"");
     assert_eq!((code, out.as_str()), (0, direct.as_str()), "{err}");
@@ -477,6 +507,48 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
         text(&out.stderr)
     );
     assert_eq!(fs::read_to_string(&s).unwrap(), "k\tv\n", "not redone");
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_named_when_the_handler_has_hung_up() {
+    // `pop` took the row and cannot print it (a pipe nobody reads), and the handler has hung up
+    // since, so the row cannot be put back either: the command exits 1 naming the row, not ended
+    // by SIGPIPE. A stand-in handler shuts its end for reading before it answers, so that the
+    // put-back fails whatever the timing.
+    use std::io::BufRead;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let listener = stand_in_handler(dir.path(), &s);
+    let handler = std::thread::spawn(move || {
+        let conn = accept_within_10s(&listener);
+        let mut request = String::new();
+        BufReader::new(&conn).read_line(&mut request).unwrap();
+        conn.shutdown(std::net::Shutdown::Read).unwrap();
+        (&conn).write_all(b"a\t1\n#0\n").unwrap();
+    });
+    let mut fds = [0; 2];
+    // SAFETY: pipe writes two new descriptors into fds.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors are new and owned here alone.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read);
+    let out = tsvz()
+        .current_dir(dir.path())
+        .args(["pop", "s.tsvz", "a"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    handler.join().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("could not be printed nor put back")
+            && text(&out.stderr).contains("a\t1"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]

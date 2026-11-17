@@ -47,3 +47,7 @@ jobs:
         with:
           toolchain: "1.85"
       - run: cargo check --all-targets
+      # The handler tests run the command line against handlers that close connections; std
+      # passes MSG_NOSIGNAL to a Unix socket's writes only from Rust 1.90, so on this one the
+      # command line itself must keep SIGPIPE from ending it.
+      - run: cargo test --test handler

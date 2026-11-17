@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::cli::Ctx;
+use crate::cli::{Ctx, NoSigpipe};
 use crate::handler::server::{self, Config, InfoFn};
 use crate::{Error, WarnFn, Warning};
 
@@ -29,6 +29,7 @@ pub(crate) fn serve(ctx: &mut Ctx) -> Result<i32, Error> {
 }
 
 pub(crate) fn stop(ctx: &mut Ctx) -> Result<i32, Error> {
+    let _sigpipe = NoSigpipe::new(); // a handler already stopping may have closed the connection
     server::stop(&ctx.store)?;
     Ok(0)
 }

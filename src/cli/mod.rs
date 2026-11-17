@@ -71,6 +71,28 @@ options:
 exit status: 0 done, 1 failed or refused, 2 usage error, 3 missing key, 4 checksum mismatch
 ";
 
+/// SIGPIPE ignored while this lives, so that writing to a closed pipe or socket fails instead of
+/// ending the process; its default action is restored after. `main` leaves the default for the
+/// standard output, which should end the process quietly; every write to a handler's socket runs
+/// under this, because std passes `MSG_NOSIGNAL` to a Unix socket's writes only from Rust 1.90
+/// and the crate builds with 1.85.
+struct NoSigpipe;
+
+impl NoSigpipe {
+    fn new() -> NoSigpipe {
+        // SAFETY: the command line runs one thread; this only changes SIGPIPE's action.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        NoSigpipe
+    }
+}
+
+impl Drop for NoSigpipe {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+}
+
 /// Run the tool with `argv` (without the program name) and return its exit status (§20.6).
 pub fn main(argv: Vec<OsString>) -> i32 {
     // SAFETY: restores the default action for SIGPIPE before any other thread exists, so writing
