@@ -96,14 +96,12 @@ fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
             .any(|(j, c)| c.is_empty() && m.defaults.get(j).is_some_and(|d| !d.is_empty())))
 }
 
-/// The snapshot content of §19.2.3 for a store read whole, as TSVZ.py writes it: the header
-/// comment, the markers, then one fully resolved row per live key, padded with empty cells to
-/// the width of the final defaults; the compensating layout of §19.4 when a row would not read
-/// back the same. For a loose file: its header comment and its rows, which is not what `scrub`
-/// writes there (it keeps the file's lines in their places, `#_defaults_#` lines included).
-pub fn snapshot(s: &Store) -> String {
-    let f = s.format();
-    let d = f.delimiter;
+/// The snapshot content of §19.2.3 for a strict store read whole, as TSVZ.py writes it: the
+/// header comment, the markers, then one fully resolved row per live key, padded with empty
+/// cells to the width of the final defaults; the compensating layout of §19.4 when a row would
+/// not read back the same. (A loose file's scrub keeps its lines instead: `loose::scrub`.)
+pub(crate) fn snapshot(s: &Store) -> String {
+    let d = s.format().delimiter;
     let m = s.markers();
     let rows: Vec<(&str, Vec<String>)> = s
         .iter()
@@ -119,17 +117,6 @@ pub fn snapshot(s: &Store) -> String {
     if let Some(h) = s.header() {
         out.push_str(h);
         out.push('\n');
-    }
-    if !f.strict {
-        for (k, cells) in &rows {
-            out.push_str(k);
-            for c in cells {
-                out.push(d as char);
-                out.push_str(c);
-            }
-            out.push('\n');
-        }
-        return out;
     }
     let compensate = !rows.iter().all(|(k, cells)| round_trips(k, cells, m));
     preamble(&mut out, m, d, compensate, true);

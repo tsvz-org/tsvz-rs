@@ -85,3 +85,14 @@ entries go last, in the same commit as the change:
 - Lesson: when a server stops, end the connections it will not serve the way clients already handle a
   server that goes away, not with a new answer: a new answer works only on the client paths taught it,
   and the one left untaught fails.
+
+## 2026-11-17 maint::snapshot is crate-private
+- Changed: `tsvz::maint::snapshot` is no longer public, and its branch for loose files goes with the
+  doc promise about it (0.2.0, with the other breaking changes of the library).
+- Why we had to change: nothing outside the crate called it, and inside it is called only on strict
+  stores, so its loose-file branch was code and a documented promise for a case no caller reached
+  (chief's decision of 2026-11-15 kept it public in 0.1.4, "revisited at 0.2").
+- Original design was wrong because: it made a helper of `scrub` public with the rest of the module,
+  so it had to answer for every store a caller might pass, not only the ones `scrub` passes.
+- Lesson: make a function public only when a caller outside needs it; a public helper must answer for
+  inputs its own callers never give it, and that answer is code and a promise to keep.
