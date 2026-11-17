@@ -196,3 +196,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   follow state, with TSVZ.py as the oracle; these cases go into its tests.
 - Noted: 2026-11-16, in the 0.1.4 re-review; a deferral under the user's standing rule that deferrals are
   noted, not asked.
+
+### A handler on a cifs (SMB) mount is unreachable for the command line
+- Kind: deferred
+- What the operator sees: while `tsvz serve` runs on a store on a cifs mount, every other `tsvz` command on that
+  store says `ignoring the pointer file ...: Permission denied (os error 13); using the files directly` and works on
+  the files, as `--x-direct` does; `tsvz::handler::Client::connect` finds no handler either. A client given the
+  socket's address itself still reaches the handler.
+- Why: the handler holds its pointer file with `flock`, as TSVZ.py's does, and cifs turns that into a mandatory SMB
+  byte-range lock, so another process's read of the file fails with EACCES. Found by the 0.1.4 measurements on a
+  loopback SMB share (2026-11-17).
+- Revisit when: 0.2.1. The plan: first, check TSVZ.py 5.18 from its code (a first look: its handler takes the same
+  `flock`, and its lookup reads the file outside the `try` that catches only the open, so its command line may fail
+  there rather than use the files; not run); then confirm both tools on a real cifs mount (VM 901, a test of its
+  own); then fix it with TSVZ.py for both, such as by holding the lock where no reader of the pointer reads (another
+  file, or a byte range past its content).
+- Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
+  asked.
