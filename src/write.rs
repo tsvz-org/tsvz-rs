@@ -1404,6 +1404,7 @@ mod loose_round_trip {
     use super::*;
     use crate::loose::{parse, py_space, sanitize};
 
+    #[rustfmt::skip]
     const ATOMS: &[&str] = &[
         "a", "e", "s", "p", "L", "F", "<", ">", "/", "#", "_", "\0", " ", "\t", "\n", "\r",
         "<sep>", "<LF>", "</sep/>", "</LF/>", "#_defaults_#", "\u{1c}", "\u{a0}", ",", "x",
@@ -1485,6 +1486,11 @@ mod loose_round_trip {
                 .collect();
             check(&fields, d, &mut bad);
         }
-        assert!(bad.is_empty(), "{} mismatches: {:?}", bad.len(), &bad[..bad.len().min(20)]);
+        assert!(
+            bad.is_empty(),
+            "{} mismatches: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(20)]
+        );
     }
 }

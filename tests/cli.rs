@@ -829,13 +829,19 @@ fn a_loose_key_with_a_line_break_at_its_end_names_its_own_row() {
     ] {
         fs::write(dir.join("f.tsv"), init).unwrap();
         let row = if init == m { "a<LF>\t1\n" } else { "a<LF>\n" };
-        assert_eq!(records(dir, &["get", "f.tsv", "a\n"]), (0, row.into(), "".into()));
+        assert_eq!(
+            records(dir, &["get", "f.tsv", "a\n"]),
+            (0, row.into(), "".into())
+        );
         assert_eq!(records(dir, &["has", "f.tsv", "a\n"]).0, 0);
         assert_eq!(records(dir, &["delete", "f.tsv", "a\n"]).0, 0);
         assert_eq!(file(dir, "f.tsv"), after_delete);
         assert_eq!(keys("f.tsv"), keys_after);
         fs::write(dir.join("f.tsv"), init).unwrap();
-        assert_eq!(records(dir, &["pop", "f.tsv", "a\n"]), (0, row.into(), "".into()));
+        assert_eq!(
+            records(dir, &["pop", "f.tsv", "a\n"]),
+            (0, row.into(), "".into())
+        );
         assert_eq!(keys("f.tsv"), keys_after);
         fs::write(dir.join("f.tsv"), init).unwrap();
         assert_eq!(bulk(&["delete", "f.tsv", "-"], b"a<LF>\n").0, 0);
@@ -877,10 +883,16 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
     // `</sep/>` reads back as `<sep>`: no row has it, so its delete is nothing (0.2.0 deleted
     // `<sep>`).
     fs::write(dir.join("g.tsv"), "k\tv\n</sep/>\t1\n").unwrap();
-    assert_eq!(records(dir, &["delete", "g.tsv", "</sep/>"]), (0, "".into(), "".into()));
+    assert_eq!(
+        records(dir, &["delete", "g.tsv", "</sep/>"]),
+        (0, "".into(), "".into())
+    );
     assert_eq!(file(dir, "g.tsv"), "k\tv\n</sep/>\t1\n");
     // setdefault's marker check names the key as a reader does (`#_defaults_# `).
-    assert_eq!(records(dir, &["setdefault", "f.tsv", "#_defaults_# ", "x"]).0, 2);
+    assert_eq!(
+        records(dir, &["setdefault", "f.tsv", "#_defaults_# ", "x"]).0,
+        2
+    );
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n");
     // Bulk input: a `#_defaults_#` line is a record, as a reader reads it.
     let all = ["--format", "records", "set", "f.tsv", "-"];

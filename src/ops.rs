@@ -332,7 +332,11 @@ pub fn parse_records(
             };
             let mut cells = cells.into_iter().map(Cow::into_owned);
             let key = cells.next().unwrap_or_default();
-            let values: Vec<String> = if keys_only { Vec::new() } else { cells.collect() };
+            let values: Vec<String> = if keys_only {
+                Vec::new()
+            } else {
+                cells.collect()
+            };
             records.push(if values.is_empty() {
                 Record::Tombstone { key }
             } else {

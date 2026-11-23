@@ -958,8 +958,14 @@ mod tests {
             delimiter: b'\t',
             strict: false,
         };
-        assert_eq!(run(loose, false, b"\0#h\0\0").0.header.as_deref(), Some("#h"));
-        assert_eq!(run(loose, false, b"\0#h\0\n").0.header.as_deref(), Some("#h\0"));
+        assert_eq!(
+            run(loose, false, b"\0#h\0\0").0.header.as_deref(),
+            Some("#h")
+        );
+        assert_eq!(
+            run(loose, false, b"\0#h\0\n").0.header.as_deref(),
+            Some("#h\0")
+        );
     }
 
     #[test]

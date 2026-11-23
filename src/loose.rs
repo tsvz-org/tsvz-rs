@@ -1049,7 +1049,7 @@ mod tests {
             ("hello", b'e', None), // its encoding holds the delimiter
             ("hllo", b'e', Some("hllo")),
             ("a<", b'e', Some("a<")), // a `<` that begins no token is written as it is
-            ("\0a", 0, Some("\0a")), // with the NUL as the delimiter the NUL is encoded away
+            ("\0a", 0, Some("\0a")),  // with the NUL as the delimiter the NUL is encoded away
         ] {
             assert_eq!(name(key, d).as_deref(), named, "{key:?} {d}");
         }
