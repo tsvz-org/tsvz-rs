@@ -127,7 +127,9 @@ Stores need nothing; the library's documented API does not change.
   cuts off a `pop` or `popitem` that waits for its write, even past the stop's 5 s; until it has
   written its queued writes, a command that reaches it finds it gone (a write exits 1, a read uses
   the files) instead of working on the files beside it. A routed `pop` whose row cannot be
-  printed is put back on the files when the handler cannot put it back. While a `#_write_ack_#`
+  printed is put back on the files when the handler cannot put it back, once the handler has
+  stopped (a handler that still serves the store leaves the files alone: the row is printed on
+  standard error). While a `#_write_ack_#`
   the handler queued is not yet written, every write through it is answered once written and
   synced. A read that falls back from a lost handler no longer warns that it "may or may not have
   been applied", and a command that meets a handler just as it stops no longer warns of a hard

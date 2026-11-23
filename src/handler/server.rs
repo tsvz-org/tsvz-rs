@@ -616,12 +616,7 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
         Err(why) => return Err(refused(why)),
     };
     let deadline = Instant::now() + wait;
-    let there = || {
-        pointer::lookup(store)
-            .ok()
-            .flatten()
-            .is_some_and(|now| now.pid == info.pid)
-    };
+    let there = || pointer::names_handler(store, &info.pid);
     let mut conn = match pointer::connect(&info, None) {
         Ok(conn) => conn,
         Err(_) if !there() => return Ok(()), // it stopped meanwhile
@@ -651,17 +646,15 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
         // timeout), and this stop waits for it as the one that asked first does.
         Err(_) => {}
     }
-    while there() {
-        if Instant::now() >= deadline {
-            return Err(refused(format!(
-                "the handler (pid {}) has not stopped within {} s",
-                info.pid,
-                wait.as_secs()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if pointer::wait_gone(store, &info.pid, deadline) {
+        Ok(())
+    } else {
+        Err(refused(format!(
+            "the handler (pid {}) has not stopped within {} s",
+            info.pid,
+            wait.as_secs()
+        )))
     }
-    Ok(())
 }
 
 #[cfg(test)]

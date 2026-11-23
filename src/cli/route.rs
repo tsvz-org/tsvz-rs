@@ -1,11 +1,14 @@
 //! Forwarding a command line to the store's handler (§20.8).
 
 use std::io::{BufWriter, Write};
+use std::time::Instant;
 
 use crate::cli::output::{Printer, stdout_error};
 use crate::cli::write::{self, bulk};
 use crate::cli::{Ctx, NoSigpipe};
+use crate::handler::engine::STOPPING;
 use crate::handler::protocol::{Response, decode, decode_fields, field};
+use crate::handler::server::STOP_WAIT;
 use crate::handler::{Client, pointer};
 use crate::ops::{Out, protocol_record, record_line};
 use crate::{Error, Warning};
@@ -111,7 +114,7 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
                 && response.status == 0
                 && !response.lines.is_empty() =>
         {
-            Some(deliver(ctx, &mut client, &response))
+            Some(deliver(ctx, &mut client, &info.pid, &response))
         }
         Ok(response) => Some(print(ctx, &response)),
         // A read applies nothing: the reason alone, not a write's "may or may not have been applied".
@@ -129,9 +132,18 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
 /// Print the row a `pop` or `popitem` took. The handler deleted it before answering (on the
 /// files the row is printed first): when it cannot be printed (a closed pipe, a full disk), it
 /// is put back with `setdefault`, which keeps a row written for its key since, and the command
-/// fails. When the handler does not put it back (it went away, is stopping, or failed), the
-/// `setdefault` is made on the files: a stopping handler has written its queue first.
-fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i32, Error> {
+/// fails. When the handler does not put it back because it went away or is stopping, the
+/// `setdefault` is made on the files once its pointer file no longer names it (`pid`), which it
+/// removes after it has written its queue: sooner, a write it acknowledged to another client
+/// could land after the put-back reads the files and be overwritten by it. A handler that
+/// answers otherwise than that it is stopping is still serving the store, and the files are left
+/// alone. Where the row cannot be put back, it is printed on standard error.
+fn deliver(
+    ctx: &mut Ctx,
+    client: &mut Client,
+    pid: &str,
+    response: &Response,
+) -> Result<i32, Error> {
     let printed = {
         let _sigpipe = NoSigpipe::new();
         let printed = print(ctx, response)
@@ -160,15 +172,33 @@ fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i3
         let _sigpipe = NoSigpipe::new();
         client.send(&line, None)
     };
+    if let Ok(r) = &put_back {
+        say(ctx, r);
+    }
     // The row its key now reads, as a response line; or why it could not be put back.
     let now: Result<Option<String>, String> = match put_back {
         Ok(r) if r.status == 0 => Ok(r.lines.first().cloned()),
         not_back => {
-            let why = match not_back {
-                Ok(r) => r.message,
-                Err(lost) => lost.to_string(),
+            // The handler is gone or stopping when its connection broke or it says so.
+            let (why, stopping) = match not_back {
+                Ok(r) => {
+                    let stopping = r.message == STOPPING;
+                    (r.message, stopping)
+                }
+                Err(lost) => (lost.to_string(), true),
             };
-            match write::put_back(ctx, &fields) {
+            let files = if !stopping {
+                Err("the handler is still serving the store, so the files were left alone".into())
+            } else if !pointer::wait_gone(&ctx.store, pid, Instant::now() + STOP_WAIT) {
+                // (a handler that died leaves its pointer file: it is waited for as `tsvz stop` does)
+                Err(format!(
+                    "the handler has not finished stopping within {} s, so the files were left alone",
+                    STOP_WAIT.as_secs()
+                ))
+            } else {
+                write::put_back(ctx, &fields).map_err(|e| format!("on the files: {e}"))
+            };
+            match files {
                 Ok(Some((key, cells))) => {
                     let mut now = String::new();
                     record_line(
@@ -184,7 +214,7 @@ fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i3
                 Ok(None) => Err(format!(
                     "{why}; on the files: could not read every part of the store"
                 )),
-                Err(files) => Err(format!("{why}; on the files: {files}")),
+                Err(files) => Err(format!("{why}; {files}")),
             }
         }
     };
@@ -203,13 +233,18 @@ fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i3
     Err(e)
 }
 
-/// Print a response as the operation prints on the files (§20.8.1).
-fn print(ctx: &mut Ctx, response: &Response) -> Result<i32, Error> {
+/// Say what the handler said while it answered (its warnings), unless `-q`.
+fn say(ctx: &Ctx, response: &Response) {
     if !ctx.args.quiet {
         for text in &response.diagnostics {
             diag!("tsvz: {text}");
         }
     }
+}
+
+/// Print a response as the operation prints on the files (§20.8.1).
+fn print(ctx: &mut Ctx, response: &Response) -> Result<i32, Error> {
+    say(ctx, response);
     match ctx.args.op.as_str() {
         "read" | "get" | "pop" | "popitem" | "setdefault" => {
             let mut out = Printer::rows(ctx);

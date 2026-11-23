@@ -24,6 +24,8 @@ use crate::{Error, Options, Scope, Store, WarnFn, Warning, escape, parts};
 
 /// The message of a read operation on a store that does not exist (§20.2.2).
 pub const NO_STORE: &str = "no such store";
+/// The message of a request that came once the engine was closed by a stop.
+pub const STOPPING: &str = "the handler is stopping";
 /// The message of a read that skipped a part or stopped at damaged data (§21.8.5).
 pub const INCOMPLETE: &str = "could not read every part of the store";
 
@@ -472,7 +474,7 @@ impl Engine {
         // Closed: the writer thread is on its way out and would not wait for a write made now
         // (a request still running when a stop cut its connection off).
         let result = if st.closed {
-            Err(Error::Refused("the handler is stopping".into()))
+            Err(Error::Refused(STOPPING.into()))
         } else {
             f(&mut st)
         };

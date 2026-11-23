@@ -153,6 +153,29 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
     trust(store, &path, fields, &meta)
 }
 
+/// Whether `store`'s pointer file still names the handler with process id `pid`. One that cannot
+/// be read or is not trusted says nothing of the handler, so it counts as still naming it.
+pub fn names_handler(store: &Path, pid: &str) -> bool {
+    match lookup(store) {
+        Ok(None) => false,
+        Ok(Some(now)) => now.pid == pid,
+        Err(_) => true,
+    }
+}
+
+/// Wait until the pointer file of `store` no longer names the handler with process id `pid`,
+/// which a handler removes once every write it acknowledged is written; false when `deadline`
+/// comes first.
+pub fn wait_gone(store: &Path, pid: &str, deadline: Instant) -> bool {
+    while names_handler(store, pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
 /// Whether the pointer file at `path`, read as `fields` with `meta` (its open file's), may be used
 /// (§21.2.4): its handler's [`Info`], Ok(None) when it names no handler, or why it is not trusted.
 fn trust(
@@ -724,6 +747,27 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         assert_eq!(trust(&s, &path_of(&s), fields, &meta), Ok(None));
+    }
+
+    #[test]
+    fn a_pointer_that_cannot_be_trusted_still_names_its_handler() {
+        // Only a pointer file that is gone, or names another process, says the handler stopped.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        plant(&s, &text("unix:/x/s", &hostname()), 0o644);
+        assert!(names_handler(&s, "1"));
+        assert!(!names_handler(&s, "2"));
+        plant(&s, &text("unix:/x/s", &hostname()), 0o620);
+        assert!(lookup(&s).is_err());
+        assert!(names_handler(&s, "1"), "a pointer not trusted is no sign");
+        let soon = Instant::now() + Duration::from_millis(120);
+        assert!(
+            !wait_gone(&s, "1", soon),
+            "it still names it at the deadline"
+        );
+        fs::remove_file(path_of(&s)).unwrap();
+        assert!(!names_handler(&s, "1"));
+        assert!(wait_gone(&s, "1", soon));
     }
 
     #[test]

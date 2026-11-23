@@ -644,37 +644,54 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
     assert_eq!(fs::read_to_string(&s).unwrap(), "k\tv\n", "not redone");
 }
 
-#[test]
-fn a_row_taken_and_not_printed_is_put_back_on_the_files_when_the_handler_has_hung_up() {
-    // `pop` took the row and cannot print it (a socket nobody reads), and the handler has hung up
-    // since, so the row cannot be put back through it: it is put back on the files, and the
-    // command exits 1, not ended by SIGPIPE. A stand-in handler deletes the row, then shuts its
-    // end for reading before it answers, so that the put-back through it fails whatever the
-    // timing.
+/// A stand-in handler for `pop s.tsvz a` in a store of `a` and `b`: it deletes the row `a` (its
+/// tombstone is appended to the part), answers with it, then runs `then` on the connection, the
+/// part and its pointer file, and gives back what that returns. The command's standard output is
+/// a socket nobody reads, so it cannot print the row.
+fn pop_a_from_a_stand_in<T: Send + 'static>(
+    dir: &Path,
+    s: &Path,
+    shut_before_answering: bool,
+    then: impl FnOnce(UnixStream, &Path, &Path) -> T + Send + 'static,
+) -> (Output, T) {
     use std::io::BufRead;
-    let dir = tempfile::tempdir().unwrap();
-    let s = store(dir.path(), "a\t1\nb\t2\n");
-    let listener = stand_in_handler(dir.path(), &s);
-    let part = s.clone();
+    let listener = stand_in_handler(dir, s);
+    let (part, at) = (s.to_path_buf(), pointer::path_of(s));
     let handler = std::thread::spawn(move || {
         let conn = accept_within_10s(&listener);
         let mut request = String::new();
         BufReader::new(&conn).read_line(&mut request).unwrap();
         let mut file = fs::OpenOptions::new().append(true).open(&part).unwrap();
         file.write_all(b"a\n").unwrap(); // the row's tombstone
-        conn.shutdown(std::net::Shutdown::Read).unwrap();
+        if shut_before_answering {
+            // so that the put-back through it fails whatever the timing
+            conn.shutdown(std::net::Shutdown::Read).unwrap();
+        }
         (&conn).write_all(b"a\t1\n#0\n").unwrap();
+        then(conn, &part, &at)
     });
     let out = unread_stdout(
         tsvz()
-            .current_dir(dir.path())
+            .current_dir(dir)
             .args(["pop", "s.tsvz", "a"])
             .stdin(Stdio::null())
             .stderr(Stdio::piped()),
     )
     .output()
     .unwrap();
-    handler.join().unwrap();
+    (out, handler.join().unwrap())
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_put_back_on_the_files_when_the_handler_has_hung_up() {
+    // `pop` took the row and cannot print it (a socket nobody reads), and the handler has hung up
+    // since, so the row cannot be put back through it: once the handler's pointer file is gone
+    // it is put back on the files, and the command exits 1, not ended by SIGPIPE.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let (out, ()) = pop_a_from_a_stand_in(dir.path(), &s, true, |_conn, _part, at| {
+        fs::remove_file(at).unwrap();
+    });
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("it was put back"),
@@ -687,6 +704,66 @@ fn a_row_taken_and_not_printed_is_put_back_on_the_files_when_the_handler_has_hun
         Some(vec!["1".to_string()])
     );
     assert!(left.get("b").is_some());
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_put_back_on_the_files_only_once_a_stopping_handler_is_gone() {
+    // A stopping handler answers the put-back that it is stopping, and goes on writing what it
+    // queued: a write it acknowledged to another client (here `a`, 9) lands while the pop's
+    // command waits. The put-back on the files comes after the handler's pointer file is
+    // removed, finds the newer row and keeps it; sooner, it would have read the files before
+    // that write and could write the older row over it.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let (out, untouched) = pop_a_from_a_stand_in(dir.path(), &s, false, |conn, part, at| {
+        use std::io::BufRead;
+        let mut request = String::new();
+        BufReader::new(&conn).read_line(&mut request).unwrap();
+        assert!(request.starts_with("setdefault\ta\t1"), "{request:?}");
+        let said = format!("#1\t{}\n", tsvz::handler::engine::STOPPING);
+        (&conn).write_all(said.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let untouched = fs::read_to_string(part).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(part).unwrap();
+        file.write_all(b"a\t9\n").unwrap();
+        fs::remove_file(at).unwrap();
+        untouched
+    });
+    assert_eq!(untouched, "a\t1\nb\t2\na\n", "the files were left alone");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("put back, its key reads a\t9"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\na\t9\n");
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_not_put_back_on_the_files_beside_a_handler_that_still_serves() {
+    // The handler answered the put-back with a failure that is not a stop: it serves the store
+    // still, so the files are left alone and the row is printed on standard error; the
+    // diagnostics it gave with the answer are said too.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let (out, ()) = pop_a_from_a_stand_in(dir.path(), &s, false, |conn, _part, _at| {
+        use std::io::BufRead;
+        let mut request = String::new();
+        BufReader::new(&conn).read_line(&mut request).unwrap();
+        (&conn)
+            .write_all(b"#!\twrites are failing (disk full)\n#1\tappend failed\n")
+            .unwrap();
+    });
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let said = text(&out.stderr);
+    assert!(said.contains("writes are failing (disk full)"), "{said}");
+    assert!(
+        said.contains("nor put back")
+            && said.contains("still serving the store")
+            && said.contains("a\t1"),
+        "{said}"
+    );
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\n");
 }
 
 #[test]
