@@ -269,7 +269,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A loose `delete` names a key with a newline or a delimiter at its end by the key without it
 - Kind: deferred
 - What the operator sees: `tsvz delete f.tsv $'a\n'` writes the tombstone for `a`, and deletes it, though `a` and
-  `a<LF>` are two keys (a key with a NUL at its start the same, as its NUL-less form). 0.2.0 does the same. The
+  `a<LF>` are two keys. 0.2.0 does the same. The
   same in `setdefault`: `setdefault f.tsv '#_defaults_# ' x y` (a blank at the key's end) passes its marker-key
   check, which looks at the key untrimmed, and writes a line that a reader takes for the defaults line and prints as
   a row, exit 0 (`setdefault f.tsv '#_defaults_#' x` is refused, exit 2; 0.2.0 wrote the same line but applied no

@@ -37,9 +37,9 @@ Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line
 (`_processLine`): keys and cells without the whitespace at their end and decoded (`<sep>`, `<LF>`),
 `#_defaults_#` lines that fill the empty cells after them, the last line read also without its
 newline, and no row for a missing key. Writes encode cells as TSVZ.py's do, and refuse what no reader
-would read back: a key that begins with `#` (a comment) or a NUL or is only whitespace, and a cell whose
-encoding holds the delimiter (`-d e`: `<sep>` has an `e`), a key alone too (a `delete` of such a key is no
-failure and writes nothing). An append to a compressed loose file whose text does
+would read back: a key, with a value or alone, that begins with `#` (a comment) or a NUL or is only
+whitespace, and a cell whose encoding holds the delimiter (`-d e`: `<sep>` has an `e`); a `delete` of such
+a key writes nothing and is no failure. An append to a compressed loose file whose text does
 not end with a newline joins that last line, as TSVZ.py's does (deferred to 0.2.2,
 [docs/limitations.md](docs/limitations.md)). A rewrite writes each
 line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
