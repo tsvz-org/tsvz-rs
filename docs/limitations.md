@@ -57,32 +57,34 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 build (the loose differential test); a deferral under the user's standing rule
   that deferrals are noted, not asked.
 
-### A handler on a cifs (SMB) mount is unreachable for the command line
+### A handler on a cifs (SMB) mount is unreachable for the command line, on older client kernels
 - Kind: deferred
-- What the operator sees: while `tsvz serve` runs on a store on a cifs mount, every other routed `tsvz` command on
-  that store (`read`, `get`, `has`, `len`, `keys`, `set`, `append`, `delete`, `clear`, `scrub`, `pop`, `popitem`,
-  `setdefault`) says `ignoring the pointer file: PATH: Permission denied (os error 13); using the files directly` and
-  works on the files, as `--x-direct` does. `verify` and `parts` never look for a handler and work on the files.
+- What the operator sees: on a cifs mount from a Linux client older than 7.0 (measured: 6.1 and RHEL 8's 4.18;
+  a 7.0 client is not affected, nor a share mounted with `nobrl`, whose locks then exclude only the processes of
+  one client), while `tsvz serve`
+  runs on a store there, every other routed `tsvz` command on that store (`read`, `get`, `has`, `len`, `keys`,
+  `set`, `append`, `delete`, `clear`, `scrub`, `pop`, `popitem`, `setdefault`) says `ignoring the pointer file:
+  PATH: Permission denied (os error 13); using the files directly` and works on the files, as `--x-direct` does.
   `tsvz stop` fails with the same `Permission denied`, so the handler is stopped by a signal (or by
-  `--x-idle-timeout`). A second `tsvz serve` is refused (`cannot take the pointer file: ... Permission denied`, or
-  `already served by pid ? on host ?`, by the error cifs gives for the conflicting lock, which was not measured).
-  `tsvz::handler::Client::connect` finds no handler either. A client given the socket's address itself still reaches
-  the handler. Measured on cifs: `get` beside an
-  idle handler; the other commands were run, as a user other than root, with the pointer file's mode set to 000, which
-  gives the same errno from `open`, so the message differs (`PATH is not a regular file (Permission denied (os
-  error 13))`).
-- Why: the handler holds its pointer file with `flock`, as TSVZ.py's does, and cifs turns that into a mandatory SMB
-  byte-range lock, so another process's read of the file fails with EACCES. Found by the 0.1.4 measurements on a
-  loopback SMB share (2026-11-17).
-- Revisit when: 0.2.1. The plan: first, check TSVZ.py 5.18 from its code (a first look: its handler takes the same
-  `flock`, and its lookup reads the file outside the `try` that catches only the open, so its command line may fail
-  there rather than use the files; not run); then confirm both tools on a real cifs mount (VM 901, a test of its
-  own); then fix it with TSVZ.py for both, such as by holding the lock where no reader of the pointer reads (another
-  file, or a byte range past its content). The test also reads in another process while the handler appends: the
-  append's whole-file lock (0.1.4 took the same) may be made mandatory on cifs too and deny that read with EACCES,
-  and then "works on the files" does not hold for a store being written.
-- Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
+  `--x-idle-timeout`). A second `tsvz serve` is refused with `cannot take the pointer file: ... Permission
+  denied`. TSVZ.py 5.18's command line fails every command there (`[Errno 13] Permission denied`, exit 1): its
+  lookup reads the pointer file outside the `try` that catches the open. On those clients a direct read of a store
+  that another process is appending to can fail too (`Permission denied`, the read incomplete), whichever tool
+  appends: both tools' append locks cover bytes a read reads.
+- Why: the handler holds its pointer file with `flock`, as TSVZ.py's does, and cifs on those kernels turns it into
+  a mandatory SMB byte-range lock over the file, so another process's read of it fails with EACCES; the append's
+  lock (whole-file on Linux in tsvz-rs, byte 1 in TSVZ.py, the layout of §18.6) is made mandatory the same way.
+  Measured on Samba 4.17 with 7.0, 6.1 and 4.18 clients (2026-11-23).
+- Revisit when: 0.2.2, together with TSVZ.py. The plan, measured on all three kernels: a handler holds a write
+  lock (an open file description lock) on one byte far past the pointer file's content (offset 2^62), where no
+  reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a second handler is
+  refused. Both tools must change together: on a local file system `flock` and such a lock do not exclude each
+  other, so a handler of one tool that took the new lock would not exclude a handler of the other that takes
+  `flock`. TSVZ.py's lookup must also catch an error of the read. The append lock's range is a spec matter (§18.6)
+  and goes to the TSVZ session; with a reachable handler the command line reads through its socket and never meets
+  it.
+- Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; a deferral under the
+  user's standing rule that deferrals are noted, not asked.
 
 ### A command that meets a handler just as it removes its pointer file can warn about a hard link
 - Kind: deferred

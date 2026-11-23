@@ -62,9 +62,10 @@ The handler and TSVZ.py's (`tsvz serve`, `TSVZClient`) speak the same protocol: 
 commands go through either tool's handler. It serves strict stores (`.tsvz .csvz .nsvz .psvz`).
 Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode M` sets the
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
-(SMB) mount the other commands cannot read the handler's pointer file: they warn `ignoring the
-pointer file` and work on the files, and `tsvz stop` fails: stop the handler with a signal or let
-`--x-idle-timeout` do it (deferred to 0.2.1, [docs/limitations.md](docs/limitations.md)).
+(SMB) mount from a Linux client older than 7.0, the other commands cannot read the handler's pointer
+file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
+handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.2,
+[docs/limitations.md](docs/limitations.md)).
 
 ## Library
 
