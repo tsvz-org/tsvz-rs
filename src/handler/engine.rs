@@ -1097,8 +1097,14 @@ mod tests {
         let held = crate::lock::lock(&file).unwrap();
         let marker = submit(&memory);
         assert!(marker.waited, "the store says disk");
-        while !lock(&e.batcher.queue).entries.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
+        // The writer waits for the lock on this part, which it has opened: the part can go.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while crate::lock::waiters_on(&p) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never waited for the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let row = submit(&data("b"));
         assert!(row.waited, "the marker is not written yet");
