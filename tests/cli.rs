@@ -793,10 +793,10 @@ fn a_loose_scrub_and_clear_read_no_row() {
     assert!(over.is_empty(), "{over:?}");
 }
 
-/// A delete of a compressed loose file of more than one column reads the whole file into memory as a
-/// `get` does, and decodes it as far as the end of the member that holds its first keyed line (docs/limitations.md): the
-/// damage of that member is found and said, once, with the file's name. A first member with no
-/// keyed line, or only a header, is no matter: the read goes on into the next.
+/// A delete of a compressed loose file of more than one column decodes it as far as the end of the
+/// member that holds its first keyed line: the damage of that member is found and said, once, with
+/// the file's name. A first member with no keyed line, or only a header, is no matter: the read
+/// goes on into the next.
 #[test]
 fn a_compressed_loose_delete_says_the_damage_of_the_member_with_its_first_key_once() {
     let d = tempfile::tempdir().unwrap();

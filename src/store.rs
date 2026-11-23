@@ -15,7 +15,10 @@ use crate::escape;
 use crate::frame::{Framer, Line};
 use crate::name::{self, Codec, Format};
 use crate::parts::{self, Stamp};
-use crate::replay::{Binding, Cells, Damage, EMPTY_CELLS, Markers, Mismatch, Policy, Replay, Sink};
+use crate::replay::{
+    Binding, Cells, DEFAULT_MEMBER_SIZE, Damage, EMPTY_CELLS, Markers, Mismatch, Policy, Replay,
+    Sink,
+};
 use crate::{Error, WarnFn, Warning};
 
 /// What a store keeps of each row.
@@ -48,7 +51,8 @@ pub struct Options {
     /// Keep a loose file's lines, for a rewrite that keeps them ([`crate::loose`]).
     pub(crate) lines: bool,
     /// Read a loose file only as far as its first keyed line, which sets its column count
-    /// ([`Store::one_column`]). A compressed part is read into memory whole first.
+    /// ([`Store::one_column`]). A compressed file's member is still decoded to its check before
+    /// its lines are used (§16.6), holding no more of it than a member of the default size.
     pub(crate) head: bool,
 }
 
@@ -707,11 +711,15 @@ impl Store {
         let mut framer = Framer::new();
         match part.codec {
             Some(codec) => {
-                let mut data = Vec::new();
-                reader
-                    .read_to_end(&mut data)
-                    .map_err(|e| Error::io(&part.path, e))?;
-                codec::for_each_item(codec, &data, &mut |item| match item {
+                // A read that stops at a file's first keyed line holds no more of a member than
+                // a member of the default size: a larger one is decoded again once it passed its
+                // check. A whole read holds each member's output once.
+                let keep = if replay.head {
+                    DEFAULT_MEMBER_SIZE as usize
+                } else {
+                    usize::MAX
+                };
+                codec::read_items(codec, &file, keep, &mut |item| match item {
                     Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
                     Item::CutShort { offset, out } => {
                         replay.cut_short(offset);
@@ -726,7 +734,8 @@ impl Store {
                         framer.brk();
                         true
                     }
-                });
+                })
+                .map_err(|e| Error::io(&part.path, e))?;
             }
             None => {
                 let mut buf = vec![0u8; 1 << 20];
