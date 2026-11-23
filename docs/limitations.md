@@ -159,23 +159,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### A scrub or clear can rewrite a part that was rotated away between its open and its lock
-- Kind: deferred
-- What the operator sees: when the part a `scrub` or `clear` has opened (a scrub's target, the last of the parts
-  before the active one, or the only part of a one-part store; `clear` rewrites the only part) is renamed away by
-  another scrub's rotation (to `.rotated`, which the part listing skips) in the moment between its opening by path
-  and taking its lock, the rewrite goes into the renamed file, and the command reports success while the store
-  still holds the rows it meant to change. A loose file is never rotated. From reading; the window was not
-  reproduced.
-- Why: `maint::rewrite` opens the part by path and locks it, and compares only the stamp of the file it opened with
-  the one its caller read; `Writer::append_at` also checks, after its lock, that the path still names the file it
-  holds. 0.1.4 is the same.
-- Revisit when: 0.2.1. The plan: check `names` after the lock in `rewrite` as `append_at` does, so the rewrite is
-  refused as a change by another writer and the scrub tries again; a test with a hook that renames the part between
-  the open and the lock.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A row queued behind a failing `#_write_ack_# memory` batch is acknowledged without a sync
 - Kind: deferred
 - What the operator sees: a client sends `#_write_ack_# memory` to a store whose file says `disk`, and its batch

@@ -230,8 +230,10 @@ fn stamp(path: &Path) -> Result<Stamp, Error> {
 }
 
 /// Replace a part's bytes in place, keeping the file (§18.7, §19.8), under the write lock and
-/// only while the part still has the stamp it had before it was read. Ok(None): another writer
-/// changed it; Ok(Some(false)): it already held these bytes.
+/// only while the part still has the stamp it had before it was read and its path still names
+/// it: another scrub's rotation may rename it away between its opening and the lock, as
+/// [`Writer::append_at`] checks too. Ok(None): another writer changed it or renamed it;
+/// Ok(Some(false)): it already held these bytes.
 pub(crate) fn rewrite(
     path: &Path,
     content: &[u8],
@@ -256,7 +258,7 @@ pub(crate) fn rewrite(
         .open(path)
         .map_err(io)?;
     let _guard = lock::lock(&file).map_err(io)?;
-    if Stamp::of(&file.metadata().map_err(io)?) != expect {
+    if Stamp::of(&file.metadata().map_err(io)?) != expect || !crate::write::names(path, &file) {
         return Ok(None);
     }
     let mut old = Vec::new();
@@ -1883,6 +1885,39 @@ mod tests {
             None
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\nb\t2\n");
+    }
+
+    #[test]
+    fn a_part_renamed_away_while_its_lock_is_waited_for_is_not_rewritten() {
+        // Another scrub's rotation renames the part (to `.rotated`) between the rewrite's open and
+        // its lock: written into, it would change nothing the store reads, and the scrub or clear
+        // would say it had.
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\na\t2\n").unwrap();
+        let before = Stamp::of(&fs::metadata(&p).unwrap());
+        let holder = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        let held = lock::lock(&holder).unwrap();
+        let rewriting = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                rewrite(&p, b"a\t2\n", before, None, DEFAULT_MEMBER_SIZE, None)
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock::waiters_on(&p) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the rewrite never waited for the lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let rotated = dir.path().join("s.tsvz.0.rotated");
+        fs::rename(&p, &rotated).unwrap();
+        drop(held);
+        assert_eq!(rewriting.join().unwrap().unwrap(), None);
+        assert_eq!(fs::read_to_string(&rotated).unwrap(), "a\t1\na\t2\n");
     }
 
     #[test]
