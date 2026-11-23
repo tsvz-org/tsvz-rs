@@ -1121,6 +1121,46 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_write_ack_disk_applies_at_once_and_a_memory_after_it_relaxes_nothing() {
+        // A client sets #_write_ack_# disk and goes on writing before the marker is written: its
+        // writes are made durable at once. A `memory` queued after it relaxes nothing either: the
+        // `disk` may be written and the `memory` fail.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, Instant::now(), records, false, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let data = [Record::Data {
+            key: "k".into(),
+            values: vec!["v".into()],
+        }];
+        let ack = |value: &str| {
+            [Record::Marker {
+                key: "#_write_ack_#".into(),
+                values: vec![value.into()],
+            }]
+        };
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
+        assert!(!submit(&ack("disk")).waited, "the store says memory");
+        while !lock(&e.batcher.queue).entries.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
+        }
+        assert!(submit(&data).waited, "#_write_ack_# disk, queued");
+        submit(&ack("memory"));
+        assert!(submit(&data).waited, "a disk, then a memory, both queued");
+        drop(held);
+        e.batcher.barrier();
+        assert!(!submit(&data).waited, "written and followed: memory");
+    }
+
+    #[test]
     fn a_batch_is_written_at_the_member_size_in_force_where_it_starts() {
         use crate::codec::{Item, encode_members, for_each_item};
         use crate::name::Codec;
