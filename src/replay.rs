@@ -950,6 +950,18 @@ mod tests {
         assert_eq!(table(&rows), vec![row("k", &["x<lt>", "y"])]);
     }
 
+    /// A loose header loses the NULs a reader drops: at its start, and at the end of an
+    /// unterminated line 1 (a torn write), not those of a terminated one.
+    #[test]
+    fn a_loose_header_loses_the_nuls_a_reader_drops() {
+        let loose = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        assert_eq!(run(loose, false, b"\0#h\0\0").0.header.as_deref(), Some("#h"));
+        assert_eq!(run(loose, false, b"\0#h\0\n").0.header.as_deref(), Some("#h\0"));
+    }
+
     #[test]
     fn a_loose_key_alone_is_a_row_in_a_one_column_file() {
         let loose = Format {
