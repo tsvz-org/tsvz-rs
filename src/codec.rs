@@ -504,9 +504,12 @@ enum Verdict {
 /// member to member, so a part costs its largest member's output, not the part. A member whose
 /// output passes `keep` bytes is judged without keeping it, and once it has passed its check it is
 /// decoded again and given a page at a time (several `Item::Data`): a read that stops early, at a
-/// part's first lines, then costs `keep`, whatever the member's size, and the time of decoding it
-/// to its check. Only a damaged member's bytes, which run to the next member start (rule 2), are
-/// held whole.
+/// part's first lines, then costs the time of decoding the member to its check and holds about
+/// `keep` whatever the member's size, plus what one input page decodes to before the next check
+/// (a decoder takes the whole page): by the formats' best ratios up to 64 MiB for deflate (1032 to
+/// one) and 2 GiB for zstd (a 128 KiB run-length block in 4 bytes), which only crafted input
+/// reaches (docs/limitations.md). Only a damaged member's bytes, which run to the next member
+/// start (rule 2), are held whole.
 pub(crate) fn read_items<S: Source + ?Sized>(
     codec: Codec,
     src: &S,

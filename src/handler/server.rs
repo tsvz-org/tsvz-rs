@@ -42,8 +42,9 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
 }
 
 /// An open connection: a handle on it, to end it when the handler stops, and whether a `pop` or
-/// `popitem` is in it, whose row is deleted once its answer is made: a stop never cuts it off
-/// before that answer is written.
+/// `popitem` is in it, whose row is deleted once its answer is made: a stop does not cut it off
+/// before that answer is written, until [`FINISH`] has passed after the queue was written (a
+/// client that still reads nothing then is cut off, as it is at the first window).
 struct Conn {
     stream: UnixStream,
     owes: bool,

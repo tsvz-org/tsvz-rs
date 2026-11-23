@@ -38,7 +38,9 @@ Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line
 `#_defaults_#` lines that fill the empty cells after them, the last line read also without its
 newline, and no row for a missing key. Writes encode cells as TSVZ.py's do, and refuse what no reader
 would read back: a key that begins with `#` (a comment) or a NUL or is only whitespace, and a cell whose
-encoding holds the delimiter (`-d e`: `<sep>` has an `e`). A rewrite writes each
+encoding holds the delimiter (`-d e`: `<sep>` has an `e`). An append to a compressed loose file whose text does
+not end with a newline joins that last line, as TSVZ.py's does (deferred to 0.2.2,
+[docs/limitations.md](docs/limitations.md)). A rewrite writes each
 line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
 line that set the column count went, and the blank `#_defaults_#` line a `clear` may write before
 the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
@@ -64,7 +66,7 @@ The handler and TSVZ.py's (`tsvz serve`, `TSVZClient`) speak the same protocol: 
 commands go through either tool's handler. It serves strict stores (`.tsvz .csvz .nsvz .psvz`).
 Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode M` sets the
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
-(SMB) mount from a Linux client older than 7.0, the other commands cannot read the handler's pointer
+(SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
 file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
 handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.2,
 [docs/limitations.md](docs/limitations.md)).

@@ -792,9 +792,9 @@ impl Store {
         if part.codec.is_some_and(|c| !c.supported()) {
             return Err(unsupported(part));
         }
-        // A read that stops at a file's first keyed line holds no more of a compressed member
-        // than a member of the default size: a larger one is decoded again once it passed its
-        // check. A whole read holds each member's output once.
+        // A read that stops at a file's first keyed line holds about as much of a compressed member
+        // as a member of the default size ([`codec::read_items`] says what more): a larger one is
+        // decoded again once it passed its check. A whole read holds each member's output once.
         let keep = if self.replay.head {
             DEFAULT_MEMBER_SIZE as usize
         } else {
