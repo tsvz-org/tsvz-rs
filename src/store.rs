@@ -1816,6 +1816,22 @@ mod tests {
     }
 
     #[test]
+    fn a_loose_files_last_member_cut_short_leaves_its_unfinished_line_unread() {
+        // A line a cut member ends in is no line (TSVZ.py reads the whole lines of such a member):
+        // the unterminated last line of a plain loose file is read, this one is not.
+        let dir = tempfile::tempdir().unwrap();
+        let gz = |data: &[u8]| crate::codec::encode_member(crate::name::Codec::Gzip, data).unwrap();
+        let mut part = gz(b"a\t1\n");
+        let mut cut = gz(b"b\t2\ncc\t3");
+        cut.truncate(cut.len() - 8); // the check bytes
+        part.extend(&cut);
+        let p = write(dir.path(), "s.tsv.gz", &part);
+        let s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(keys(&s), ["a", "b"]);
+        assert!(s.damaged());
+    }
+
+    #[test]
     fn compressed_parts_and_the_corruption_policy() {
         let dir = tempfile::tempdir().unwrap();
         let mut bad =

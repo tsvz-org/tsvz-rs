@@ -25,7 +25,8 @@ pub enum Item<'a> {
     CutShort { offset: usize, out: Cow<'a, [u8]> },
     /// A corrupt member: the policy in force decides what happens to `out` (§4.10).
     Corrupt { offset: usize, out: Cow<'a, [u8]> },
-    /// A damaged member ended here: the unfinished line before this point is dropped.
+    /// A damaged member ended here, with another member after it or at the part's end: the
+    /// unfinished line before this point is dropped.
     Break,
 }
 
@@ -528,8 +529,23 @@ pub(crate) fn read_items<S: Source + ?Sized>(
                 if !each(Item::Data(Cow::Borrowed(&buf))) {
                     return Ok(());
                 }
-            } else if !redecode(codec, src, pos, len, &mut page, &mut buf, each)? {
-                return Ok(());
+            } else {
+                match redecode(codec, src, pos, len, &mut page, &mut buf, each)? {
+                    Redone::Whole => {}
+                    Redone::Stopped => return Ok(()),
+                    // The bytes ended sooner than they did a moment ago (a failed batch cut back
+                    // from the active part, which a reader holds no lock against): what was given
+                    // is what is left of the member, and its unfinished line goes.
+                    Redone::Cut => {
+                        let cut = Item::CutShort {
+                            offset: pos as usize,
+                            out: Cow::Borrowed(&[]),
+                        };
+                        if !each(cut) || !each(Item::Break) {
+                            return Ok(());
+                        }
+                    }
+                }
             }
             pos += len.max(1);
             continue;
@@ -565,13 +581,13 @@ pub(crate) fn read_items<S: Source + ?Sized>(
         if !each(item) {
             return Ok(());
         }
+        // The member's unfinished last line goes with it (a break after it, where another member
+        // follows or not).
+        if !each(Item::Break) {
+            return Ok(());
+        }
         match following {
-            Some(next) => {
-                if !each(Item::Break) {
-                    return Ok(());
-                }
-                pos = next;
-            }
+            Some(next) => pos = next,
             None => return Ok(()),
         }
     }
@@ -622,9 +638,18 @@ fn judge<S: Source + ?Sized>(
     }
 }
 
+/// How [`redecode`] ended.
+enum Redone {
+    /// The member decoded to its end again.
+    Whole,
+    /// `each` stopped.
+    Stopped,
+    /// The bytes no longer decode as they did: the part was rewritten meanwhile.
+    Cut,
+}
+
 /// Decode again the member at `pos`, `len` bytes that passed their check, giving its output to
-/// `each` a page at a time; false when `each` stopped. Should the bytes no longer decode so (the
-/// part was rewritten meanwhile), the member's output ends where they stop.
+/// `each` a page at a time.
 fn redecode<S: Source + ?Sized>(
     codec: Codec,
     src: &S,
@@ -633,23 +658,24 @@ fn redecode<S: Source + ?Sized>(
     page: &mut [u8],
     out: &mut Vec<u8>,
     each: &mut dyn FnMut(Item<'_>) -> bool,
-) -> io::Result<bool> {
+) -> io::Result<Redone> {
     let mut decoder = Decoder::new(codec);
     let mut at = pos;
     while at < pos + len {
-        let want = page.len().min((pos + len - at) as usize);
+        let want = (pos + len - at).min(page.len() as u64) as usize;
         let n = src.read_at(&mut page[..want], at)?;
         out.clear();
         let fed = decoder.feed(&page[..n], out);
         if !out.is_empty() && !each(Item::Data(Cow::Borrowed(out))) {
-            return Ok(false);
+            return Ok(Redone::Stopped);
         }
         match fed {
             Ok((used, false)) if n > 0 && used == n => at += n as u64,
-            _ => break,
+            Ok((_, true)) => return Ok(Redone::Whole),
+            _ => return Ok(Redone::Cut),
         }
     }
-    Ok(true)
+    Ok(if len == 0 { Redone::Whole } else { Redone::Cut })
 }
 
 /// Where `magic` next begins at or after `from`, read a page at a time.
@@ -953,6 +979,90 @@ mod tests {
             let n = self.data.read_at(buf, offset)?;
             self.reached.set(self.reached.get().max(offset + n as u64));
             Ok(n)
+        }
+    }
+
+    /// A part that shrinks once its first member has passed its check: from the `shrink_at`th read
+    /// from its start on, that member has only its first `cut` bytes (a failed batch cut back from
+    /// the active part while a reader holds no lock).
+    struct Shrinking<'a> {
+        data: &'a [u8],
+        first: usize,
+        cut: usize,
+        shrink_at: usize,
+        starts: std::cell::Cell<usize>,
+    }
+
+    impl Source for Shrinking<'_> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            if offset == 0 {
+                self.starts.set(self.starts.get() + 1);
+            }
+            let shrunk = self.starts.get() >= self.shrink_at && (offset as usize) < self.first;
+            self.data[..if shrunk { self.cut } else { self.data.len() }].read_at(buf, offset)
+        }
+    }
+
+    #[test]
+    fn a_damaged_member_ends_with_a_break_also_when_it_is_the_last() {
+        // Its unfinished last line goes: nothing follows to join it to, and a reader must not
+        // take it for a line of its own.
+        for codec in codecs() {
+            let whole = fixture(codec, &b"k\tvalue\n".repeat(200));
+            let got = items(codec, &whole[..whole.len() / 2]);
+            assert_eq!(got.len(), 2, "{codec:?}: {got:?}");
+            assert!(
+                matches!(&got[0], Item::CutShort { offset: 0, .. }),
+                "{codec:?}"
+            );
+            assert_eq!(got[1], Item::Break, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn a_member_that_shrinks_between_its_two_passes_is_cut_short_and_ends_with_a_break() {
+        // Judged complete, then given again a page at a time: bytes that end sooner are reported,
+        // and the member's unfinished line goes, as for any damaged member; the next member is
+        // read as it was.
+        for codec in codecs() {
+            // longer than a page of compressed bytes and than a bzip2 block, so that it is judged as it is read
+            let first = fixture(codec, &noise(50_000));
+            assert!(first.len() > PAGE, "{codec:?}");
+            let part = [first.clone(), fixture(codec, b"z\t1\n")].concat();
+            let src = Shrinking {
+                data: &part,
+                first: first.len(),
+                cut: first.len() / 2,
+                // the reads from the start: gzip looks for padding, the judging, the second pass
+                shrink_at: if codec == Codec::Gzip { 3 } else { 2 },
+                starts: 0.into(),
+            };
+            let mut got = Vec::new();
+            read_items(codec, &src, 100, &mut |item| {
+                got.push(item.into_owned());
+                true
+            })
+            .unwrap();
+            let kinds: Vec<String> = got
+                .iter()
+                .map(|i| match i {
+                    Item::Data(d) => format!("Data({})", d.len()),
+                    Item::CutShort { offset, out } => format!("CutShort({offset}, {})", out.len()),
+                    Item::Corrupt { offset, out } => format!("Corrupt({offset}, {})", out.len()),
+                    Item::Break => "Break".into(),
+                })
+                .collect();
+            assert!(got.len() >= 3, "{codec:?}: {kinds:?}");
+            let n = got.len();
+            let cut = Item::CutShort {
+                offset: 0,
+                out: Vec::new().into(),
+            };
+            assert_eq!(
+                got[n - 3..],
+                [cut, Item::Break, Item::Data(b"z\t1\n".to_vec().into())],
+                "{codec:?}: {kinds:?}"
+            );
         }
     }
 
