@@ -159,22 +159,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### A row queued behind a failing `#_write_ack_# memory` batch is acknowledged without a sync
-- Kind: deferred
-- What the operator sees: a client sends `#_write_ack_# memory` to a store whose file says `disk`, and its batch
-  fails to write (a full disk or an I/O error; also a file size limit, when the handler ignores SIGXFSZ, whose
-  default action ends the process). A plain write another client sent before that failure was seen is acknowledged
-  before it is written, and written without a sync, while the file still says `disk` (§21.9): a crash before the
-  system writes it back loses a row the handler promised to sync. Rows sent after the failure was seen are synced
-  again. Checked by running (a file size limit, with SIGXFSZ ignored, makes the marker's batch fail); 0.1.4 does the
-  same.
-- Why: `Engine::submit` takes the acknowledgement mode and the member size from the markers still queued, which the
-  failed batch never clears; the engine drops them only when it next follows the files.
-- Revisit when: 0.2.1. The plan: a queued `memory` does not relax a `disk` the store has already written, until the
-  store has followed the file; the cost is latency for rows sent in that window.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A pop that is still waiting when a stop's five seconds end loses its row
 - Kind: deferred
 - What the operator sees: a stop by a signal (SIGINT, SIGTERM or SIGHUP), or a pop that arrives after a `tsvz stop`
