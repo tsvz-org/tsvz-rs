@@ -159,37 +159,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### A pop that is still waiting when a stop's five seconds end loses its row
-- Kind: deferred
-- What the operator sees: a stop by a signal (SIGINT, SIGTERM or SIGHUP), or a pop that arrives after a `tsvz stop`
-  request's flush, while a `pop` or `popitem`'s batch is still being written when the five seconds the stop allows
-  end (a slow disk, a flood of other writes): the pop has queued its tombstone, which the stop writes before it
-  ends, but its connection is cut before the row reaches the client. The row is gone from the store, the command
-  exits 1 with `may or may not have been applied`, and nobody has the row. A `tsvz stop` request flushes the queued
-  batches, with no limit, before it ends the accept loop, so a pop it had queued is answered. From reading; to be
-  reproduced first. 0.1.4 drains the same way.
-- Why: `finish_connections` gives requests already read `FINISH` (5 s) and then ends every connection still open;
-  `pop` and `popitem` delete the row, so their answer is the only copy of it.
-- Revisit when: 0.2.1. The plan: reproduce with a stalled write; then wait for a request whose batch is being
-  written with a bound of its own, whose reason is written next to it (a stalled disk must not hold a stop forever),
-  keeping the five seconds for a client that does not read its answer.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A pop on the files while a stopping handler has one in flight can take the same row
-- Kind: deferred
-- What the operator sees: once a stopping handler has closed its listener, a command that connects is refused and
-  works on the files. A `pop` there can read a row as live that a `pop` already in flight in the handler took, whose
-  tombstone the handler has not yet written, and take it too: two clients get the same row. The window lasts until
-  that batch is written, longer under a slow sync. From reading; to be reproduced first. 0.1.4 closes its listener
-  at the same point.
-- Why: the listener goes first and the pointer file stays until the queue is written, so a command in the window
-  finds a pointer file with nothing behind it and does what it does when a handler is gone.
-- Revisit when: 0.2.1. The plan: reproduce with a stalled batch; then hold the listener open until the queued
-  tombstones are written, so that a command in the window is closed (a write exits 1) and does not run on the files.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A routed pop whose row cannot be printed, with the handler gone, loses the row
 - Kind: deferred
 - What the operator sees: a `pop` or `popitem` through a handler whose standard output cannot be written (a closed

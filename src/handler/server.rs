@@ -41,9 +41,20 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
     move |e| Error::io(path, e)
 }
 
+/// An open connection: a handle on it, to end it when the handler stops, and whether a `pop` or
+/// `popitem` is in it, whose row is deleted once its answer is made: a stop never cuts it off
+/// before that answer is written.
+struct Conn {
+    stream: UnixStream,
+    owes: bool,
+}
+
 /// What the connections and the stoppers share.
 struct Shared {
     stopping: AtomicBool,
+    /// Set once the stop has ended the connections and written every queued write: the accept
+    /// loop, which closes every connection it accepts meanwhile, then ends.
+    finished: AtomicBool,
     /// Why the handler stops, said by serve once its accept loop ends: set by the one that
     /// claimed the stop (the idle timeout, a signal), under this mutex.
     why: Mutex<Option<String>>,
@@ -51,8 +62,8 @@ struct Shared {
     wake: UnixStream,
     /// Open connections (for the idle timeout) and when the last one closed.
     activity: Mutex<(usize, Instant)>,
-    /// A handle on each open connection, to end it when the handler stops.
-    open: Mutex<HashMap<u64, UnixStream>>,
+    /// Each open connection that a stop has not cut off.
+    open: Mutex<HashMap<u64, Conn>>,
     next: AtomicU64,
 }
 
@@ -243,6 +254,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     }
     let shared = Arc::new(Shared {
         stopping: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
         why: Mutex::new(None),
         wake,
         activity: Mutex::new((0, Instant::now())),
@@ -282,13 +294,33 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         store.display(),
         std::process::id()
     ));
+    // Once stopping, the loop goes on accepting, and closes each connection unread (as a client
+    // finds a handler gone: a write exits 1, a read uses the files), until the stop has written
+    // every queued write: a command that found the listener closed would work on the files, where
+    // a `pop` could take a row whose tombstone is still queued here.
+    let mut finishing = false;
     loop {
         let ready = wait_for(&listener, &wakened);
-        if shared.stopping.load(Ordering::SeqCst) {
+        drain(&wakened);
+        if shared.stopping.load(Ordering::SeqCst) && !finishing {
+            finishing = true;
             let why = lock(&shared.why).take();
             if let Some(why) = why {
                 (config.info)(&why);
             }
+            let finisher = {
+                let (shared, engine) = (shared.clone(), engine.clone());
+                std::thread::Builder::new()
+                    .name("tsvz-stop".into())
+                    .spawn(move || finish(&shared, &engine))
+            };
+            if finisher.is_err() {
+                // No thread to spare: finished here, with the connections that come meanwhile
+                // left in the listener's queue.
+                finish(&shared, &engine);
+            }
+        }
+        if shared.finished.load(Ordering::SeqCst) {
             break;
         }
         if !ready {
@@ -315,34 +347,77 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
             config.verbose,
         );
     }
-    drop(listener); // the clients still in its queue find their connection closed
-    finish_connections(&shared);
-    engine.close();
-    let _ = std::fs::remove_dir_all(&dir);
+    // Every queued write is written: the pointer file goes first, so that a command that finds the
+    // listener closed finds no handler (`tsvz stop` waits for this).
     held.release();
+    drop(listener); // the clients still in its queue find their connection closed
+    let _ = std::fs::remove_dir_all(&dir);
     (config.info)(&format!("stopped serving {}", store.display()));
     Ok(())
 }
 
-/// How long a stop waits for the requests already read to be answered.
-const FINISH: Duration = Duration::from_secs(5);
+/// Empty the stop pair `wakened` (non-blocking), so that the next wait waits.
+fn drain(wakened: &UnixStream) {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    while matches!((&*wakened).read(&mut buf), Ok(n) if n > 0) {}
+}
 
-/// End the open connections as a stop does: no request sent from now on is read; the ones
-/// already read finish and are answered (a pop in flight has written its tombstone: its row
-/// must reach its client), and on Linux so do those already queued on the connection, which
-/// the shutdown leaves readable (macOS drops them); then each connection ends when it reads
-/// its next line. A connection still open after [`FINISH`] (a client not reading its answer)
-/// is cut off.
-fn finish_connections(shared: &Shared) {
+/// How long a stop waits for the requests already read to be answered, and then for the answers
+/// of the pops it waited for: a client that does not read its answer is cut off after this.
+pub const FINISH: Duration = Duration::from_secs(5);
+
+/// Stop as §21.13 says, then set `finished` and wake the accept loop. No request sent from now on
+/// is read; the ones already read finish and are answered, and on Linux so do those already
+/// queued on a connection, which the shutdown leaves readable (macOS drops them). After
+/// [`FINISH`], every connection is cut off but those a `pop` or `popitem` is in: its row is
+/// deleted once its answer is made, so the answer is its only copy. Then the engine closes:
+/// requests not yet begun are refused, and every queued write is written and synced (§21.9.3), as
+/// long as that takes: the stop waited for it before as well. The pops' answers are given
+/// [`FINISH`] more to be written, then the rest is cut off.
+fn finish(shared: &Shared, engine: &Engine) {
     for conn in lock(&shared.open).values() {
-        let _ = conn.shutdown(std::net::Shutdown::Read);
+        let _ = conn.stream.shutdown(std::net::Shutdown::Read);
     }
+    settle(shared, |open| open.values().all(|c| c.owes));
+    cut(shared, true);
+    engine.close();
+    settle(shared, HashMap::is_empty);
+    cut(shared, false);
+    shared.finished.store(true, Ordering::SeqCst);
+    shared.wake();
+}
+
+/// Wait until `done` holds for the open connections, or [`FINISH`] has passed.
+fn settle(shared: &Shared, done: impl Fn(&HashMap<u64, Conn>) -> bool) {
     let deadline = Instant::now() + FINISH;
-    while lock(&shared.activity).0 > 0 && Instant::now() < deadline {
+    while !done(&lock(&shared.open)) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    for (_, conn) in lock(&shared.open).drain() {
-        let _ = conn.shutdown(std::net::Shutdown::Both);
+}
+
+/// Cut off every open connection, but with `spare_owing` those a pop is in. A connection cut off
+/// begins no other request ([`begin`]).
+fn cut(shared: &Shared, spare_owing: bool) {
+    lock(&shared.open).retain(|_, conn| {
+        if spare_owing && conn.owes {
+            return true;
+        }
+        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+        false
+    });
+}
+
+/// Begin a request on connection `id`: false once a stop has cut it off (a request begun then
+/// could take a row it has no way to answer). `owes` marks a `pop` or `popitem` until the next
+/// request begins, under the lock the cut takes.
+fn begin(shared: &Shared, id: u64, owes: bool) -> bool {
+    match lock(&shared.open).get_mut(&id) {
+        Some(conn) => {
+            conn.owes = owes;
+            true
+        }
+        None => false,
     }
 }
 
@@ -381,10 +456,11 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>) {
 
 /// Serve `stream` on a thread of its own, made by `builder`. The connection is counted and
 /// registered here, as it is accepted: the idle timeout never sees an accepted connection as
-/// none, and a stop always ends it; one accepted once the handler is stopping is closed unread,
-/// as a client finds a handler gone. When no thread can be made (a task limit, no memory), the
-/// connection is closed, the fact is reported, and the handler keeps serving:
-/// `std::thread::spawn` would panic, and the release build aborts on panic.
+/// none, and a stop always ends it; one accepted once the handler is stopping, or that cannot be
+/// registered (no descriptor for its handle), is closed unread, as a client finds a handler
+/// gone. When no thread can be made (a task limit, no memory), the connection is closed, the
+/// fact is reported, and the handler keeps serving: `std::thread::spawn` would panic, and the
+/// release build aborts on panic.
 fn start_connection(
     builder: std::thread::Builder,
     stream: UnixStream,
@@ -401,8 +477,18 @@ fn start_connection(
         activity.0 += 1;
     }
     let id = shared.next.fetch_add(1, Ordering::SeqCst);
-    if let Ok(handle) = stream.try_clone() {
-        lock(&shared.open).insert(id, handle);
+    match stream.try_clone() {
+        Ok(handle) => {
+            let conn = Conn {
+                stream: handle,
+                owes: false,
+            };
+            lock(&shared.open).insert(id, conn);
+        }
+        Err(_) => {
+            end_connection(&shared, id);
+            return false;
+        }
     }
     let report = info.clone();
     let mine = shared.clone();
@@ -436,6 +522,7 @@ fn serve_connection(
 ) {
     if let Ok(reader) = stream.try_clone() {
         answer(
+            id,
             BufReader::new(reader),
             stream,
             engine,
@@ -448,6 +535,7 @@ fn serve_connection(
 }
 
 fn answer(
+    id: u64,
     mut reader: BufReader<UnixStream>,
     mut writer: UnixStream,
     engine: &Engine,
@@ -469,6 +557,12 @@ fn answer(
                 }
             }
             bulk = Some(records);
+        }
+        let owes = request
+            .as_ref()
+            .is_ok_and(|r| matches!(r.op.as_str(), "pop" | "popitem"));
+        if !begin(shared, id, owes) {
+            return; // cut off by a stop
         }
         let response = match &request {
             Ok(r) if r.op == "stop" => {
@@ -551,6 +645,7 @@ mod tests {
         let (wake, _) = UnixStream::pair().unwrap();
         Arc::new(Shared {
             stopping: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             why: Mutex::new(None),
             wake,
             activity: Mutex::new((0, Instant::now())),
@@ -635,6 +730,7 @@ mod tests {
         let (wake, _wakened) = UnixStream::pair().unwrap();
         let shared = Arc::new(Shared {
             stopping: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             why: Mutex::new(None),
             wake,
             activity: Mutex::new((0, Instant::now())),

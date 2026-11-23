@@ -479,6 +479,95 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     assert!(lost.is_empty(), "deleted and never answered: {lost:?}");
 }
 
+/// Wait until the handler has begun to stop (it says why on its standard error).
+fn wait_until_stopping(served: &Served) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !served.stderr().contains("; stopping") {
+        assert!(
+            Instant::now() < deadline,
+            "not stopping: {}",
+            served.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
+    // A signal stops the handler while a pop's tombstone waits to be written (here for the part's
+    // lock, held past the stop's window): the stop writes the tombstone, so the pop's answer is
+    // the row's only copy, and it must reach its client.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let mut served = Served::start(&s, &[]);
+    let mut client = tsvz::handler::Client::connect(&s).unwrap();
+    // The part's write lock, held here, stalls the handler's writes as a slow disk would.
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let popper = std::thread::spawn(move || client.pop("a"));
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    served.signal(libc::SIGTERM);
+    std::thread::sleep(tsvz::handler::server::FINISH + Duration::from_secs(1));
+    drop(held);
+    let popped = popper.join().unwrap();
+    assert_eq!(served.wait(), 0, "{}", served.stderr());
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    match popped {
+        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
+        // Not read before the stop (macOS drops a request queued on the connection): not taken.
+        other => assert!(
+            left.get("a").is_some(),
+            "deleted and never answered: {other:?}"
+        ),
+    }
+    assert!(left.get("b").is_some());
+}
+
+#[test]
+fn a_pop_that_finds_a_handler_stopping_never_takes_the_row_its_pop_took() {
+    // While a stopping handler has a pop's tombstone still to write, a pop on the files would
+    // read that row as live and take it too: a command in that window finds the handler gone
+    // (a write exits 1) instead of finding its listener closed and using the files.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let mut served = Served::start(&s, &[]);
+    let mut client = tsvz::handler::Client::connect(&s).unwrap();
+    // The part's write lock, held here, stalls the handler's writes as a slow disk would.
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let popper = std::thread::spawn(move || client.popitem(false));
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    served.signal(libc::SIGTERM);
+    wait_until_stopping(&served);
+    let mut other = tsvz()
+        .current_dir(dir.path())
+        .args(["--format", "records", "popitem", "s.tsvz"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // On the files it would print the row, then wait for the lock to write its tombstone.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while other.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(held);
+    let other = other.wait_with_output().unwrap();
+    let popped = popper.join().unwrap();
+    assert_eq!(served.wait(), 0, "{}", served.stderr());
+    assert_eq!(text(&other.stdout), "", "{}", text(&other.stderr));
+    assert_ne!(other.status.code(), Some(0), "{}", text(&other.stderr));
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    match popped {
+        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
+        other => assert!(
+            left.get("a").is_some(),
+            "deleted and never answered: {other:?}"
+        ),
+    }
+}
+
 #[test]
 fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
     // A handler that stops closes the connections it will not serve, as TSVZ.py's does: a routed

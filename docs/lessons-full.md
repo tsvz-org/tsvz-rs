@@ -106,3 +106,22 @@ entries go last, in the same commit as the change:
   so it had to answer for every store a caller might pass, not only the ones `scrub` passes.
 - Lesson: make a function public only when a caller outside needs it; a public helper must answer for
   inputs its own callers never give it, and that answer is code and a promise to keep.
+
+## 2026-11-23 A stopping handler keeps its listener until its queue is written
+- Changed: a handler that stops goes on accepting connections, and closes each unread, until every
+  queued write is written; it then removes its pointer file, and only then closes its listener. A
+  `pop` or `popitem` still in flight when the stop's 5 s end is no longer cut off: the stop writes
+  its tombstone, as before, and its answer is given 5 s more to be written; the other connections
+  are cut off then, and a connection cut off begins no other request. Before, the listener closed
+  first and every connection was cut off at 5 s.
+- Why we had to change: a command that found the listener closed ran on the files, where a `pop` read
+  a row as live that a `pop` in the handler had taken and whose tombstone was still queued, so two
+  clients got one row; and a pop cut off at 5 s lost its row, whose tombstone the stop went on to
+  write (deferrals of the 0.2.0 final review, built in 0.2.1).
+- Original design was wrong because: it closed the handler's front door before the work it still
+  held was written, so the clients' fallback ran against files that did not yet show that work; and
+  it cut connections off by time alone, though the stop makes their requests' writes anyway, so for
+  a pop the cut lost the only copy of the row.
+- Lesson: a server that stops keeps telling new clients it is gone (closing them unread) until the
+  work they could race with is written, and announces it is gone only then; it never cuts off an
+  answer that is the only copy of what its own write removed, since the stop makes that write anyway.
