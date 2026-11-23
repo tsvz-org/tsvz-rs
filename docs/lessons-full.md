@@ -197,6 +197,25 @@ entries go last, in the same commit as the change:
 - Lesson: when a port replaces a refusal with an encoding, run the reader's own rule over the output for every input the
   refusal covered; an encoding is a promise only as wide as the cases it was tried on.
 
+## 2026-11-23 One rule names a loose key: the reader's
+- Changed: every key a loose command names (`get`, `has`, `pop`, `setdefault`, `delete`, bulk input, a keyed
+  read) is named by `loose::name`: the cell the reader reads from the key as it is written (encoded, trimmed of the
+  whitespace at its end, decoded). `$'a\n'` names the line `a<LF>`, a blank at a key's end still goes, and a key no
+  row can have (`#x`, `</sep/>`, `-d e` and `hello`) names none. A loose write reads its own line back with
+  `loose::parse` and refuses it when the cells are not the record less that trim; that replaced three hand-written
+  lists (`unwritable`, `delimiter_in_encoding`, `unreadable_key`). Bulk input of a loose format is read with
+  `loose::parse`, setdefault's marker check names its key first, and the header drops the NULs a reader drops.
+- Why we had to change: 0.2.1's fix rounds named a key by trimming its decoded form, where the reader trims the
+  encoded cell before decoding. On a file holding rows `a` and `a<LF>`, `delete $'a\n'` deleted `a`, and `get`,
+  `has` and `pop` acted on `a` (0.2.0 refused or exited 3); `popitem` took the same row forever. The step back of
+  the second fix round's re-review found every finding of all rounds (R07a-1, R16-1, R08-1 to 3, A, B, R07a-3,
+  R10-3, F4, F5) in a copy of the reader's line rule outside the reader.
+- Original design was wrong because: each command that named a key wrote its own short form of the reader's rule
+  (a trim, a list of refusals, a comment test), each right on the cases it was tried on, and each drifted from the
+  reader on the ones it was not: a line break is whitespace once decoded but not as written.
+- Lesson: when several places must agree with a reader about what a name or a line means, give them the reader's
+  own function (encode, read back, compare) instead of a description of it; a copy of a rule is a second rule.
+
 ## 2026-11-23 An optimistic check guards the property, not the stamp
 - Changed: a loose `delete` at more than one column appends its key alone to the file it read, or to that file with
   more appended since by another writer: the writer checks the file's inode, that it is no shorter, and its last

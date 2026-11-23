@@ -232,17 +232,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### Bulk input to a loose file is read by its own rule, not the loose line rule
-- Kind: deferred
-- What the operator sees: `tsvz set f.tsv -` (and `append`, `delete -`) with a loose-format payload drops a
-  `#_defaults_#` line as a comment instead of writing it, where a reader reads it as the defaults. 0.2.0 does the
-  same. (0.2.1 drops the NULs at a line's start, as a reader does.)
-- Why: `ops::parse_records` tests the raw first field for a comment, and a `#_defaults_#` line is one.
-- Revisit when: 0.2.2. The plan: give bulk input of a loose format to `loose::parse`, the one rule a reader uses (a
-  `#_defaults_#` line is a record, a comment is skipped).
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A loose `clear` writes no blank line 1 before the defaults it keeps
 - Kind: deferred
 - What the operator sees: when line 1 of a loose file is neither a comment nor empty and `clear` keeps `#_defaults_#`
@@ -263,20 +252,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: the name is read as a numbered part (§17.2), which a loose file has none of.
 - Revisit when: 0.2.2. The plan: a loose path's numeric suffix names a file, not a part, for `scrub` and `clear` as
   for the rest (`name.rs`); check §17.2 and §5.2 with the TSVZ session first.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A loose `delete` names a key with a newline or a delimiter at its end by the key without it
-- Kind: deferred
-- What the operator sees: `tsvz delete f.tsv $'a\n'` writes the tombstone for `a`, and deletes it, though `a` and
-  `a<LF>` are two keys. 0.2.0 does the same. The
-  same in `setdefault`: `setdefault f.tsv '#_defaults_# ' x y` (a blank at the key's end) passes its marker-key
-  check, which looks at the key untrimmed, and writes a line that a reader takes for the defaults line and prints as
-  a row, exit 0 (`setdefault f.tsv '#_defaults_#' x` is refused, exit 2; 0.2.0 wrote the same line but applied no
-  defaults).
-- Why: the key is trimmed of whitespace before it is encoded, where a reader trims the cell as the file has it.
-- Revisit when: 0.2.2. The plan: encode the key, then trim it (`loose::sanitize` and `py_space`), as a reader names
-  it, before `delete` makes its names and `setdefault` its marker-key check.
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
@@ -302,15 +277,4 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 0.2.2. The plan: append only when the head read's first keyed line ends within the size seen (else
   read again), or read the head again under the lock.
 - Noted: 2026-11-23, in the 0.2.1 re-review of the final-review fix round (E); a deferral under the user's standing
-  rule that deferrals are noted, not asked.
-
-### The header of a loose file keeps the NULs at the end of an unterminated first line comment
-- Kind: deferred
-- What the operator sees: `header()` of a loose file whose line 1 is a comment with no newline and ends in NULs (a
-  torn write) returns the comment with those NULs; a read of the file strips them as TSVZ.py does. A trivial
-  difference in the library's `header()`; the command line prints no header.
-- Why: `header()` trims the NULs at the start of line 1 and not the ones at the end of an unterminated one.
-- Revisit when: 0.2.2. The plan: one more trim of the NULs at the end when line 1 is unterminated, as `loose::parse`
-  does.
-- Noted: 2026-11-23, in the 0.2.1 re-review of the final-review fix round (F5); a deferral under the user's standing
   rule that deferrals are noted, not asked.
