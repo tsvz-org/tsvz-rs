@@ -1888,6 +1888,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_waiting_for_the_lock_while_the_file_is_cleared_writes_no_key_alone() {
+        // A clear lands between the delete's read (two columns) and its append: a key alone,
+        // written to the file as it is now, with no keyed line, would be a row of one column. The
+        // append is made only to the file as it was read; the delete reads it again, finds none.
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        let holder = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        let held = lock::lock(&holder).unwrap();
+        let deleting = {
+            let p = p.clone();
+            std::thread::spawn(move || delete_loose(&p, &opts(), &["a".to_string()]))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock::waiters_on(&p) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the delete never waited for the lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(&p, "").unwrap(); // the clear
+        drop(held);
+        assert_eq!(deleting.join().unwrap().unwrap(), LooseDelete::Nothing);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "");
+    }
+
+    #[test]
     fn scrub_of_a_compressed_part_and_a_loose_file() {
         let dir = tempfile::tempdir().unwrap();
         let gz = dir.path().join("s.tsvz.gz");
