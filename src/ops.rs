@@ -307,8 +307,9 @@ pub fn delete_records(
 
 /// Records read from bulk input in `format` (§20.3.1, §21.7.2): a line is a record; a marker
 /// key is a marker line; a comment, an empty line or an empty key is skipped (a loose line first
-/// loses the NULs at its start, as a reader drops them); a key alone is a tombstone. With `keys_only` (`delete -`) only the first field counts. An unterminated last
-/// line is ignored with a warning naming `source`.
+/// loses the NULs at its start, as a reader drops them); a key alone is a tombstone. With
+/// `keys_only` (`delete -`) only the first field counts. An unterminated last line is ignored
+/// with a warning naming `source`.
 pub fn parse_records(
     input: &[u8],
     format: Format,

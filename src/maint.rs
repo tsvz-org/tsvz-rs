@@ -1542,9 +1542,9 @@ pub(crate) enum LooseDelete {
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
 /// deletion, appended for each key asked, live or not, as a reader names it (without the
-/// whitespace at its end; a key with nothing left, or that no row can have, names none), and only while the file is as the
-/// read found it; one column, where a key alone is a row and no line can delete, a rewrite without
-/// the lines of the keys ([`loose::WithoutPlan`]); no keyed line yet, nothing, since a key alone
+/// whitespace at its end; a key with nothing left, or that no row can have, names none), and only
+/// while the file is as the read found it; one column, where a key alone is a row and no line can
+/// delete, a rewrite without the lines of the keys ([`loose::WithoutPlan`]); no keyed line yet, nothing, since a key alone
 /// would set one column and be a row. The file is read only as far as its first keyed line (a
 /// compressed one to the end of the member that holds it); the whole file is read for a rewrite,
 /// at one column only. A missing file is created (§20.2.2).
@@ -1992,10 +1992,11 @@ mod tests {
     #[test]
     #[cfg(feature = "cli")]
     fn a_loose_delete_beside_a_writer_that_keeps_appending_is_never_refused_for_it() {
-        // 0.2.1's first build compared the file's stamp with the one before its head read, and
-        // refused (`kept changing`) a delete that each of its three tries found overtaken by an
-        // append (2 of 150 beside six writers). Only a clear or a rewrite matters: the file's head
-        // sets its column count. A stamp check fails this nearly every run (500 deletes, 3 tries each: 30 of 30 runs measured).
+        // A check of the file's stamp (size, mtime) against the one before the head read refused
+        // (`kept changing`) a delete that each of its three tries found overtaken by an append (2
+        // of 150 beside six writers). Only a clear or a rewrite matters: the file's head sets its
+        // column count. A stamp check fails this test every time (500 deletes, 3 tries each; 30 of
+        // 30 runs measured).
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
