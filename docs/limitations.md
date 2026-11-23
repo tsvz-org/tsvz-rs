@@ -161,8 +161,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   which still names it: `tsvz stop` waits 30 s and fails (0.2.0 gave 0 after 10 s). (3) The same stale pointer after
   a routed `pop` or `popitem`: a handler that dies after answering the pop and before the command prints the row (the
   put-back path, `cli::route`) leaves its pointer, so the command waits 30 s for it to go, leaves the files alone and
-  prints the row on standard error (0.2.0 printed the row at once and never put it back; 0.2.1's first build put it
-  back at once).
+  prints the row on standard error (0.2.0 printed the row at once and never put it back).
 - Why: the stop, and the put-back after a routed pop, tell a handler that is gone from one that is not by the
   pointer file's name alone.
 - Revisit when: 0.2.2. The plan: also try the pointer file's `flock`, which the system releases when the handler's
@@ -237,7 +236,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: `tsvz set f.tsv -` (and `append`, `delete -`) with a loose-format payload drops a
   `#_defaults_#` line as a comment instead of writing it, where a reader reads it as the defaults. 0.2.0 does the
-  same. (The NULs at a line's start are dropped as a reader drops them, since the 0.2.1 fix round.)
+  same. (0.2.1 drops the NULs at a line's start, as a reader does.)
 - Why: `ops::parse_records` tests the raw first field for a comment, and a `#_defaults_#` line is one.
 - Revisit when: 0.2.2. The plan: give bulk input of a loose format to `loose::parse`, the one rule a reader uses (a
   `#_defaults_#` line is a record, a comment is skipped).
@@ -297,8 +296,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   file; `tsvz delete f.tsv k` takes the file's size and last bytes (nothing); another process appends `a<TAB>1`; the
   delete's head read sees two columns; a `clear` (which rewrites the file in place, the same inode) empties it again;
   under the lock the file is as it was first seen (same inode, no shorter, the same empty end), so `k` is appended and
-  `f.tsv` now holds one row, `k`. 0.2.0 appended after any clear, a wider window; 0.2.1's first build refused it (its
-  stamp changed).
+  `f.tsv` now holds one row, `k`. 0.2.0 appended after any clear, a wider window.
 - Why: the decision (the column count) rests on the bytes up to the first keyed line, which here lie past the size the
   guard covers.
 - Revisit when: 0.2.2. The plan: append only when the head read's first keyed line ends within the size seen (else
