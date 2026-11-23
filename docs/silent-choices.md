@@ -45,7 +45,7 @@ TSVZ.py code it copies. The differential harness (`difftest/`) finds new ones.
 | `pop`, `popitem`, `setdefault` through a handler | Answered once their write is made; a failed write answers 1 and no row | `_ServeStore.pop` |
 | Writes that fail after they were acknowledged | Reported on `serve`'s standard error; every response carries a `#!` warning until a batch is written again | `_ServeWriter`, `_serveRespond` |
 | The handler's socket | A new `tsvz-XXXXXX` directory under `$XDG_RUNTIME_DIR` when it is absolute and writable and access is private, else the temporary directory, made absolute; socket 0600, 0660 with `--x-group`, or `--x-mode`; the directory 0700 plus search bits for whom the socket admits | `_ServeHandle.start` |
-| The pointer file | Created 0600, published 0644; one that is incomplete is read again after 50 ms; one with another first line, or no `address` or `host`, means no handler, without a warning | `_ServeHandle.lock`, `_serveLookup` |
+| The pointer file | Created 0600, published 0644; one that is incomplete is read again after 50 ms; one with another first line, or no `address` or `host`, or removed as it is read (its handler stopping), means no handler, without a warning | `_ServeHandle.lock`, `_serveLookup` |
 | Request line limit | 64 MiB; a longer line closes the connection | `_SERVE_LINE_LIMIT` |
 | `stop STORE` | After `#0`, waits up to 10 s until the pointer file no longer names that handler | `_cliStop` |
 | `serve` options | `--x-idle-timeout S`, `--x-group G`, `--x-mode M`, and `--x-direct` for any command, spelled as TSVZ.py spells them | `_CLI_OPTIONS` |

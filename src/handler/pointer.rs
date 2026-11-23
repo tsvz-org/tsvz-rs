@@ -126,8 +126,9 @@ fn store_owner(store: &Path) -> Option<u32> {
 }
 
 /// The pointer file of `store`, checked as §21.2.4 says: Ok(None) when there is no usable
-/// pointer file and nothing to report (none, not of this protocol, or incomplete); Err with why
-/// one that exists is not trusted (a client warns, §20.8.2).
+/// pointer file and nothing to report (none, not of this protocol, incomplete, or removed as it
+/// was read: its handler stopped); Err with why one that exists is not trusted (a client warns,
+/// §20.8.2).
 pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
     let path = path_of(store);
     let mut found = None;
@@ -149,6 +150,21 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
     let Some((fields, meta)) = found else {
         return Ok(None);
     };
+    trust(store, &path, fields, &meta)
+}
+
+/// Whether the pointer file at `path`, read as `fields` with `meta` (its open file's), may be used
+/// (§21.2.4): its handler's [`Info`], Ok(None) when it names no handler, or why it is not trusted.
+fn trust(
+    store: &Path,
+    path: &Path,
+    fields: HashMap<String, String>,
+    meta: &std::fs::Metadata,
+) -> Result<Option<Info>, String> {
+    if meta.nlink() == 0 {
+        // Removed since it was opened: its handler has stopped, as if there were none.
+        return Ok(None);
+    }
     // SAFETY: geteuid only reads the process's user id.
     let me = unsafe { libc::geteuid() };
     if meta.uid() != me && Some(meta.uid()) != store_owner(store) {
@@ -164,7 +180,7 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
             path.display()
         ));
     }
-    if meta.nlink() != 1 {
+    if meta.nlink() > 1 {
         // Its owner wrote it, but not necessarily here: anyone may link a file they can see.
         return Err(format!(
             "{} has another name (a hard link), so its owner may not have put it there",
@@ -690,6 +706,24 @@ mod tests {
         assert!(lookup(&s).unwrap_err().contains("hard link"));
         fs::remove_file(&other).unwrap();
         assert!(lookup(&s).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pointer_removed_after_it_was_opened_names_no_handler() {
+        // A stopping handler removes its pointer file: a client that opened it just before finds
+        // it with no name left, which is no handler, not a second name (a hard link).
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        plant(&s, &text("unix:/x/s", &hostname()), 0o644);
+        let file = open_pointer(&path_of(&s)).unwrap();
+        fs::remove_file(path_of(&s)).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.nlink(), 0);
+        let fields = [("address", "unix:/x/s"), ("host", hostname().as_str())]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(trust(&s, &path_of(&s), fields, &meta), Ok(None));
     }
 
     #[test]

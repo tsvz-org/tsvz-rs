@@ -159,21 +159,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### A command that meets a handler just as it removes its pointer file can warn about a hard link
-- Kind: deferred
-- What the operator sees: a command that opens the pointer file just before a stopping handler removes it says
-  `ignoring the pointer file: PATH has another name (a hard link), so its owner may not have put it there; using the
-  files directly`, then works on the files and exits 0. Only the text is wrong. `tsvz stop` does not fall back: it
-  exits 1 with the same words (`PATH has another name (a hard link), so its owner may not have put it there`).
-  Seen in 6 of about 141,000 `get` commands over three stress runs of 0.2.0 builds that stopped a handler under 24
-  clients (Rust 1.85.1), and in none of about 51,000 in the run of 0.1.4; the code that refuses is the same in 0.1.4.
-- Why: `lookup` refuses any link count but 1 (anyone may link a file they can see), and a file removed after it was
-  opened has link count 0.
-- Revisit when: 0.2.1. The plan: `lookup` treats link count 0 as no handler, without a warning (`tsvz stop` then
-  says `no handler is running`, and exits 1 as it does for a handler that is not there).
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A scrub or clear can rewrite a part that was rotated away between its open and its lock
 - Kind: deferred
 - What the operator sees: when the part a `scrub` or `clear` has opened (a scrub's target, the last of the parts
