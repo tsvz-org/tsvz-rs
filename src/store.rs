@@ -173,7 +173,7 @@ impl Table {
                         let resolved = if format.strict {
                             crate::write::resolve(k, format.delimiter).into_owned()
                         } else {
-                            k.trim_end_matches(crate::loose::py_space).to_string()
+                            crate::loose::name(k, format.delimiter).unwrap_or_else(|| k.clone())
                         };
                         [k.clone(), resolved]
                     })
@@ -923,10 +923,12 @@ impl Store {
 
     /// The key a requested KEY names (§20.2.7): while the final stripping is on, a key a reader
     /// would strip names the live key equal to it, else what a reader resolves it to (§7.7).
-    /// In a loose file, the key without the whitespace at its end, as TSVZ.py reads a key.
+    /// In a loose file, the key a reader names it by ([`crate::loose::name`]: a line break or a
+    /// delimiter at its end stays, a blank goes), or, for a key no row can have, the key itself.
     pub fn lookup_key<'k>(&self, requested: &'k str) -> Cow<'k, str> {
         if !self.format.strict {
-            return Cow::Borrowed(requested.trim_end_matches(crate::loose::py_space));
+            return crate::loose::name(requested, self.format.delimiter)
+                .map_or(Cow::Borrowed(requested), Cow::Owned);
         }
         let strip = self.format.strict && self.replay.markers.strip;
         crate::write::name_key(requested, self.format.delimiter, strip, |k| {

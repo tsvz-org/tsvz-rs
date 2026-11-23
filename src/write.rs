@@ -134,8 +134,8 @@ fn snapshot_refused(key: &str) -> Error {
 }
 
 /// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file's fields are
-/// encoded as TSVZ.py writes them ([`crate::loose::sanitize`]); one that holds `</sep/>` or
-/// `</LF/>`, which would read back as another, is refused.
+/// encoded as TSVZ.py writes them ([`crate::loose::sanitize`]); a record whose line would not read
+/// back as it (`loose::reads_back`) is refused.
 pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Result<(), Error> {
     let d = format.delimiter;
     let (key, values, marker) = match record {
@@ -158,32 +158,31 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
                 "the delimiter {d:#04x} is not one ASCII character other than a line break; nothing was written"
             )));
         }
-        for field in std::iter::once(key).chain(values) {
-            if let Some(token) = crate::loose::unwritable(field) {
-                return Err(Error::Refused(format!(
-                    "{field:?} holds {token}, which a loose file reads back as another; nothing was written"
-                )));
+        // What is written must read back as the record, less the whitespace a reader trims at a
+        // cell's end (`loose::reads_back`): the reader's own rule, so a key alone too, which in a
+        // file of one column, or with no keyed line yet, is a row. A delete never asks for a
+        // tombstone that would not ([`crate::maint::delete_loose`] names keys by that rule).
+        // Each cell is written as the reader names it, without that whitespace, as TSVZ.py's
+        // writer strips it.
+        let fields: Vec<&str> = std::iter::once(key.as_str())
+            .chain(values.iter().map(String::as_str))
+            .collect();
+        let start = out.len();
+        for (i, f) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(d as char);
             }
-            // A delimiter that is a character of `<sep>`, `<LF>` or their escapes (`-d e`) is in
-            // the encoding itself, and a reader would cut the cell there.
-            if crate::loose::delimiter_in_encoding(field, d) {
-                return Err(Error::Refused(format!(
-                    "{field:?} is written with the delimiter {:?} inside it, which a loose file reads as the end of a cell; nothing was written",
-                    d as char
-                )));
-            }
+            out.push_str(crate::loose::sanitize(f, d).trim_end_matches(crate::loose::py_space));
         }
-        // A key alone too: in a file of one column, or with no keyed line yet, it is a row. A
-        // delete never asks for such a tombstone ([`crate::maint::delete_loose`] drops those names).
-        if let Some(why) = crate::loose::unreadable_key(key, d) {
+        if let Err(cells) = crate::loose::reads_back(&out[start..], d, &fields) {
+            let read = match cells {
+                None => "nothing (a comment, or an empty key)".to_string(),
+                Some(cells) => format!("{cells:?}"),
+            };
+            out.truncate(start);
             return Err(Error::Refused(format!(
-                "the key {key:?} {why}, so it could never be read back from a loose file; nothing was written"
+                "{fields:?} would read back from a loose file as {read}, so it could never be read back as it was written; nothing was written"
             )));
-        }
-        out.push_str(&crate::loose::sanitize(key, d));
-        for v in values {
-            out.push(d as char);
-            out.push_str(&crate::loose::sanitize(v, d));
         }
         out.push('\n');
         return Ok(());
@@ -809,13 +808,13 @@ mod tests {
             delimiter: b',',
             strict: false,
         };
-        // A loose file's cells as TSVZ.py writes them (`_sanitize`): what reads back as another
-        // token is refused.
+        // A loose file's cells as TSVZ.py writes them (`_sanitize`), without the whitespace a
+        // reader trims at a cell's end: what reads back as another token is refused.
         assert_eq!(enc(d("k", &["a<b", "#c"]), loose).unwrap(), "k,a<b,#c\n");
         assert_eq!(enc(d("k", &["a,b"]), loose).unwrap(), "k,a<sep>b\n");
         assert_eq!(
             enc(d("k\nl", &["a\nb<sep>", "x<LF>\r"]), loose).unwrap(),
-            "k<LF>l,a<LF>b</sep/>,x</LF/>\r\n"
+            "k<LF>l,a<LF>b</sep/>,x</LF/>\n"
         );
         assert!(matches!(
             enc(d("k", &["a</sep/>b"]), loose),
@@ -1393,5 +1392,99 @@ mod tests {
             "stripping is off"
         );
         assert_eq!(name_key("k\t", b'\t', true, live), "k\t");
+    }
+}
+
+/// The loose writer's rule against the reader's, over many records (the 0.2.1 re-review's
+/// property check, rr021b): a record is written exactly when its line, encoded as TSVZ.py
+/// encodes it, reads back ([`crate::loose::parse`]) as its fields less the whitespace at their
+/// ends; and what is written reads back so.
+#[cfg(test)]
+mod loose_round_trip {
+    use super::*;
+    use crate::loose::{parse, py_space, sanitize};
+
+    const ATOMS: &[&str] = &[
+        "a", "e", "s", "p", "L", "F", "<", ">", "/", "#", "_", "\0", " ", "\t", "\n", "\r",
+        "<sep>", "<LF>", "</sep/>", "</LF/>", "#_defaults_#", "\u{1c}", "\u{a0}", ",", "x",
+    ];
+    const DS: &[u8] = &[
+        b'\t', b',', b'e', b'<', b'/', b'#', b'>', b'L', b' ', b'\0', b's', b'_', b'x',
+    ];
+
+    /// The cells `line` reads back as equal `fields` less some whitespace at their ends.
+    fn same(line: &str, d: u8, fields: &[String]) -> bool {
+        parse(line, d, true).is_some_and(|cells| {
+            cells.len() == fields.len()
+                && cells.iter().zip(fields).all(|(c, f)| {
+                    f.strip_prefix(&**c)
+                        .is_some_and(|r| r.chars().all(py_space))
+                })
+        })
+    }
+
+    fn check(fields: &[String], d: u8, bad: &mut Vec<String>) {
+        let rec = if fields.len() == 1 {
+            Record::Tombstone {
+                key: fields[0].clone(),
+            }
+        } else {
+            Record::Data {
+                key: fields[0].clone(),
+                values: fields[1..].to_vec(),
+            }
+        };
+        let raw: Vec<String> = fields.iter().map(|f| sanitize(f, d).into_owned()).collect();
+        let readable = same(&raw.join(&(d as char).to_string()), d, fields);
+        let mut out = String::new();
+        let format = Format {
+            delimiter: d,
+            strict: false,
+        };
+        let written = encode_record(&rec, format, &mut out).is_ok();
+        let reads = written && same(out.strip_suffix('\n').unwrap_or(&out), d, fields);
+        if written != readable || written != reads || (!written && !out.is_empty()) {
+            bad.push(format!("{:?} {fields:?} written={written}", d as char));
+        }
+    }
+
+    #[test]
+    fn a_loose_write_is_refused_exactly_when_it_would_not_read_back() {
+        let mut bad = Vec::new();
+        let mut keys = vec![String::new()];
+        for _ in 0..3 {
+            let next: Vec<String> = keys
+                .iter()
+                .flat_map(|k| ATOMS.iter().map(move |a| format!("{k}{a}")))
+                .collect();
+            keys.extend(next);
+            keys.sort();
+            keys.dedup();
+        }
+        for &d in DS {
+            for k in &keys {
+                check(std::slice::from_ref(k), d, &mut bad);
+            }
+        }
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..300_000 {
+            let d = DS[(next() % DS.len() as u64) as usize];
+            let n = 1 + (next() % 4) as usize;
+            let fields: Vec<String> = (0..n)
+                .map(|_| {
+                    (0..next() % 5)
+                        .map(|_| ATOMS[(next() % ATOMS.len() as u64) as usize])
+                        .collect()
+                })
+                .collect();
+            check(&fields, d, &mut bad);
+        }
+        assert!(bad.is_empty(), "{} mismatches: {:?}", bad.len(), &bad[..bad.len().min(20)]);
     }
 }

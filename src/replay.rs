@@ -604,8 +604,15 @@ impl Replay {
         use crate::loose::{DEFAULTS, parse, valueless};
         let d = self.format.delimiter;
         let Some(mut cells) = parse(text, d, terminated) else {
-            if self.lines_read == 0 && text.trim_start_matches('\0').starts_with('#') {
-                self.header = Some(text.trim_start_matches('\0').to_string());
+            // Without the NULs a reader drops: at its start, and at the end of an unterminated one.
+            let line = text.trim_start_matches('\0');
+            let line = if terminated {
+                line
+            } else {
+                line.trim_end_matches('\0')
+            };
+            if self.lines_read == 0 && line.starts_with('#') {
+                self.header = Some(line.to_string());
             }
             self.lines_read += 1;
             return;

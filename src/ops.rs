@@ -5,6 +5,7 @@
 //! `setdefault` only decide: they return a [`Plan`] their caller carries out, the command line
 //! with a `Writer`, the handler through its writer thread.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::escape::{self, is_marker_key};
@@ -306,8 +307,8 @@ pub fn delete_records(
 }
 
 /// Records read from bulk input in `format` (§20.3.1, §21.7.2): a line is a record; a marker
-/// key is a marker line; a comment, an empty line or an empty key is skipped (a loose line first
-/// loses the NULs at its start, as a reader drops them); a key alone is a tombstone. With
+/// key is a marker line; a comment, an empty line or an empty key is skipped; a key alone is a
+/// tombstone. A loose line is read as a reader reads it ([`crate::loose::parse`]). With
 /// `keys_only` (`delete -`) only the first field counts. An unterminated last line is ignored
 /// with a warning naming `source`.
 pub fn parse_records(
@@ -318,29 +319,33 @@ pub fn parse_records(
     warn: Option<&WarnFn>,
 ) -> Vec<Record> {
     let d = format.delimiter;
-    let decode = |f: &str| {
-        if format.strict {
-            escape::decode(f, d).into_owned()
-        } else {
-            crate::loose::unsanitize(f, d).into_owned() // the file's own encoding, as TSVZ.py takes it
-        }
-    };
+    let decode = |f: &str| escape::decode(f, d).into_owned();
     let mut records = Vec::new();
     let mut framer = Framer::new();
     framer.push(input, &mut |line| {
         let text = String::from_utf8_lossy(line.text());
-        // A loose line loses the NULs at its start, as a reader drops them (`loose::parse`).
-        let text = if format.strict {
-            &*text
-        } else {
-            text.trim_start_matches('\0')
-        };
+        if !format.strict {
+            // A loose line is read as a reader reads it (`loose::parse`): a comment, an empty line
+            // or an empty key is nothing, a `#_defaults_#` line is a record.
+            let Some(cells) = crate::loose::parse(&text, d, true) else {
+                return true;
+            };
+            let mut cells = cells.into_iter().map(Cow::into_owned);
+            let key = cells.next().unwrap_or_default();
+            let values: Vec<String> = if keys_only { Vec::new() } else { cells.collect() };
+            records.push(if values.is_empty() {
+                Record::Tombstone { key }
+            } else {
+                Record::Data { key, values }
+            });
+            return true;
+        }
         if text.is_empty() {
             return true;
         }
         let mut fields = text.split(d as char);
         let first = fields.next().unwrap_or("");
-        let marker = format.strict && is_marker_key(first);
+        let marker = is_marker_key(first);
         if first.starts_with('#') && !marker {
             return true; // a comment
         }

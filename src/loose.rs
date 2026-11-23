@@ -61,7 +61,7 @@ pub(crate) fn unsanitize(cell: &str, d: u8) -> Cow<'_, str> {
 /// A cell as TSVZ.py writes it to a loose file and prints it (`_sanitize`): the delimiter `<sep>`, a
 /// newline `<LF>`, and the tokens `<sep>` and `<LF>` `</sep/>` and `</LF/>`, so that
 /// [`unsanitize`] gives it back but for the whitespace at its end. `</sep/>` and `</LF/>`
-/// themselves stay as they are, and read back as `<sep>` and `<LF>` ([`unwritable`]).
+/// themselves stay as they are, and read back as `<sep>` and `<LF>` ([`name`]).
 pub(crate) fn sanitize(cell: &str, d: u8) -> Cow<'_, str> {
     let special = |b: u8| b == d || b == b'\n' || b == b'<';
     if !cell.bytes().any(special) {
@@ -94,32 +94,45 @@ pub(crate) fn sanitize(cell: &str, d: u8) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// The token in `cell` that [`sanitize`] cannot write so that it reads back: `</sep/>` or
-/// `</LF/>`, which TSVZ.py writes as they are (with a warning) and reads back as `<sep>` and
-/// `<LF>`.
-pub(crate) fn unwritable(cell: &str) -> Option<&'static str> {
-    ["</sep/>", "</LF/>"].into_iter().find(|t| cell.contains(t))
-}
-
-/// Whether `field`, written as [`sanitize`] encodes it, holds the delimiter: a delimiter that is a
-/// character of `<sep>`, `<LF>` or their escapes (`-d e`), where a reader cuts the cell.
-pub(crate) fn delimiter_in_encoding(field: &str, d: u8) -> bool {
-    sanitize(field, d).as_bytes().contains(&d)
-}
-
-/// Why `key`, written as [`sanitize`] encodes it, would not read back as that key ([`parse`]):
-/// it begins with a NUL, which a reader drops; it begins with `#` but not `#_defaults_#`, so its
-/// line is a comment; or it is empty or only whitespace, which no reader reads as a key.
-pub(crate) fn unreadable_key(key: &str, d: u8) -> Option<&'static str> {
+/// The key a reader names `key` by, in a loose file of delimiter `d`: the one cell that
+/// [`parse`] reads from the key as [`sanitize`] writes it (the encoded cell trimmed of the
+/// whitespace at its end, then decoded). None when that is not `key` less some whitespace at its
+/// end, so that no row can have `key`: it begins with `#` (a comment) or a NUL, is only
+/// whitespace, holds `</sep/>` or `</LF/>` (read back as `<sep>` and `<LF>`), or its encoding
+/// holds the delimiter (`-d e`: `<sep>` has an `e`). The one rule for every key a loose command
+/// names, and, field by field, for what a loose write may write ([`reads_back`]).
+pub(crate) fn name(key: &str, d: u8) -> Option<String> {
     let encoded = sanitize(key, d);
-    if encoded.starts_with('\0') {
-        Some("begins with a NUL, which a reader drops")
-    } else if encoded.starts_with('#') && !encoded.starts_with(DEFAULTS) {
-        Some("begins with `#`, which makes its line a comment")
-    } else if encoded.trim_end_matches(py_space).is_empty() {
-        Some("is empty or only whitespace, which no reader reads as a key")
-    } else {
-        None
+    let cells = parse(&encoded, d, true)?;
+    let [cell] = &cells[..] else {
+        return None;
+    };
+    read_as(key, cell).then(|| cell.to_string())
+}
+
+/// Whether a field written as `field` reads back as `cell`: `field` less whitespace at its end.
+fn read_as(field: &str, cell: &str) -> bool {
+    field
+        .strip_prefix(cell)
+        .is_some_and(|rest| rest.chars().all(py_space))
+}
+
+/// Whether the line `line`, written from `fields`, reads back as them ([`parse`]): as many cells
+/// as fields, each its field less some whitespace at its end ([`name`]'s rule, for a line).
+/// Else what it reads back as: None for a line read as nothing.
+pub(crate) fn reads_back<'l>(
+    line: &'l str,
+    d: u8,
+    fields: &[&str],
+) -> Result<(), Option<Vec<Cow<'l, str>>>> {
+    match parse(line, d, true) {
+        Some(cells)
+            if cells.len() == fields.len()
+                && cells.iter().zip(fields).all(|(c, f)| read_as(f, c)) =>
+        {
+            Ok(())
+        }
+        other => Err(other),
     }
 }
 
@@ -794,8 +807,8 @@ mod tests {
             assert_eq!(unsanitize(&sanitize(cell, b'\t'), b'\t'), cell, "{cell:?}");
         }
         assert_eq!(sanitize("x</sep/>y<sep>", b'\t'), "x</sep/>y</sep/>");
-        assert_eq!(unwritable("x</LF/>"), Some("</LF/>"));
-        assert_eq!(unwritable("x<LF>"), None);
+        assert_eq!(name("x</LF/>", b'\t'), None);
+        assert_eq!(name("x<LF>", b'\t').as_deref(), Some("x<LF>"));
     }
 
     #[test]
@@ -1009,25 +1022,36 @@ mod tests {
         assert_eq!(first_cell(b"\0k\0v", 0), b"k");
     }
 
+    /// A key is named as a reader names its cell: the encoding trimmed, then decoded (a line break
+    /// or a delimiter at its end stays, a blank goes); None for a key no row can have.
     #[test]
-    fn a_key_that_would_not_read_back_is_named() {
-        for (key, d, bad) in [
-            ("#tag", b'\t', true),
-            ("#_defaults_#", b'\t', false),
-            ("#_defaults_#x", b'\t', false),
-            ("#_DEFAULTS_#", b'\t', true),
-            (" ", b'\t', true),
-            ("\r \u{a0}", b'\t', true),
-            ("", b'\t', true),
-            ("\0a", b'\t', true),
-            ("a#", b'\t', false),
-            (" a", b'\t', false),
-            ("\n", b'\t', false), // `<LF>`, read back as a newline
-            ("\t", b'\t', false), // `<sep>`
-            // with the NUL as the delimiter the NUL is encoded away
-            ("\0a", 0, false),
+    fn a_key_is_named_as_a_reader_names_its_cell() {
+        for (key, d, named) in [
+            ("#tag", b'\t', None),
+            ("#_defaults_#", b'\t', Some("#_defaults_#")),
+            ("#_defaults_#x", b'\t', Some("#_defaults_#x")),
+            ("#_defaults_# ", b'\t', Some("#_defaults_#")),
+            ("#_DEFAULTS_#", b'\t', None),
+            (" ", b'\t', None),
+            ("\r \u{a0}", b'\t', None),
+            ("", b'\t', None),
+            ("\0a", b'\t', None),
+            ("a#", b'\t', Some("a#")),
+            (" a", b'\t', Some(" a")),
+            ("a ", b'\t', Some("a")),
+            ("a\n", b'\t', Some("a\n")), // `a<LF>`, read back with its newline
+            ("a\n ", b'\t', Some("a\n")),
+            ("a\t", b'\t', Some("a\t")), // `a<sep>`
+            ("\n", b'\t', Some("\n")),
+            ("a ", b' ', Some("a ")), // the delimiter is encoded, so not trimmed
+            ("</sep/>", b'\t', None),
+            ("x</LF/>", b'\t', None),
+            ("hello", b'e', None), // its encoding holds the delimiter
+            ("hllo", b'e', Some("hllo")),
+            ("a<", b'e', Some("a<")), // a `<` that begins no token is written as it is
+            ("\0a", 0, Some("\0a")), // with the NUL as the delimiter the NUL is encoded away
         ] {
-            assert_eq!(unreadable_key(key, d).is_some(), bad, "{key:?} {d}");
+            assert_eq!(name(key, d).as_deref(), named, "{key:?} {d}");
         }
     }
 

@@ -1541,8 +1541,8 @@ pub(crate) enum LooseDelete {
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
-/// deletion, appended for each key asked, live or not, as a reader names it (without the
-/// whitespace at its end; a key with nothing left, or that no row can have, names none), and only
+/// deletion, appended for each key asked, live or not, as a reader names it ([`loose::name`]: a
+/// line break or a delimiter at its end stays, a blank goes; a key no row can have names none), and only
 /// while the file is as the read found it; one column, where a key alone is a row and no line can
 /// delete, a rewrite without the lines of the keys ([`loose::WithoutPlan`]); no keyed line yet, nothing, since a key alone
 /// would set one column and be a row. The file is read only as far as its first keyed line (a
@@ -1555,18 +1555,11 @@ pub(crate) fn delete_loose(
     keys: &[String],
 ) -> Result<LooseDelete, Error> {
     let d = loose_delimiter(store, options)?.expect("a loose file");
-    // The names a reader names, less those no row can have: a key that begins with `#` (a comment)
-    // or only whitespace, or whose encoding holds the delimiter (`-d e`). Nothing is written for
-    // one, as for a key that is not there; for a key alone in a file of one column it would be a row.
-    let names: Vec<&str> = keys
-        .iter()
-        .map(|k| k.trim_end_matches(loose::py_space))
-        .filter(|n| {
-            !n.is_empty()
-                && loose::unreadable_key(n, d).is_none()
-                && !loose::delimiter_in_encoding(n, d)
-        })
-        .collect();
+    // The names a reader names ([`loose::name`]), less the keys no row can have: one that begins
+    // with `#` (a comment) or is only whitespace, holds `</sep/>` or `</LF/>`, or whose encoding
+    // holds the delimiter (`-d e`). Nothing is written for one, as for a key that is not there; for
+    // a key alone in a file of one column it would be a row.
+    let names: Vec<String> = keys.iter().filter_map(|k| loose::name(k, d)).collect();
     let mut meanwhile = "rewritten"; // what the file was being when it kept changing
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
@@ -1613,9 +1606,7 @@ pub(crate) fn delete_loose(
             }
             let tombstones: Vec<crate::write::Record> = names
                 .iter()
-                .map(|key| crate::write::Record::Tombstone {
-                    key: key.to_string(),
-                })
+                .map(|key| crate::write::Record::Tombstone { key: key.clone() })
                 .collect();
             // Appended only to the file as it was read, or that file with more appended by another
             // writer: one cleared meanwhile, with no keyed line left, would take a key alone for
@@ -1640,7 +1631,7 @@ pub(crate) fn delete_loose(
             }
         }
         // One column: planned in a whole read, written in a second.
-        let gone: std::collections::HashSet<String> = names.iter().map(|n| n.to_string()).collect();
+        let gone: std::collections::HashSet<String> = names.iter().cloned().collect();
         let plan = Arc::new(Mutex::new(loose::WithoutPlan::new(d, gone)));
         let s = Store::open(store, planned(options, &plan))?;
         if s.incomplete() {
