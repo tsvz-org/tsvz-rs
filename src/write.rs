@@ -248,6 +248,47 @@ fn stamp(file: &File) -> io::Result<parts::Stamp> {
     file.metadata().map(|m| parts::Stamp::of(&m))
 }
 
+/// A part as a read of it found it, for a writer that appends only while the part has only grown
+/// since: the file (its inode), how long it was, and its last bytes, as `Store::refresh` tells an
+/// append from a rewrite in place ([`crate::store::CHECK_BYTES`]). A clear, which leaves the file
+/// shorter, and a rewrite, which changes those bytes or the file, show; an append by another
+/// writer does not.
+#[derive(Debug)]
+pub(crate) struct Seen {
+    ino: u64,
+    size: u64,
+    tail: Vec<u8>,
+}
+
+impl Seen {
+    #[cfg(feature = "cli")]
+    pub(crate) fn of(path: &Path) -> io::Result<Seen> {
+        use std::os::unix::fs::MetadataExt;
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        let want = meta.len().min(crate::store::CHECK_BYTES);
+        let mut tail = vec![0u8; want as usize];
+        file.read_exact_at(&mut tail, meta.len() - want)?;
+        Ok(Seen {
+            ino: meta.ino(),
+            size: meta.len(),
+            tail,
+        })
+    }
+
+    /// Whether `file` is the file seen, no shorter, with the bytes it ended in.
+    fn grew(&self, file: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        if meta.ino() != self.ino || meta.len() < self.size {
+            return Ok(false);
+        }
+        let mut tail = vec![0u8; self.tail.len()];
+        file.read_exact_at(&mut tail, self.size - self.tail.len() as u64)?;
+        Ok(tail == self.tail)
+    }
+}
+
 /// Appends batches of records to a store's active part (§17.7).
 ///
 /// Each append holds the write lock shared with TSVZ.py (an open file description lock on
@@ -352,28 +393,28 @@ impl Writer {
         Ok(appended.expect("appended: nothing was expected of the part"))
     }
 
-    /// Append `records` only while the part still has the stamp `expect`, which a read of it took:
-    /// false, with nothing written, when another writer changed it since (a loose delete decides
-    /// from what it read).
+    /// Append `records` only while the part is the file `seen` took, which has only grown since:
+    /// false, with nothing written, when it was cleared, rewritten or replaced (a loose delete
+    /// decides from the head of the file it read, which other writers' appends leave as it was).
     #[cfg(feature = "cli")]
-    pub(crate) fn append_if_unchanged(
+    pub(crate) fn append_if_grown(
         &mut self,
         records: &[Record],
-        expect: parts::Stamp,
+        seen: &Seen,
     ) -> Result<bool, Error> {
         let payload = encode(records, self.format)?;
         let appended =
-            self.append_unless_changed(payload.as_bytes(), self.member_size as u64, Some(expect))?;
+            self.append_unless_changed(payload.as_bytes(), self.member_size as u64, Some(seen))?;
         Ok(appended.is_some())
     }
 
-    /// [`Writer::append_at`], which writes nothing and answers None when `expect` is a stamp the
-    /// part no longer has under the lock.
+    /// [`Writer::append_at`], which writes nothing and answers None when the part under the lock is
+    /// not the file `expect` saw, grown.
     fn append_unless_changed(
         &mut self,
         payload: &[u8],
         member_size: u64,
-        expect: Option<parts::Stamp>,
+        expect: Option<&Seen>,
     ) -> Result<Option<Appended>, Error> {
         // The part is locked as it was opened; when by then it is no longer the store's active
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
@@ -408,7 +449,7 @@ impl Writer {
             options
                 .append(true)
                 .create(create)
-                .read(part.codec.is_none());
+                .read(part.codec.is_none() || expect.is_some());
             let file = match options.open(path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !create => {
@@ -437,8 +478,10 @@ impl Writer {
             let mut cut = None;
             let locked = (|| {
                 let before = stamp(&file).map_err(io)?;
-                if expect.is_some_and(|e| e != before) {
-                    return Ok(None);
+                if let Some(seen) = expect {
+                    if !seen.grew(&file).map_err(io)? {
+                        return Ok(None);
+                    }
                 }
                 let mut bytes = Cow::Borrowed(&bytes[..]);
                 let start = match part.codec {
@@ -1238,21 +1281,40 @@ mod tests {
 
     #[cfg(feature = "cli")]
     #[test]
-    fn an_append_made_on_what_was_read_writes_nothing_once_the_file_changed() {
-        // A loose delete appends its key alone only to the file it read: cleared meanwhile, with
-        // no keyed line left, the key alone would be a row.
+    fn an_append_made_on_what_was_read_is_made_to_a_file_that_only_grew() {
+        // A loose delete appends its key alone only to the file it read, or that file with more
+        // appended: cleared meanwhile, with no keyed line left, the key alone would be a row.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
         fs::write(&p, "a\t1\nb\t2\n").unwrap();
-        let read = parts::Stamp::of(&fs::metadata(&p).unwrap());
+        let seen = Seen::of(&p).unwrap();
         let gone = [Record::from_args("a", &[])];
         let mut w = Writer::open(&p).unwrap();
-        fs::write(&p, "").unwrap(); // the clear
-        assert!(!w.append_if_unchanged(&gone, read).unwrap());
-        assert_eq!(fs::read(&p).unwrap(), b"");
-        let now = parts::Stamp::of(&fs::metadata(&p).unwrap());
-        assert!(w.append_if_unchanged(&gone, now).unwrap());
-        assert_eq!(fs::read(&p).unwrap(), b"a\n");
+        // another writer appended meanwhile: the head is as it was
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"c\t3\n")
+            .unwrap();
+        assert!(w.append_if_grown(&gone, &seen).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\nc\t3\na\n");
+        // cleared, then rows of other columns written until it is as long again: not that file
+        fs::write(&p, "").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        fs::write(&p, "x\ny\nzzzzzzzzzzzzzzzzzzzz\n").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        // rewritten in place at the same length
+        fs::write(&p, "a\t1\nb\t3\n").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        // replaced by another file with the same bytes
+        fs::remove_file(&p).unwrap();
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n", "nothing written");
+        let now = Seen::of(&p).unwrap();
+        assert!(w.append_if_grown(&gone, &now).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\na\n");
     }
 
     #[test]

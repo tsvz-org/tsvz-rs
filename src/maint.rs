@@ -1559,6 +1559,7 @@ pub(crate) fn delete_loose(
         .map(|k| k.trim_end_matches(loose::py_space))
         .filter(|n| !n.is_empty())
         .collect();
+    let mut meanwhile = "rewritten"; // what the file was being when it kept changing
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
             Writer::open(store)?
@@ -1568,6 +1569,7 @@ pub(crate) fn delete_loose(
             return Ok(LooseDelete::Nothing);
         };
         let before = stamp(&part.path)?;
+        let seen = crate::write::Seen::of(&part.path).map_err(|e| Error::io(&part.path, e))?;
         // The head's warnings are held: at one column the whole read below says them again.
         let held: Arc<Mutex<Vec<Warning>>> = Arc::default();
         let hold: crate::WarnFn = {
@@ -1602,14 +1604,18 @@ pub(crate) fn delete_loose(
                     key: key.to_string(),
                 })
                 .collect();
-            // Appended only to the file as it was read: one cleared meanwhile, with no keyed line
-            // left, would take a key alone for a row.
+            // Appended only to the file as it was read, or that file with more appended by another
+            // writer: one cleared meanwhile, with no keyed line left, would take a key alone for
+            // a row.
             let appended = Writer::open(store)?
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
-                .append_if_unchanged(&tombstones, before);
+                .append_if_grown(&tombstones, &seen);
             match appended {
-                Ok(false) => continue, // another writer changed it since the read
+                Ok(false) => {
+                    meanwhile = "read"; // another writer cleared or rewrote it since the read
+                    continue;
+                }
                 Ok(true) => {
                     say();
                     return Ok(LooseDelete::Appended(tombstones.len()));
@@ -1657,7 +1663,7 @@ pub(crate) fn delete_loose(
         }
     }
     Err(Error::Refused(format!(
-        "{}: delete skipped: the file kept changing while it was being rewritten; nothing was written",
+        "{}: delete skipped: the file kept changing while it was being {meanwhile}; nothing was written",
         store.display()
     )))
 }
@@ -1915,6 +1921,61 @@ mod tests {
         drop(held);
         assert_eq!(deleting.join().unwrap().unwrap(), LooseDelete::Nothing);
         assert_eq!(fs::read_to_string(&p).unwrap(), "");
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_waiting_for_the_lock_while_another_writer_appends_still_deletes() {
+        // 0.2.0 appended its key alone whatever happened meanwhile; a check that the file was as
+        // read refused a delete that another process's append overtook, and went on refusing it
+        // while appends kept coming. Only a clear or a rewrite matters (the file's head sets its
+        // column count): `Writer::append_if_grown`'s own test pins that the first try is made.
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["s.tsv", "s.tsv.gz"] {
+            let p = dir.path().join(name);
+            let text = |t: &str| t.as_bytes().to_vec();
+            let member = |t: &str| match name.ends_with(".gz") {
+                true => {
+                    crate::codec::encode_member(crate::name::Codec::Gzip, t.as_bytes()).unwrap()
+                }
+                false => text(t),
+            };
+            fs::write(&p, member("a\t1\nb\t2\n")).unwrap();
+            let holder = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            let held = lock::lock(&holder).unwrap();
+            let deleting = {
+                let p = p.clone();
+                std::thread::spawn(move || delete_loose(&p, &opts(), &["a".to_string()]))
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while lock::waiters_on(&p) == 0 {
+                assert!(Instant::now() < deadline, "{name}: no wait for the lock");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            OpenOptions::new()
+                .append(true)
+                .open(&p)
+                .unwrap()
+                .write_all(&member("c\t3\n"))
+                .unwrap();
+            drop(held);
+            assert_eq!(
+                deleting.join().unwrap().unwrap(),
+                LooseDelete::Appended(1),
+                "{name}"
+            );
+            let want = ["a\t1\nb\t2\n", "c\t3\n", "a\n"].map(member).concat();
+            assert_eq!(fs::read(&p).unwrap(), want, "{name}");
+            assert_eq!(
+                rows(&p),
+                vec![
+                    vec!["b".to_string(), "2".into()],
+                    vec!["c".to_string(), "3".into()]
+                ],
+                "{name}"
+            );
+        }
     }
 
     #[test]
