@@ -164,6 +164,24 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
                     "{field:?} holds {token}, which a loose file reads back as another; nothing was written"
                 )));
             }
+            // A delimiter that is a character of `<sep>`, `<LF>` or their escapes (`-d e`) is in
+            // the encoding itself, and a reader would cut the cell there.
+            if crate::loose::sanitize(field, d).as_bytes().contains(&d) {
+                return Err(Error::Refused(format!(
+                    "{field:?} is written with the delimiter {:?} inside it, which a loose file reads as the end of a cell; nothing was written",
+                    d as char
+                )));
+            }
+        }
+        // (a tombstone of such a key deletes nothing, and a reader skips its line)
+        let unreadable = match record {
+            Record::Tombstone { .. } => None,
+            _ => crate::loose::unreadable_key(key, d),
+        };
+        if let Some(why) = unreadable {
+            return Err(Error::Refused(format!(
+                "the key {key:?} {why}, so it could never be read back from a loose file; nothing was written"
+            )));
         }
         out.push_str(&crate::loose::sanitize(key, d));
         for v in values {
@@ -644,22 +662,19 @@ mod tests {
             .append_payload(b"b,2\n")
             .unwrap();
         assert_eq!(std::fs::read_to_string(&csv).unwrap(), "a,1\nb,2\n");
-        // A loose file carries no marker semantics (§19.10.2): there the line is a comment, as
-        // TSVZ.py writes it.
+        // A loose file carries no marker semantics (§19.10.2): there the line is a comment, which a
+        // payload may hold; a record is refused, since no reader would read it.
         let loose = dir.path().join("l.tsv");
         let marker = Record::Marker {
             key: "#_snapshot_#".into(),
             values: Vec::new(),
         };
-        Writer::open(&loose).unwrap().append(&[marker]).unwrap();
+        assert!(Writer::open(&loose).unwrap().append(&[marker]).is_err());
         Writer::open(&loose)
             .unwrap()
             .append_payload(b"#_snapshot_#\n")
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&loose).unwrap(),
-            "#_snapshot_#\n#_snapshot_#\n"
-        );
+        assert_eq!(std::fs::read_to_string(&loose).unwrap(), "#_snapshot_#\n");
     }
 
     #[test]
@@ -754,6 +769,61 @@ mod tests {
             enc(d("k", &["a</sep/>b"]), loose),
             Err(Error::Refused(_))
         ));
+    }
+
+    /// A loose file takes no field whose encoding holds the delimiter (`-d e`: `<sep>` has an
+    /// `e`), nor a key it could not read back.
+    #[test]
+    fn a_loose_record_that_could_not_be_read_back_is_refused() {
+        let loose = |d: u8| Format {
+            delimiter: d,
+            strict: false,
+        };
+        let data = |k: &str, v: &[&str]| Record::Data {
+            key: k.into(),
+            values: v.iter().map(|v| v.to_string()).collect(),
+        };
+        let refused = |r: Record, f: Format| matches!(enc(r, f), Err(Error::Refused(_)));
+        // The delimiter is a character of the tokens: `h` + the delimiter, or the newline `<LF>`
+        // and the token `<sep>`, which a `/` or an `L` delimiter meets in their encodings.
+        for (d, field) in [
+            (b'<', "h<"),
+            (b'>', "h>"),
+            (b's', "hs"),
+            (b'e', "he"),
+            (b'p', "hp"),
+            (b'L', "h\nh"),
+            (b'F', "h\nh"),
+            (b'/', "h<sep>"),
+        ] {
+            assert!(refused(data("k", &[field]), loose(d)), "{d} {field:?}");
+            assert!(refused(data(field, &["1"]), loose(d)), "{d} {field:?}");
+        }
+        // Any other delimiter is encoded away (`<sep>`), and a field without it is no concern.
+        assert_eq!(
+            enc(data("k", &["h,llo"]), loose(b',')).unwrap(),
+            "k,h<sep>llo\n"
+        );
+        assert_eq!(enc(data("k", &["hllo"]), loose(b'e')).unwrap(), "kehllo\n");
+        for key in ["#tag", " ", " \r", "", "\0a"] {
+            assert!(refused(data(key, &["1"]), loose(b'\t')), "{key:?}");
+            assert!(refused(data(key, &[]), loose(b'\t')), "{key:?}");
+        }
+        // `#_defaults_#` is a marker a loose file reads; any other marker is a comment there.
+        let marker = |key: &str| Record::Marker {
+            key: key.into(),
+            values: vec!["a".into()],
+        };
+        assert_eq!(
+            enc(marker("#_defaults_#"), loose(b'\t')).unwrap(),
+            "#_defaults_#\ta\n"
+        );
+        assert!(refused(marker("#_rotate_#"), loose(b'\t')));
+        // A tombstone of a key no row can have deletes nothing, and is no refusal; one that holds
+        // the delimiter in its encoding is.
+        let tomb = |key: &str| Record::Tombstone { key: key.into() };
+        assert_eq!(enc(tomb("#tag"), loose(b'\t')).unwrap(), "#tag\n");
+        assert!(refused(tomb("hello"), loose(b'e')));
     }
 
     #[test]

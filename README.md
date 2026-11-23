@@ -36,7 +36,9 @@ snapshot part (§19.10.3) and does not open the parts before it; `verify` reads 
 Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them
 (`_processLine`): keys and cells without the whitespace at their end and decoded (`<sep>`, `<LF>`),
 `#_defaults_#` lines that fill the empty cells after them, the last line read also without its
-newline, and no row for a missing key. Writes encode cells as TSVZ.py's do. A rewrite writes each
+newline, and no row for a missing key. Writes encode cells as TSVZ.py's do, and refuse what no reader
+would read back: a key that begins with `#` (a comment) or a NUL or is only whitespace, and a cell whose
+encoding holds the delimiter (`-d e`: `<sep>` has an `e`). A rewrite writes each
 line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
 line that set the column count went, and the blank `#_defaults_#` line a `clear` may write before
 the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
@@ -113,8 +115,10 @@ Stores need nothing; the library's documented API does not change.
   `#_defaults_#` lines fill the empty cells after them, a line whose key is only whitespace is
   no row, the last line is read even without its newline, and `get` of a missing key prints
   nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
-  (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, and ends an unterminated last line with a
-  newline before it appends (0.2.0 cut that line).
+  (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, a cell whose encoding holds the delimiter
+  (`-d e`) and a key that no reader would read back (it begins with `#` or a NUL, or is only
+  whitespace), and ends an unterminated last line with a newline before it appends (0.2.0 cut
+  that line).
 - A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
   less memory.
 - Through a handler: `tsvz stop` exits 0 when another stop or a signal stopped the handler first

@@ -737,6 +737,38 @@ fn the_delimiter_option() {
     assert_eq!(quiet, "");
 }
 
+/// A loose `set` writes nothing that a reader could not read back as it was set: not a cell whose
+/// encoding holds the delimiter (`-d e`: `<sep>` has an `e`), not a key that begins with `#` or a
+/// NUL, or is only whitespace. Each is refused, as 0.2.0 refused the first, with nothing written.
+#[test]
+fn a_loose_set_that_could_not_be_read_back_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("t.tsv"), "a\t1\n").unwrap();
+    for args in [
+        &["set", "t.tsv", "#tag", "1"][..],
+        &["set", "t.tsv", " ", "1"],
+        &["set", "t.tsv", "#_rotate_#", "1"],
+    ] {
+        let (code, _, err) = records(dir, args);
+        assert!(
+            code == 1 && err.contains("never be read back"),
+            "{args:?} {err}"
+        );
+        assert_eq!(file(dir, "t.tsv"), "a\t1\n", "{args:?}");
+    }
+    // A comment is no key, and a delete of one is no failure.
+    assert_eq!(records(dir, &["delete", "t.tsv", "#tag"]).0, 0);
+    let (code, _, err) = records(dir, &["-d", "e", "set", "e.tsv", "k", "hello"]);
+    assert!(
+        code == 1 && err.contains("delimiter 'e' inside it"),
+        "{err}"
+    );
+    assert!(fs::read(dir.join("e.tsv")).is_ok_and(|f| f.is_empty()) || !dir.join("e.tsv").exists());
+    assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
+    assert_eq!(file(dir, "e.tsv"), "kehllo\n");
+}
+
 /// Peak RSS in KiB of `tsvz ARGS` run in `dir`, read with wait4 so no other child counts.
 #[cfg(target_os = "linux")]
 #[allow(clippy::zombie_processes)] // reaped by wait4 below, which also reads its peak RSS

@@ -101,6 +101,22 @@ pub(crate) fn unwritable(cell: &str) -> Option<&'static str> {
     ["</sep/>", "</LF/>"].into_iter().find(|t| cell.contains(t))
 }
 
+/// Why `key`, written as [`sanitize`] encodes it, would not read back as that key ([`parse`]):
+/// it begins with a NUL, which a reader drops; it begins with `#` but not `#_defaults_#`, so its
+/// line is a comment; or it is empty or only whitespace, which no reader reads as a key.
+pub(crate) fn unreadable_key(key: &str, d: u8) -> Option<&'static str> {
+    let encoded = sanitize(key, d);
+    if encoded.starts_with('\0') {
+        Some("begins with a NUL, which a reader drops")
+    } else if encoded.starts_with('#') && !encoded.starts_with(DEFAULTS) {
+        Some("begins with `#`, which makes its line a comment")
+    } else if encoded.trim_end_matches(py_space).is_empty() {
+        Some("is empty or only whitespace, which no reader reads as a key")
+    } else {
+        None
+    }
+}
+
 /// A line's cells as TSVZ.py reads it (`_processLine`): without the NULs at its start (and at its
 /// end, for an unterminated last line, which has no `\n` after them) and the CRs and newlines at
 /// its end, split on the delimiter, each cell decoded ([`unsanitize`]). None for a line read as
@@ -174,6 +190,27 @@ fn text_of(raw: &[u8]) -> (Cow<'_, str>, bool) {
         raw
     };
     (String::from_utf8_lossy(raw), terminated)
+}
+
+/// A line's first cell as the file has it, the bytes [`parse`] would decode into the key: after the
+/// NULs at the line's start (and at its end, for an unterminated last line) and before the
+/// delimiter or the CRs and newlines at its end.
+#[cfg(feature = "cli")]
+fn first_cell(raw: &[u8], d: u8) -> &[u8] {
+    let terminated = raw.last() == Some(&b'\n');
+    let mut line = raw;
+    while let [b'\0', rest @ ..] = line {
+        line = rest;
+    }
+    if !terminated {
+        while let [rest @ .., b'\0'] = line {
+            line = rest;
+        }
+    }
+    while let [rest @ .., b'\r' | b'\n'] = line {
+        line = rest;
+    }
+    line.split(|&b| b == d).next().unwrap_or(line)
 }
 
 /// `raw` ending with its `\n`, which an unterminated last line put before other lines needs.
@@ -638,8 +675,8 @@ impl Planner for WithoutPlan {
         if defaults {
             self.valueless |= empty;
         } else if self.row.is_none() {
-            // the line's key as a reader reads it, written so that it reads back the same
-            self.row = Some(sanitize(&key, d).as_bytes().to_vec());
+            // the line's own first cell, as the file has it (also where it is not UTF-8)
+            self.row = Some(first_cell(raw, d).to_vec());
         }
     }
 }
@@ -940,6 +977,52 @@ mod tests {
             without("0\n\n#_defaults_#\tQ\t\n\0x\n", b'\t', &["0"]),
             Some(Some("x\n\n#_defaults_#\tQ\t\n\0x\n".into()))
         );
+    }
+
+    /// The key put in the place of a column-count line that goes is the first line's own cell,
+    /// byte for byte: a key that is not UTF-8 stays what it was (0.2.0 did; a lossy decode made
+    /// it U+FFFD, another key to a reader that decodes it otherwise).
+    #[test]
+    #[cfg(feature = "cli")]
+    fn the_key_that_replaces_a_width_line_is_the_first_cell_as_the_file_has_it() {
+        let text: &[u8] = b"a\n\xe9b\x80 \tv\n";
+        let mut plan = WithoutPlan::new(b'\t', ["a".to_string()].into());
+        for l in text.split_inclusive(|&b| b == b'\n') {
+            plan.line(l);
+        }
+        let kept = plan.finish().unwrap().unwrap();
+        let mut w = Writer::new(kept);
+        for l in text.split_inclusive(|&b| b == b'\n') {
+            w.line(l);
+        }
+        assert_eq!(w.out, b"\xe9b\x80 \n\xe9b\x80 \tv\n");
+        // NULs at the start of the line and at the end of an unterminated one are no part of it.
+        assert_eq!(first_cell(b"\0\0k\0x\n", b'\t'), b"k\0x");
+        assert_eq!(first_cell(b"k\0\0", b'\t'), b"k");
+        assert_eq!(first_cell(b"k\r\n", b'\t'), b"k");
+        assert_eq!(first_cell(b"\0k\0v", 0), b"k");
+    }
+
+    #[test]
+    fn a_key_that_would_not_read_back_is_named() {
+        for (key, d, bad) in [
+            ("#tag", b'\t', true),
+            ("#_defaults_#", b'\t', false),
+            ("#_defaults_#x", b'\t', false),
+            ("#_DEFAULTS_#", b'\t', true),
+            (" ", b'\t', true),
+            ("\r \u{a0}", b'\t', true),
+            ("", b'\t', true),
+            ("\0a", b'\t', true),
+            ("a#", b'\t', false),
+            (" a", b'\t', false),
+            ("\n", b'\t', false), // `<LF>`, read back as a newline
+            ("\t", b'\t', false), // `<sep>`
+            // with the NUL as the delimiter the NUL is encoded away
+            ("\0a", 0, false),
+        ] {
+            assert_eq!(unreadable_key(key, d).is_some(), bad, "{key:?} {d}");
+        }
     }
 
     #[test]
