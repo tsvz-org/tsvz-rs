@@ -352,7 +352,9 @@ impl SnapshotLines {
 /// its member's check, so what it says is only a first look.
 fn first_lines(codec: Codec, reader: &mut impl Read, on_line: &mut dyn FnMut(&Line<'_>) -> bool) {
     let mut decoder = codec::Decoder::new(codec);
-    let mut between = false; // a member ended: what follows begins another
+    // A member ended: what follows begins another. A gzip part may begin with zero padding, which
+    // `codec::read_items` skips before its first member too.
+    let mut between = codec == Codec::Gzip;
     let mut framer = Framer::new();
     let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT], Vec::new());
     loop {
@@ -1647,6 +1649,27 @@ mod tests {
         assert_eq!(keys(&s), ["a"]);
         assert_eq!(keys(&s), keys(&all));
         assert!(s.incomplete() && all.incomplete());
+    }
+
+    #[test]
+    fn a_gzip_snapshot_part_that_begins_with_zero_padding_is_found() {
+        // `read_items` skips zeros before a gzip member, the first one too: the look does.
+        let gz = |t: &[u8]| crate::codec::encode_member(Codec::Gzip, t).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "s.tsvz.gz",
+            &gz(b"#_on_corruption_#\tstop\na\t1\n"),
+        );
+        let mut part = vec![0u8; 5];
+        part.extend(gz(b"#h\n#_snapshot_#\nb\t2\n"));
+        write(dir.path(), "s.tsvz.1.gz", &part);
+        let p = dir.path().join("s.tsvz.gz");
+        let list = parts::list(&p).unwrap();
+        assert!(looks_marked(&list[1], name::format_of(&p).unwrap()));
+        let s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(keys(&s), ["b"]);
+        assert!(!s.incomplete());
     }
 
     #[test]
