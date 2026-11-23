@@ -104,28 +104,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that
   deferrals are noted, not asked.
 
-### A loose scrub and a one-column delete hold every line of the file in memory
-- Kind: deferred
-- What the operator sees: `tsvz scrub` of a loose file, and `delete`, `pop` and `popitem` in a loose file of
-  one column, use memory that grows with the file's length, 3 to 11 times its size, also when most of its lines
-  are old values of a few keys. 0.1.3's scrub needed memory for the live rows only, and its delete appended one
-  line. Peak memory in MiB (0.1.3 in brackets), release builds of the 0.1.4 branch (2026-11-16), on files of
-  60-byte lines: `key%07d`, two cells of 16 hex digits and `some text here` (`k%08d` alone for the delete):
-  - scrub, 200,000 lines of 1,000 keys drawn at random (11.4 MiB): 36 (15);
-  - scrub, 800,000 lines of 200,000 keys drawn at random (45.8 MiB): 176 (127); with the keys in round-robin
-    order, 163 (152);
-  - scrub, 4,000,000 lines of unique keys (228.9 MiB): 1,373 (2,273), less than 0.1.3;
-  - delete of one key, 5,000,000 one-column lines (47.7 MiB): 527 (16) and about 1 s, where 0.1.3 appended one
-    line and took no time (TSVZ.py's own delete: 1,422 MiB, 7 s).
-- Why: the rewrite keeps each line it keeps as the file has it, so it holds every line, each in its own buffer,
-  until it decides which go.
-- Revisit when: 0.2.1. The plan: rewrite in two passes. The first keeps a kind and a key number
-  for each line, and each key's latest line; the second streams the file and writes the kept lines. Memory then
-  follows the keys, as 0.1.3's did. A one-column delete streams the same way: one pass to see which lines go, one
-  to write the rest.
-- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
-  noted, not asked.
-
 ### Three edges of how a loose file names its keys, left to the port of TSVZ.py's line rule
 - Kind: deferred
 - What the operator sees: three narrow cases where tsvz-rs 0.1.4 names a loose line's key differently from

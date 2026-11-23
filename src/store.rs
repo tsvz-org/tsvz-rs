@@ -48,8 +48,8 @@ pub struct Options {
     /// with a warning, instead of failing: the store then holds what could be read, and
     /// [`Store::incomplete`] is true (§21.8.5). Off by default.
     pub skip_unreadable: bool,
-    /// Keep a loose file's lines, for a rewrite that keeps them ([`crate::loose`]).
-    pub(crate) lines: bool,
+    /// Give a loose file's lines to a rewrite's planner ([`crate::loose`]), and read no row.
+    pub(crate) lines: Option<crate::loose::Sink>,
     /// Replay every part, also those before the last snapshot part, where a read otherwise begins
     /// (§19.10.3): a rewrite reads all it compacts. [`Options::verify`] reads every part too
     /// (§19.10.4).
@@ -597,13 +597,13 @@ impl Store {
         let mut below = usize::MAX;
         loop {
             let mut replay = Replay::new(format, options.verify, options.warnings.clone());
-            if options.lines && !format.strict {
-                replay.lines = Some(Vec::new());
+            if !format.strict {
+                replay.lines = options.lines.clone();
             }
             replay.head = options.head && !format.strict;
             // A loose rewrite works on the lines it keeps and reads no row: no key is wanted.
             let no_rows = Scope::Keys(Vec::new());
-            let scope = if options.lines && !format.strict {
+            let scope = if options.lines.is_some() && !format.strict {
                 &no_rows
             } else {
                 &options.scope
@@ -970,12 +970,10 @@ impl Store {
         &self.replay.mismatches
     }
 
-    /// A loose file's lines and the bytes after its last newline, when the store was opened to
-    /// keep them.
-    pub(crate) fn loose_lines(&self) -> Option<(crate::loose::Lines<'_>, &[u8])> {
-        let lines = self.replay.lines.as_deref()?;
-        let lines = crate::loose::Lines::new(lines, self.format.delimiter);
-        Some((lines, &self.tail))
+    /// The bytes after a loose file's last newline, when the store was opened with a planner of
+    /// its lines.
+    pub(crate) fn loose_tail(&self) -> &[u8] {
+        &self.tail
     }
 
     pub fn header(&self) -> Option<&str> {
@@ -1764,19 +1762,25 @@ mod tests {
     fn a_follow_that_completes_a_loose_files_last_line_leaves_no_tail() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "s.tsv", b"a\t1\nb\t2");
+        struct Count(usize);
+        impl crate::loose::Planner for Count {
+            fn line(&mut self, _: &[u8]) {
+                self.0 += 1;
+            }
+        }
+        let count = Arc::new(std::sync::Mutex::new(Count(0)));
         let options = Options {
-            lines: true,
+            lines: Some(count.clone()),
             ..Options::default()
         };
         let mut s = Store::open(&p, options).unwrap();
-        assert_eq!(s.loose_lines().unwrap().1, b"b\t2");
+        assert_eq!(s.loose_tail(), b"b\t2");
         append(&p, b"\n");
         assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
-        let (lines, tail) = s.loose_lines().unwrap();
-        assert_eq!((lines.len(), tail), (2, &b""[..]));
+        assert_eq!((count.lock().unwrap().0, s.loose_tail()), (2, &b""[..]));
         append(&p, b"c\t3");
         assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
-        assert_eq!(s.loose_lines().unwrap().1, b"c\t3");
+        assert_eq!(s.loose_tail(), b"c\t3");
     }
 
     #[test]

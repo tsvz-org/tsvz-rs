@@ -77,3 +77,68 @@ fn a_compressed_loose_delete_holds_no_more_of_a_large_member_than_its_default_si
         "a delete in {text} KiB of text in one member peaked at {kib} KiB, {base} KiB for a len of one row"
     );
 }
+
+/// Write `rows` lines of `keys` keys in turn, of the layout above, to a plain loose file: the
+/// bytes written.
+fn loose_rows(path: &Path, rows: u64, keys: u64) -> u64 {
+    let mut file = BufWriter::new(File::create(path).unwrap());
+    let mut text = 0;
+    for i in 0..rows {
+        let x = i
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let line = format!("key{:07}\t{x:016x}\t{x:016x}\tsome text here\n", i % keys);
+        text += line.len() as u64;
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    file.into_inner().unwrap().sync_all().unwrap();
+    text
+}
+
+/// A loose scrub reads the file twice: the first read keeps a kind for each line and each key's
+/// last line, the second writes the lines kept as it reads them, so memory follows the keys, with
+/// the file held once by the in-place rewrite (to put it back should the write fail). 0.2.0 held
+/// every line, each in a buffer of its own: on 400,000 lines of 1,000 keys (23 MiB), its test
+/// build peaked 69 MiB above a `len` of a one-row file, and 0.2.1's 25 MiB above it (2026-11-23);
+/// the test allows one and a half times the file.
+#[test]
+fn a_loose_scrub_holds_the_file_once_and_what_its_keys_keep() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("tiny.tsv"), "a\t1\n").unwrap();
+    let (_, base) = peak_rss_kib(dir, &["len", "tiny.tsv"]);
+    let text = loose_rows(&dir.join("big.tsv"), 400_000, 1_000) as i64 / 1024;
+    let (code, kib) = peak_rss_kib(dir, &["scrub", "big.tsv"]);
+    assert_eq!(code, 0);
+    assert!(
+        kib - base < text * 3 / 2,
+        "a scrub of {text} KiB peaked at {kib} KiB, {base} KiB for a len of one row"
+    );
+}
+
+/// A delete in a one-column loose file reads it twice too: which lines go, then the rest written
+/// as they are read, and held once more by the in-place rewrite. 0.2.0 held every line: on
+/// 1,000,000 keys alone (9.5 MiB), its test build peaked 106 MiB above a `len` of a one-row file,
+/// and 0.2.1's 23 MiB above it (2026-11-23); the test allows three times the file.
+#[test]
+fn a_one_column_delete_holds_the_file_twice_at_most() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("tiny.tsv"), "a\t1\n").unwrap();
+    let (_, base) = peak_rss_kib(dir, &["len", "tiny.tsv"]);
+    let mut file = BufWriter::new(File::create(dir.join("one.tsv")).unwrap());
+    for i in 0..1_000_000 {
+        writeln!(file, "k{i:08}").unwrap();
+    }
+    file.into_inner().unwrap().sync_all().unwrap();
+    let text = std::fs::metadata(dir.join("one.tsv")).unwrap().len() as i64 / 1024;
+    let (code, kib) = peak_rss_kib(dir, &["delete", "one.tsv", "k00000005"]);
+    assert_eq!(code, 0);
+    assert!(
+        kib - base < text * 3,
+        "a one-column delete in {text} KiB peaked at {kib} KiB, {base} KiB for a len of one row"
+    );
+    // counted a buffer at a time: the parent's own peak counts in a child's (above)
+    let left = std::io::BufReader::new(File::open(dir.join("one.tsv")).unwrap());
+    assert_eq!(std::io::BufRead::lines(left).count(), 999_999);
+}

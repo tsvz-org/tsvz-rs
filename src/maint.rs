@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::escape;
 use crate::loose;
@@ -240,13 +241,14 @@ pub(crate) fn rewrite(
     recovery: Option<&Path>,
 ) -> Result<Option<bool>, Error> {
     let io = |e: io::Error| Error::io(path, e);
-    let raw = match codec {
+    let raw: std::borrow::Cow<[u8]> = match codec {
         Some(c) if !content.is_empty() => codec::encode_members(c, content, member_size as usize)
             .ok_or_else(|| Error::UnsupportedCodec {
-            path: path.to_path_buf(),
-            codec: c.name(),
-        })?,
-        _ => content.to_vec(),
+                path: path.to_path_buf(),
+                codec: c.name(),
+            })?
+            .into(),
+        _ => content.into(),
     };
     let file = OpenOptions::new()
         .read(true)
@@ -259,7 +261,7 @@ pub(crate) fn rewrite(
     }
     let mut old = Vec::new();
     (&file).read_to_end(&mut old).map_err(io)?;
-    if old == raw {
+    if old[..] == raw[..] {
         return Ok(Some(false));
     }
     // Reserve the space first (§19.8), so a full disk or a file-size limit refuses the rewrite
@@ -455,9 +457,48 @@ fn whole(options: &Options) -> Options {
         verify: false,
         skip_unreadable: false,
         every_part: true,
-        lines: true,
+        lines: None,
         ..options.clone()
     }
+}
+
+/// The delimiter of the loose file `store` as a read takes it (`-d`, else its name's), or None for
+/// a strict store.
+fn loose_delimiter(store: &Path, options: &Options) -> Result<Option<u8>, Error> {
+    let format = crate::name::format_of(store).ok_or_else(|| Error::BadPath(store.into()))?;
+    Ok((!format.strict).then(|| options.delimiter.unwrap_or(format.delimiter)))
+}
+
+/// A whole read of a loose file that gives its lines to `plan` (and rows to no one).
+fn planned<P: loose::Planner + 'static>(options: &Options, plan: &Arc<Mutex<P>>) -> Options {
+    let sink: loose::Sink = plan.clone();
+    Options {
+        lines: Some(sink),
+        ..whole(options)
+    }
+}
+
+/// The second read of a loose rewrite: the lines `kept` keeps, as the file has them or as the
+/// plan puts them, and the bytes after its last newline. None when the file no longer gives the
+/// lines the plan was made from (it changed between the reads).
+fn write_kept(
+    store: &Path,
+    options: &Options,
+    kept: loose::Kept,
+) -> Result<Option<Vec<u8>>, Error> {
+    let writer = Arc::new(Mutex::new(loose::Writer::new(kept)));
+    let quiet = Options {
+        warnings: None, // the first read said them
+        ..options.clone()
+    };
+    let again = Store::open(store, planned(&quiet, &writer))?;
+    let mut w = writer.lock().expect("a planner never panics");
+    if !w.same_lines() {
+        return Ok(None);
+    }
+    let mut content = std::mem::take(&mut w.out);
+    content.extend_from_slice(again.loose_tail());
+    Ok(Some(content))
 }
 
 /// Compact a store with §19.4 fidelity (§20.2 `scrub`). A one-part store is compacted in place
@@ -610,11 +651,14 @@ fn attempt(
             .collect::<Result<_, _>>(),
         Step::Again
     );
+    // A loose file is planned in this read, and written in a second (`write_kept`).
+    let plan =
+        loose_delimiter(store, options)?.map(|d| Arc::new(Mutex::new(loose::ScrubPlan::new(d))));
     let s = read!(
-        if multi {
-            Store::open_prefix(store, whole(options), prefix.len())
-        } else {
-            Store::open(store, whole(options))
+        match (&plan, multi) {
+            (Some(plan), _) => Store::open(store, planned(options, plan)),
+            (None, true) => Store::open_prefix(store, whole(options), prefix.len()),
+            (None, false) => Store::open(store, whole(options)),
         },
         Step::Again
     );
@@ -716,8 +760,14 @@ fn attempt(
     // With no part before it (a one-part store, or part 0), there is nothing to skip: the
     // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), and
     // the bytes after its last newline, which TSVZ.py reads as a line.
-    let content = match (&earlier, s.loose_lines()) {
-        (_, Some((lines, tail))) => [loose::scrub(&lines), tail.to_vec()].concat(),
+    let content = match (&earlier, plan) {
+        (_, Some(plan)) => {
+            let kept = plan.lock().expect("a planner never panics").finish();
+            match read!(write_kept(store, options, kept), Step::Again) {
+                Some(content) => content,
+                None => return Ok(Step::Again(None)), // the file changed between the reads
+            }
+        }
         (None, None) => snapshot(&s).into_bytes(),
         (Some(earlier), None) => match read!(
             live_after_any_prefix(store, options, others, earlier),
@@ -1422,7 +1472,12 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
         } else {
             None
         };
-        let s = Store::open(store, whole(options))?;
+        let plan = loose_delimiter(store, options)?
+            .map(|d| Arc::new(Mutex::new(loose::ClearPlan::new(d))));
+        let s = match &plan {
+            Some(plan) => Store::open(store, planned(options, plan))?,
+            None => Store::open(store, whole(options))?,
+        };
         if s.incomplete() {
             let why = if s.stopped().is_some() {
                 "the read stopped at damaged data (§4.10)"
@@ -1460,8 +1515,8 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 store.display()
             )));
         }
-        let content = match s.loose_lines() {
-            Some((lines, _)) => loose::cleared(&lines),
+        let content = match &plan {
+            Some(plan) => plan.lock().expect("a planner never panics").finish(),
             None => {
                 let mut content = String::new();
                 if let Some(h) = s.header() {
@@ -1592,30 +1647,33 @@ pub(crate) fn delete_loose(
                 .append(&tombstones)?;
             return Ok(LooseDelete::Appended(tombstones.len()));
         }
-        let s = Store::open(store, whole(options))?;
+        // One column: planned in a whole read, written in a second.
+        let gone: std::collections::HashSet<String> = asked
+            .iter()
+            .map(|&(given, name)| if name.is_empty() { given } else { name })
+            .map(str::to_string)
+            .collect();
+        let d = loose_delimiter(store, options)?.expect("a loose file");
+        let plan = Arc::new(Mutex::new(loose::WithoutPlan::new(d, gone)));
+        let s = Store::open(store, planned(options, &plan))?;
         if s.incomplete() {
             return Err(Error::Refused(format!(
                 "{}: delete skipped: the file could not be read whole; nothing was written",
                 store.display()
             )));
         }
-        let (lines, tail) = s
-            .loose_lines()
-            .expect("a loose file read whole keeps its lines");
-        // a key is named without the whitespace at its end, one of only whitespace as given
-        let gone: std::collections::HashSet<&str> = asked
-            .iter()
-            .map(|&(given, name)| if name.is_empty() { given } else { name })
-            .collect();
-        let content = match loose::without(&lines, &gone) {
+        let decided = plan.lock().expect("a planner never panics").finish();
+        let kept = match decided {
             None => continue, // the file changed since its first line was read
             Some(None) => return Ok(LooseDelete::Nothing), // no line is one of the keys
-            Some(Some(content)) => content,
+            Some(Some(kept)) => kept,
+        };
+        let Some(content) = write_kept(store, options, kept)? else {
+            continue; // the file changed between the reads
         };
         if s.damaged() {
             backup(&part.path, options)?;
         }
-        let content = [content, tail.to_vec()].concat();
         match rewrite(
             &part.path,
             &content,

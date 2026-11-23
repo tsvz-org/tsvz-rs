@@ -183,9 +183,9 @@ pub struct Replay {
     /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
     /// line.
     pub(crate) one_column: Option<bool>,
-    /// A loose file's committed lines, without their `\n`, kept for a rewrite that keeps them
-    /// ([`crate::loose`]); None unless asked for.
-    pub(crate) lines: Option<Vec<Vec<u8>>>,
+    /// Where a loose file's committed lines go, without their `\n`, for a rewrite that plans
+    /// from them or writes them ([`crate::loose`]); None unless asked for.
+    pub(crate) lines: Option<crate::loose::Sink>,
     /// Stop reading a loose file at its first keyed line.
     pub(crate) head: bool,
     first_line: bool,
@@ -392,27 +392,42 @@ impl Replay {
             marked = [mark, body].concat();
             body = &marked;
         }
+        if let (false, Some(lines)) = (self.format.strict, &self.lines) {
+            // A rewrite plans from the lines as the file has them, but for their `\n`, and reads
+            // no row.
+            if self.warn.is_some() && std::str::from_utf8(body).is_err() {
+                self.not_utf8(line);
+            }
+            let raw = &line.raw[..line.raw.len() - 1];
+            let raw: Cow<[u8]> = if mark.is_empty() {
+                Cow::Borrowed(raw)
+            } else {
+                Cow::Owned([mark, raw].concat())
+            };
+            lines.lock().expect("a planner never panics").line(&raw);
+            return true;
+        }
         let text = String::from_utf8_lossy(body);
         if matches!(text, Cow::Owned(_)) {
-            self.warn(
-                Some(line.offset),
-                format!(
-                    "line {} is not valid UTF-8; replaced the bad bytes with U+FFFD",
-                    line.number
-                ),
-            );
+            self.not_utf8(line);
         }
         if self.format.strict {
             self.strict_line(&text, line, first, sink);
         } else {
-            if let Some(lines) = &mut self.lines {
-                // As the file has it, but for its `\n`: a rewrite keeps the lines it keeps.
-                lines.push([mark, &line.raw[..line.raw.len() - 1]].concat());
-            }
             self.loose_line(&text, first, sink);
             return !(self.head && self.one_column.is_some());
         }
         true
+    }
+
+    fn not_utf8(&self, line: &Line<'_>) {
+        self.warn(
+            Some(line.offset),
+            format!(
+                "line {} is not valid UTF-8; replaced the bad bytes with U+FFFD",
+                line.number
+            ),
+        );
     }
 
     /// Feed a line's raw bytes to every armed digest but `except` (§7.4).
@@ -956,15 +971,24 @@ mod tests {
             delimiter: b'\t',
             strict: false,
         };
+        struct Kept(Vec<Vec<u8>>);
+        impl crate::loose::Planner for Kept {
+            fn line(&mut self, raw: &[u8]) {
+                self.0.push(raw.to_vec());
+            }
+        }
+        let kept = Arc::new(Mutex::new(Kept(Vec::new())));
         let mut replay = Replay::new(loose, false, None);
-        replay.lines = Some(Vec::new());
+        replay.lines = Some(kept.clone());
         replay.begin_part(Path::new("s.tsv"), true);
         let mut rows = Rows::default();
         Framer::new().push(b"\xef\xbb\xbfa\t1\r\n#c\r\r\n\nb\t2\n", &mut |l| {
             replay.line(l, &mut rows)
         });
-        let kept: Vec<&[u8]> = replay.lines.iter().flatten().map(|l| &l[..]).collect();
-        assert_eq!(kept, [&b"\xef\xbb\xbfa\t1\r"[..], b"#c\r\r", b"", b"b\t2"]);
+        assert_eq!(
+            kept.lock().unwrap().0,
+            [&b"\xef\xbb\xbfa\t1\r"[..], b"#c\r\r", b"", b"b\t2"]
+        );
     }
 
     #[test]
