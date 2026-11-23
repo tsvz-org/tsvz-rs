@@ -190,7 +190,8 @@ fn deliver(
             let files = if !stopping {
                 Err("the handler is still serving the store, so the files were left alone".into())
             } else if !pointer::wait_gone(&ctx.store, pid, Instant::now() + STOP_WAIT) {
-                // (a handler that died leaves its pointer file: it is waited for as `tsvz stop` does)
+                // (a handler that died leaves its pointer file, which still names it: the wait runs
+                // its time out and the row is printed; docs/limitations.md says how 0.2.2 tells it)
                 Err(format!(
                     "the handler has not finished stopping within {} s, so the files were left alone",
                     STOP_WAIT.as_secs()

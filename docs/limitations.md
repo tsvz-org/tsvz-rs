@@ -158,11 +158,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   connection unanswered for a reason of its own (no descriptor left, no thread to start): `tsvz stop` takes that for
   "stopping already", waits 30 s and fails with `has not stopped within 30 s` while the handler serves (0.2.0 failed
   at once). (2) A handler killed after it replied to a stop and before it removed its pointer file leaves the file,
-  which still names it: `tsvz stop` waits 30 s and fails (0.2.0 gave 0 after 10 s).
-- Why: the stop tells a handler that is gone from one that is not by the pointer file's name alone.
+  which still names it: `tsvz stop` waits 30 s and fails (0.2.0 gave 0 after 10 s). (3) The same stale pointer after
+  a routed `pop` or `popitem`: a handler that dies after answering the pop and before the command prints the row (the
+  put-back path, `cli::route`) leaves its pointer, so the command waits 30 s for it to go, leaves the files alone and
+  prints the row on standard error (0.2.0 printed the row at once and never put it back; 0.2.1's first build put it
+  back at once).
+- Why: the stop, and the put-back after a routed pop, tell a handler that is gone from one that is not by the
+  pointer file's name alone.
 - Revisit when: 0.2.2. The plan: also try the pointer file's `flock`, which the system releases when the handler's
   process ends (gone when it can be taken), and after a close with no answer ask once more after a short wait: a
-  handler that answers is serving, and the stop says so at once.
+  handler that answers is serving, and the stop says so at once. The put-back asks the same question
+  (`pointer::wait_gone`), so a dead handler's row goes back at once.
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
@@ -230,11 +236,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Bulk input to a loose file is read by its own rule, not the loose line rule
 - Kind: deferred
 - What the operator sees: `tsvz set f.tsv -` (and `append`, `delete -`) with a loose-format payload drops a
-  `#_defaults_#` line as a comment instead of writing it, and a key with NULs at its start keeps them, where a reader
-  reads the key without them. 0.2.0 does the same.
-- Why: `ops::parse_records` tests the raw first field for a comment and strips no NULs.
+  `#_defaults_#` line as a comment instead of writing it, where a reader reads it as the defaults. 0.2.0 does the
+  same. (The NULs at a line's start are dropped as a reader drops them, since the 0.2.1 fix round.)
+- Why: `ops::parse_records` tests the raw first field for a comment, and a `#_defaults_#` line is one.
 - Revisit when: 0.2.2. The plan: give bulk input of a loose format to `loose::parse`, the one rule a reader uses (a
-  `#_defaults_#` line is a record, NULs at a line's start are dropped, a comment is skipped).
+  `#_defaults_#` line is a record, a comment is skipped).
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
@@ -264,10 +270,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A loose `delete` names a key with a newline or a delimiter at its end by the key without it
 - Kind: deferred
 - What the operator sees: `tsvz delete f.tsv $'a\n'` writes the tombstone for `a`, and deletes it, though `a` and
-  `a<LF>` are two keys (a key with a NUL at its start the same, as its NUL-less form). 0.2.0 does the same.
+  `a<LF>` are two keys (a key with a NUL at its start the same, as its NUL-less form). 0.2.0 does the same. The
+  same in `setdefault`: `setdefault f.tsv '#_defaults_# ' x y` (a blank at the key's end) passes its marker-key
+  check, which looks at the key untrimmed, and writes a line that a reader takes for the defaults line and prints as
+  a row, exit 0 (`setdefault f.tsv '#_defaults_#' x` is refused, exit 2; 0.2.0 wrote the same line but applied no
+  defaults).
 - Why: the key is trimmed of whitespace before it is encoded, where a reader trims the cell as the file has it.
 - Revisit when: 0.2.2. The plan: encode the key, then trim it (`loose::sanitize` and `py_space`), as a reader names
-  it.
+  it, before `delete` makes its names and `setdefault` its marker-key check.
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
@@ -280,3 +290,29 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 0.2.2. The plan: make the backup once, when an attempt is about to commit its rewrite.
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
+
+### A loose delete's guard does not cover a first keyed line appended after the file was read
+- Kind: deferred
+- What the operator sees: a second opinion's reading of the code, not reproduced. An empty (or comment-only) loose
+  file; `tsvz delete f.tsv k` takes the file's size and last bytes (nothing); another process appends `a<TAB>1`; the
+  delete's head read sees two columns; a `clear` (which rewrites the file in place, the same inode) empties it again;
+  under the lock the file is as it was first seen (same inode, no shorter, the same empty end), so `k` is appended and
+  `f.tsv` now holds one row, `k`. 0.2.0 appended after any clear, a wider window; 0.2.1's first build refused it (its
+  stamp changed).
+- Why: the decision (the column count) rests on the bytes up to the first keyed line, which here lie past the size the
+  guard covers.
+- Revisit when: 0.2.2. The plan: append only when the head read's first keyed line ends within the size seen (else
+  read again), or read the head again under the lock.
+- Noted: 2026-11-23, in the 0.2.1 re-review of the final-review fix round (E); a deferral under the user's standing
+  rule that deferrals are noted, not asked.
+
+### The header of a loose file keeps the NULs at the end of an unterminated first line comment
+- Kind: deferred
+- What the operator sees: `header()` of a loose file whose line 1 is a comment with no newline and ends in NULs (a
+  torn write) returns the comment with those NULs; a read of the file strips them as TSVZ.py does. A trivial
+  difference in the library's `header()`; the command line prints no header.
+- Why: `header()` trims the NULs at the start of line 1 and not the ones at the end of an unterminated one.
+- Revisit when: 0.2.2. The plan: one more trim of the NULs at the end when line 1 is unterminated, as `loose::parse`
+  does.
+- Noted: 2026-11-23, in the 0.2.1 re-review of the final-review fix round (F5); a deferral under the user's standing
+  rule that deferrals are noted, not asked.

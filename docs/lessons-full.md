@@ -181,8 +181,9 @@ entries go last, in the same commit as the change:
 - Changed: a loose `set` (and every loose write through `Writer`) refuses a cell whose encoding still holds the
   delimiter (`-d e` and `set k hello`: `<sep>` has an `e`, so the line read back as `h<s` and `p>llo`), and a key that
   could never be read back: one that begins with `#` (a comment), begins with a NUL (a reader drops it) or is only
-  whitespace (no key). A tombstone of such a key is still written (it deletes nothing). Before, 0.2.1's build wrote
-  all of them with exit 0.
+  whitespace (no key). A key alone is refused too, since in a file of one column (or with no keyed line yet) it is a
+  row; `delete` drops the names no row can have, so a delete of one writes nothing and is no failure. Before, 0.2.1's
+  build wrote all of them with exit 0.
 - Why we had to change: 0.2.0 refused any delimiter in a cell, which made a cell holding a delimiter unwritable;
   0.2.1 encoded it as TSVZ.py does (`<sep>`) and so dropped the refusal, but the encoding itself holds the letters
   `s e p L F < > /`, which a delimiter can be, and the keys a reader skips were written as before (0.2.0 wrote
@@ -190,7 +191,9 @@ entries go last, in the same commit as the change:
   0.2.1 final review (R07a-1, R08-1 to R08-3), built in the fix round.
 - Original design was wrong because: the encoder was tested on the cells it was meant to carry, not on the
   inputs the refusal it replaced had covered, and nothing asked the reader's own rule whether the line it was about to
-  write gave the key and cells back.
+  write gave the key and cells back. The first fix round then exempted a key alone ("a tombstone deletes
+  nothing"), true of the file it had in mind (more than one column) and false of a file of one column, which the
+  re-review found; the exemption was a second encoding of the same promise, tried on one file shape.
 - Lesson: when a port replaces a refusal with an encoding, run the reader's own rule over the output for every input the
   refusal covered; an encoding is a promise only as wide as the cases it was tried on.
 

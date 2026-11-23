@@ -787,6 +787,13 @@ fn a_loose_key_alone_that_could_not_be_read_back_is_refused_and_its_delete_is_no
         assert_eq!(records(dir, &["delete", "one.tsv", key]).0, 0, "{key:?}");
         assert_eq!(file(dir, "one.tsv"), "a\nb\n", "{key:?}");
     }
+    // At more than one column a delete of it would be a tombstone: none is written, and `b` goes.
+    fs::write(dir.join("m.tsv"), "a\t1\nb\t2\n").unwrap();
+    assert_eq!(records(dir, &["delete", "m.tsv", "#tag"]).0, 0);
+    assert_eq!(file(dir, "m.tsv"), "a\t1\nb\t2\n");
+    let (code, _, err) = records(dir, &["delete", "m.tsv", "#tag", "b"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(file(dir, "m.tsv"), "a\t1\nb\t2\nb\n");
     // A file with no keyed line yet: the same.
     fs::write(dir.join("new.tsv"), "#h\n").unwrap();
     assert_eq!(records(dir, &["set", "new.tsv", "#tag"]).0, 1);
