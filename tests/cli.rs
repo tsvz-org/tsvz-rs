@@ -768,6 +768,63 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
     assert_eq!(file(dir, "e.tsv"), "kehllo\n");
 }
 
+/// A key alone (`set FILE KEY`) is refused as a key with a value is: in a file of one column, or
+/// with no keyed line yet, it is a row, and one no reader reads back (0.2.0 wrote `#tag` and
+/// listed ` `; 0.2.1's first build wrote both and listed neither). A `delete` of such a key writes
+/// nothing and is no failure, and the keys beside it are deleted.
+#[test]
+fn a_loose_key_alone_that_could_not_be_read_back_is_refused_and_its_delete_is_not() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("one.tsv"), "a\nb\n").unwrap();
+    for key in [" ", "#tag", "#_rotate_#"] {
+        let (code, _, err) = records(dir, &["set", "one.tsv", key]);
+        assert!(
+            code == 1 && err.contains("never be read back"),
+            "{key:?}: {code} {err}"
+        );
+        assert_eq!(file(dir, "one.tsv"), "a\nb\n", "{key:?}");
+        assert_eq!(records(dir, &["delete", "one.tsv", key]).0, 0, "{key:?}");
+        assert_eq!(file(dir, "one.tsv"), "a\nb\n", "{key:?}");
+    }
+    // A file with no keyed line yet: the same.
+    fs::write(dir.join("new.tsv"), "#h\n").unwrap();
+    assert_eq!(records(dir, &["set", "new.tsv", "#tag"]).0, 1);
+    assert_eq!(file(dir, "new.tsv"), "#h\n");
+    // `-d e`: `hello` holds the delimiter in itself, so no row of that file has it; `xyz` goes.
+    fs::write(dir.join("d.tsv"), "ae1\nxyze2\n").unwrap();
+    let (code, _, err) = records(dir, &["-d", "e", "delete", "d.tsv", "hello", "xyz"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(records(dir, &["-d", "e", "keys", "d.tsv"]).1, "a\n");
+    assert_eq!(file(dir, "d.tsv"), "ae1\nxyze2\nxyz\n");
+}
+
+/// Bulk input to a loose file loses the NULs at a line's start, as a reader does (0.2.0 and the
+/// 0.2.1 build before it wrote the line with them, and a reader read the key without them; the
+/// key check of 0.2.1's first fix round refused the whole input for it).
+#[test]
+fn bulk_input_to_a_loose_file_drops_the_nuls_at_the_start_of_a_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let (code, _, err) = run_in(
+        dir,
+        &["--format", "records", "set", "b.tsv", "-"],
+        b"a\t1\n\0c\t2\n\0\0\nb\t3\n",
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(file(dir, "b.tsv"), "a\t1\nc\t2\nb\t3\n");
+    assert_eq!(records(dir, &["keys", "b.tsv"]).1, "a\nc\nb\n");
+    // A key alone: the tombstone of the key a reader reads.
+    let (code, _, err) = run_in(
+        dir,
+        &["--format", "records", "delete", "b.tsv", "-"],
+        b"\0a\n",
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(records(dir, &["keys", "b.tsv"]).1, "c\nb\n");
+    assert_eq!(file(dir, "b.tsv"), "a\t1\nc\t2\nb\t3\na\n");
+}
+
 /// Peak RSS in KiB of `tsvz ARGS` run in `dir`, read with wait4 so no other child counts.
 #[cfg(target_os = "linux")]
 #[allow(clippy::zombie_processes)] // reaped by wait4 below, which also reads its peak RSS

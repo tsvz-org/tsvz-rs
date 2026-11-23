@@ -747,6 +747,9 @@ impl Store {
                 }
                 self.skip(i, part, &e);
             }
+            if i == start && judge.verdict == Some(true) {
+                hold.release(); // the start is confirmed: what it said is said, the rest as it comes
+            }
             if self.replay.stopped.is_some() {
                 break; // a stop policy ends the read of the whole store (§4.10)
             }
@@ -1666,6 +1669,43 @@ mod tests {
         assert!(!said.iter().any(|m| m.contains("not verified")), "{said:?}");
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("reading stopped there"), "{said:?}");
+    }
+
+    #[test]
+    fn a_read_from_a_confirmed_snapshot_part_says_its_warnings_before_it_reads_on() {
+        // The snapshot part is confirmed by its first lines; the damage it meets after them is
+        // said at once, not kept until every later part is read (memory, and the order of what is
+        // said and done). The sink appends to the last part when it first hears: said before the
+        // last part is read, the read sees the row.
+        let gz = |t: &[u8]| crate::codec::encode_member(Codec::Gzip, t).unwrap();
+        let mut part1 = gz(b"#_snapshot_#\nb\t2\n");
+        let mut bad = gz(b"x\t9\n");
+        let n = bad.len();
+        bad[n - 8] ^= 1; // the member's checksum
+        part1.extend(bad);
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "s.tsvz.gz", &gz(b"a\t1\n"));
+        write(dir.path(), "s.tsvz.1.gz", &part1);
+        let last = write(dir.path(), "s.tsvz.2.gz", &gz(b"c\t3\n"));
+        let heard = Arc::new(Mutex::new(0));
+        let (count, to) = (heard.clone(), last.clone());
+        let options = Options {
+            warnings: Some(Arc::new(move |_: &Warning| {
+                let mut count = count.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    append(&to, &gz(b"d\t4\n"));
+                }
+            })),
+            ..Options::default()
+        };
+        let s = Store::open(&dir.path().join("s.tsvz.gz"), options).unwrap();
+        assert_eq!(*heard.lock().unwrap(), 1);
+        assert!(keys(&s).contains(&"d".to_string()), "{:?}", keys(&s));
+        assert!(
+            !keys(&s).contains(&"a".to_string()),
+            "begun at the snapshot part"
+        );
     }
 
     #[test]

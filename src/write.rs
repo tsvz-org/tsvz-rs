@@ -166,19 +166,16 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
             }
             // A delimiter that is a character of `<sep>`, `<LF>` or their escapes (`-d e`) is in
             // the encoding itself, and a reader would cut the cell there.
-            if crate::loose::sanitize(field, d).as_bytes().contains(&d) {
+            if crate::loose::delimiter_in_encoding(field, d) {
                 return Err(Error::Refused(format!(
                     "{field:?} is written with the delimiter {:?} inside it, which a loose file reads as the end of a cell; nothing was written",
                     d as char
                 )));
             }
         }
-        // (a tombstone of such a key deletes nothing, and a reader skips its line)
-        let unreadable = match record {
-            Record::Tombstone { .. } => None,
-            _ => crate::loose::unreadable_key(key, d),
-        };
-        if let Some(why) = unreadable {
+        // A key alone too: in a file of one column, or with no keyed line yet, it is a row. A
+        // delete never asks for such a tombstone ([`crate::maint::delete_loose`] drops those names).
+        if let Some(why) = crate::loose::unreadable_key(key, d) {
             return Err(Error::Refused(format!(
                 "the key {key:?} {why}, so it could never be read back from a loose file; nothing was written"
             )));
@@ -261,19 +258,21 @@ pub(crate) struct Seen {
 }
 
 impl Seen {
+    /// How `path` is now; None when it was truncated between its length and its last bytes being
+    /// read (the caller reads it again).
     #[cfg(feature = "cli")]
-    pub(crate) fn of(path: &Path) -> io::Result<Seen> {
+    pub(crate) fn of(path: &Path) -> io::Result<Option<Seen>> {
         use std::os::unix::fs::MetadataExt;
         let file = File::open(path)?;
         let meta = file.metadata()?;
         let want = meta.len().min(crate::store::CHECK_BYTES);
-        let mut tail = vec![0u8; want as usize];
-        file.read_exact_at(&mut tail, meta.len() - want)?;
-        Ok(Seen {
-            ino: meta.ino(),
-            size: meta.len(),
-            tail,
-        })
+        Ok(
+            bytes_at(&file, meta.len() - want, want as usize)?.map(|tail| Seen {
+                ino: meta.ino(),
+                size: meta.len(),
+                tail,
+            }),
+        )
     }
 
     /// Whether `file` is the file seen, no shorter, with the bytes it ended in.
@@ -283,9 +282,19 @@ impl Seen {
         if meta.ino() != self.ino || meta.len() < self.size {
             return Ok(false);
         }
-        let mut tail = vec![0u8; self.tail.len()];
-        file.read_exact_at(&mut tail, self.size - self.tail.len() as u64)?;
-        Ok(tail == self.tail)
+        let at = self.size - self.tail.len() as u64;
+        Ok(bytes_at(file, at, self.tail.len())?.is_some_and(|tail| tail == self.tail))
+    }
+}
+
+/// The `len` bytes of `file` at `at`; None when it ends before them: a file that another process
+/// truncated since its length was taken is a file that changed, not an I/O error.
+fn bytes_at(file: &File, at: u64, len: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = vec![0u8; len];
+    match file.read_exact_at(&mut bytes, at) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -862,11 +871,14 @@ mod tests {
             "#_defaults_#\ta\n"
         );
         assert!(refused(marker("#_rotate_#"), loose(b'\t')));
-        // A tombstone of a key no row can have deletes nothing, and is no refusal; one that holds
-        // the delimiter in its encoding is.
+        // A key alone is refused as a key with a value is: in a file of one column, or with no
+        // keyed line yet, it is a row. (`maint::delete_loose` asks for no tombstone of such a key.)
         let tomb = |key: &str| Record::Tombstone { key: key.into() };
-        assert_eq!(enc(tomb("#tag"), loose(b'\t')).unwrap(), "#tag\n");
+        for key in ["#tag", " ", "\0a"] {
+            assert!(refused(tomb(key), loose(b'\t')), "{key:?}");
+        }
         assert!(refused(tomb("hello"), loose(b'e')));
+        assert_eq!(enc(tomb("k"), loose(b'\t')).unwrap(), "k\n");
     }
 
     #[test]
@@ -1287,7 +1299,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
         fs::write(&p, "a\t1\nb\t2\n").unwrap();
-        let seen = Seen::of(&p).unwrap();
+        let seen = Seen::of(&p).unwrap().unwrap();
         let gone = [Record::from_args("a", &[])];
         let mut w = Writer::open(&p).unwrap();
         // another writer appended meanwhile: the head is as it was
@@ -1312,9 +1324,23 @@ mod tests {
         fs::write(&p, "a\t1\nb\t2\n").unwrap();
         assert!(!w.append_if_grown(&gone, &seen).unwrap());
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n", "nothing written");
-        let now = Seen::of(&p).unwrap();
+        let now = Seen::of(&p).unwrap().unwrap();
         assert!(w.append_if_grown(&gone, &now).unwrap());
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\na\n");
+    }
+
+    #[test]
+    fn bytes_beyond_the_end_of_a_file_truncated_meanwhile_are_none_not_an_error() {
+        // `Seen::of` and `grew` take a length, then read the bytes before it: another process
+        // may truncate the file between the two.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        let file = File::open(&p).unwrap();
+        assert_eq!(bytes_at(&file, 4, 4).unwrap().unwrap(), b"b\t2\n");
+        fs::write(&p, "a\t1\n").unwrap(); // the same inode, shorter
+        assert_eq!(bytes_at(&file, 4, 4).unwrap(), None);
+        assert_eq!(bytes_at(&file, 0, 0).unwrap().unwrap(), b"");
     }
 
     #[test]

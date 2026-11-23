@@ -101,6 +101,12 @@ pub(crate) fn unwritable(cell: &str) -> Option<&'static str> {
     ["</sep/>", "</LF/>"].into_iter().find(|t| cell.contains(t))
 }
 
+/// Whether `field`, written as [`sanitize`] encodes it, holds the delimiter: a delimiter that is a
+/// character of `<sep>`, `<LF>` or their escapes (`-d e`), where a reader cuts the cell.
+pub(crate) fn delimiter_in_encoding(field: &str, d: u8) -> bool {
+    sanitize(field, d).as_bytes().contains(&d)
+}
+
 /// Why `key`, written as [`sanitize`] encodes it, would not read back as that key ([`parse`]):
 /// it begins with a NUL, which a reader drops; it begins with `#` but not `#_defaults_#`, so its
 /// line is a comment; or it is empty or only whitespace, which no reader reads as a key.

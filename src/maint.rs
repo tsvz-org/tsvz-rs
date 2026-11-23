@@ -1542,7 +1542,7 @@ pub(crate) enum LooseDelete {
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
 /// deletion, appended for each key asked, live or not, as a reader names it (without the
-/// whitespace at its end; a key with nothing left names none), and only while the file is as the
+/// whitespace at its end; a key with nothing left, or that no row can have, names none), and only while the file is as the
 /// read found it; one column, where a key alone is a row and no line can delete, a rewrite without
 /// the lines of the keys ([`loose::WithoutPlan`]); no keyed line yet, nothing, since a key alone
 /// would set one column and be a row. The file is read only as far as its first keyed line (a
@@ -1554,10 +1554,18 @@ pub(crate) fn delete_loose(
     options: &Options,
     keys: &[String],
 ) -> Result<LooseDelete, Error> {
+    let d = loose_delimiter(store, options)?.expect("a loose file");
+    // The names a reader names, less those no row can have: a key that begins with `#` (a comment)
+    // or only whitespace, or whose encoding holds the delimiter (`-d e`). Nothing is written for
+    // one, as for a key that is not there; for a key alone in a file of one column it would be a row.
     let names: Vec<&str> = keys
         .iter()
         .map(|k| k.trim_end_matches(loose::py_space))
-        .filter(|n| !n.is_empty())
+        .filter(|n| {
+            !n.is_empty()
+                && loose::unreadable_key(n, d).is_none()
+                && !loose::delimiter_in_encoding(n, d)
+        })
         .collect();
     let mut meanwhile = "rewritten"; // what the file was being when it kept changing
     for _ in 0..ATTEMPTS {
@@ -1569,7 +1577,12 @@ pub(crate) fn delete_loose(
             return Ok(LooseDelete::Nothing);
         };
         let before = stamp(&part.path)?;
-        let seen = crate::write::Seen::of(&part.path).map_err(|e| Error::io(&part.path, e))?;
+        let Some(seen) =
+            crate::write::Seen::of(&part.path).map_err(|e| Error::io(&part.path, e))?
+        else {
+            meanwhile = "read"; // truncated while its end was being read
+            continue;
+        };
         // The head's warnings are held: at one column the whole read below says them again.
         let held: Arc<Mutex<Vec<Warning>>> = Arc::default();
         let hold: crate::WarnFn = {
@@ -1628,7 +1641,6 @@ pub(crate) fn delete_loose(
         }
         // One column: planned in a whole read, written in a second.
         let gone: std::collections::HashSet<String> = names.iter().map(|n| n.to_string()).collect();
-        let d = loose_delimiter(store, options)?.expect("a loose file");
         let plan = Arc::new(Mutex::new(loose::WithoutPlan::new(d, gone)));
         let s = Store::open(store, planned(options, &plan))?;
         if s.incomplete() {
@@ -1926,10 +1938,9 @@ mod tests {
     #[test]
     #[cfg(feature = "cli")]
     fn a_loose_delete_waiting_for_the_lock_while_another_writer_appends_still_deletes() {
-        // 0.2.0 appended its key alone whatever happened meanwhile; a check that the file was as
-        // read refused a delete that another process's append overtook, and went on refusing it
-        // while appends kept coming. Only a clear or a rewrite matters (the file's head sets its
-        // column count): `Writer::append_if_grown`'s own test pins that the first try is made.
+        // The delete's append is made to the file as it was read with more appended, not refused
+        // for the append. The wait for the lock is one append, and the delete's retry masks a
+        // refusal of it (a stamp check passes this test), so the test below pins the property.
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
         for name in ["s.tsv", "s.tsv.gz"] {
@@ -1974,6 +1985,45 @@ mod tests {
                     vec!["c".to_string(), "3".into()]
                 ],
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_beside_a_writer_that_keeps_appending_is_never_refused_for_it() {
+        // 0.2.1's first build compared the file's stamp with the one before its head read, and
+        // refused (`kept changing`) a delete that each of its three tries found overtaken by an
+        // append (2 of 150 beside six writers). Only a clear or a rewrite matters: the file's head
+        // sets its column count. A stamp check fails this about every run (60 deletes, 3 tries).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\n").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let appender = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut writer = Writer::open(&p).unwrap();
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let row = crate::write::Record::from_args(&format!("r{n}"), &["1".into()]);
+                    writer.append(&[row]).unwrap();
+                    n += 1;
+                }
+                n
+            })
+        };
+        let deleted: Vec<_> = (0..60)
+            .map(|i| delete_loose(&p, &opts(), &[format!("k{i}")]))
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        let appended = appender.join().unwrap();
+        for (i, d) in deleted.into_iter().enumerate() {
+            assert_eq!(
+                d.unwrap(),
+                LooseDelete::Appended(1),
+                "{i} of {appended} appends"
             );
         }
     }

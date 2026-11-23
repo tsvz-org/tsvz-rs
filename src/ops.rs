@@ -306,8 +306,8 @@ pub fn delete_records(
 }
 
 /// Records read from bulk input in `format` (§20.3.1, §21.7.2): a line is a record; a marker
-/// key is a marker line; a comment, an empty line or an empty key is skipped; a key alone is a
-/// tombstone. With `keys_only` (`delete -`) only the first field counts. An unterminated last
+/// key is a marker line; a comment, an empty line or an empty key is skipped (a loose line first
+/// loses the NULs at its start, as a reader drops them); a key alone is a tombstone. With `keys_only` (`delete -`) only the first field counts. An unterminated last
 /// line is ignored with a warning naming `source`.
 pub fn parse_records(
     input: &[u8],
@@ -328,6 +328,12 @@ pub fn parse_records(
     let mut framer = Framer::new();
     framer.push(input, &mut |line| {
         let text = String::from_utf8_lossy(line.text());
+        // A loose line loses the NULs at its start, as a reader drops them (`loose::parse`).
+        let text = if format.strict {
+            &*text
+        } else {
+            text.trim_start_matches('\0')
+        };
         if text.is_empty() {
             return true;
         }
