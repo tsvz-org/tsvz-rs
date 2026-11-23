@@ -1699,7 +1699,7 @@ mod tests {
             })),
             ..Options::default()
         };
-        let s = Store::open(&dir.path().join("s.tsvz.gz"), options).unwrap();
+        let s = Store::open(dir.path().join("s.tsvz.gz"), options).unwrap();
         assert_eq!(*heard.lock().unwrap(), 1);
         assert!(keys(&s).contains(&"d".to_string()), "{:?}", keys(&s));
         assert!(
