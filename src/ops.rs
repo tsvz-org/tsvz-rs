@@ -321,7 +321,7 @@ pub fn parse_records(
         if format.strict {
             escape::decode(f, d).into_owned()
         } else {
-            f.to_string()
+            crate::loose::unsanitize(f, d).into_owned() // the file's own encoding, as TSVZ.py takes it
         }
     };
     let mut records = Vec::new();
@@ -393,8 +393,8 @@ pub fn protocol_record(record: &Record) -> Result<String, Error> {
 }
 
 /// Append one row as a record line to `buf`: the key (`<#>` for a leading `#`), then its cells,
-/// joined by `delimiter` and ended by `\n`. Strict variants are §13-encoded; a loose file's
-/// cells are written as they are (§20.4.4).
+/// joined by `delimiter` and ended by `\n`. Strict variants are §13-encoded; a loose file's are
+/// encoded as TSVZ.py's command line prints them (`_sanitize`, §20.4.4).
 pub fn record_line<'a>(
     buf: &mut String,
     key: &str,
@@ -405,14 +405,14 @@ pub fn record_line<'a>(
     if strict {
         escape::encode_into(buf, key, delimiter, true);
     } else {
-        buf.push_str(key);
+        buf.push_str(&crate::loose::sanitize(key, delimiter));
     }
     for cell in cells {
         buf.push(delimiter as char);
         if strict {
             escape::encode_into(buf, cell, delimiter, false);
         } else {
-            buf.push_str(cell);
+            buf.push_str(&crate::loose::sanitize(cell, delimiter));
         }
     }
     buf.push('\n');

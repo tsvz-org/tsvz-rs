@@ -9,8 +9,15 @@ gzip, padded. Both tools then answer the same reads, compared byte for byte: tsv
 rows to the store's width as TSVZ.py does (§3.6 lets a reader pad). `read`, `verify` and
 `parts` are also run on a pseudo-terminal of fixed width, and their tables compared exactly,
 and `read` with a `-d` that the strict extension overrides (§20.7.1).
-Loose files are left out: both read them by TSVZ.py's 3.39 rules (§20.2.4 leaves the data
-semantics to the implementation), but for the differences docs/limitations.md names.
+
+With --loose, each seed builds a loose file instead (`.tsv .csv .psv .nsv`, some compressed):
+keys and cells with whitespace at their end, `<sep>` `<LF>` `</sep/>` `</LF/>` tokens,
+`#_defaults_#` lines, comments, keys of only whitespace, CRs, NULs, a byte-order mark, invalid
+UTF-8, rows wider and narrower than the column count, one-column files and an unterminated last
+line. tsvz-rs reads them by TSVZ.py's rules (§20.2.4 leaves the data semantics to the
+implementation), so the reads must agree byte for byte; then a copy is changed by tsvz-rs (a
+`delete` of a key it holds, a `set` of a new one) and TSVZ.py must read the copy as the original
+with that change, as tsvz-rs reads it. With --scrub as well, the copy is scrubbed instead.
 
 With --scrub, each seed's store is also scrubbed by tsvz-rs, in place for one part and by a
 snapshot of the parts before the active one for several (§19.2), on a copy: TSVZ.py, and
@@ -22,7 +29,7 @@ its handler (§20.8), while TSVZ.py still reads the files (`--x-direct`): what a
 must be what the files give (§20.8.1, §21.8.5).
 
 usage: python3 difftest/difftest.py --rust target/release/tsvz [--tsvz ../TSVZ/TSVZ.py]
-                                    [--seeds 0:200] [--keep DIR] [--handler] [--scrub]
+                                    [--seeds 0:200] [--keep DIR] [--handler] [--scrub] [--loose]
 Exit status: 0 when every seed agrees, 1 when one does not (its files are kept).
 """
 import argparse
@@ -160,6 +167,128 @@ def make(rng, directory):
     return store, d
 
 
+LOOSE_DELIMITERS = {'tsv': '\t', 'csv': ',', 'psv': '|', 'nsv': '\0'}
+LOOSE_KEYS = ['a', 'b', 'c', 'a ', 'b\r', ' ', '  ', 'k<sep>1', 'x<LF>', '#_defaults_#', '#_defaults_# ',
+              '#_defaults_#x', '\0a', 'a\0', 'ü', '<', 'z</sep/>']
+LOOSE_CELLS = ['1', '2', '', ' ', 'v ', 'P', '<sep>', '</LF/>', 'q<LF>r', '<lt>', '\r', 'x\0', '\u3000']
+
+
+def loose_line(rng, d):
+    """One line of a loose file, without its end."""
+    roll = rng.random()
+    if roll < 0.08:
+        return rng.choice(['#c', '#h' + d + 'v', '', '\0\0', '#'])
+    key = rng.choice(LOOSE_KEYS)
+    cells = [rng.choice(LOOSE_CELLS) for _ in range(rng.choice([0, 1, 1, 1, 2, 2, 3, 4]))]
+    return d.join([key] + cells)
+
+
+def make_loose(rng, directory):
+    ext = rng.choice(['tsv', 'tsv', 'csv', 'psv', 'nsv'])
+    d = LOOSE_DELIMITERS[ext]
+    one = rng.random() < 0.2  # a one-column file: keys alone, but for some lines
+    lines = []
+    for _ in range(rng.randint(0, 14)):
+        line = loose_line(rng, d)
+        if one and rng.random() < 0.8:
+            line = line.split(d)[0]
+        lines.append(line + rng.choice(['\n', '\n', '\n', '\n', '\r\n', '\r\r\n']))
+    data = ''.join(lines).encode('utf-8')
+    if lines and rng.random() < 0.3:
+        data = data.rstrip(b'\n')  # an unterminated last line
+    if rng.random() < 0.1:
+        data = b'\xef\xbb\xbf' + data
+    if rng.random() < 0.1:
+        data = data.replace(b'1', b'\xff', 1)
+    name = 's.' + ext
+    if rng.random() < 0.25:
+        suffix = rng.choice(sorted(CODECS))
+        name, data = name + '.' + suffix, CODECS[suffix](data)
+    store = os.path.join(directory, name)
+    with open(store, 'wb') as f:
+        f.write(data)
+    return store, d
+
+
+LOOSE_OPS = [['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'a  ', ' ', 'b', 'k\t1', '#_defaults_#']]
+
+
+def open_compressed_tail(store):
+    """Whether `store` is compressed and what it decodes to does not end with a newline."""
+    suffix = store.rsplit('.', 1)[-1]
+    if suffix not in CODECS:
+        return False
+    with open(store, 'rb') as f:
+        raw = f.read()
+    try:
+        text = {'gz': gzip.decompress, 'bz2': bz2.decompress, 'xz': lzma.decompress,
+                'zst': lambda b: _zstd.decompress(b)}[suffix](raw)
+    except Exception:
+        return True
+    return bool(text) and not text.endswith(b'\n')
+
+
+def changed_reads(rust, python, store, delimiter, directory, how):
+    """Problems where a copy of a loose file that tsvz-rs changed by `how` (a delete of a key it
+    holds, a set of a new one, a scrub) is read otherwise by TSVZ.py than the original with that
+    change, or otherwise by the two tools."""
+    copy = directory + '-changed'
+    shutil.copytree(directory, copy)
+    try:
+        changed = os.path.join(copy, os.path.basename(store))
+        before = {}
+        for who, command in (('TSVZ.py', python), ('tsvz-rs', rust)):
+            before[who] = ask(command, store, ['read'])
+        if before['TSVZ.py'][0] != 0:
+            return []
+        rows = [line for line in before['TSVZ.py'][1].split(b'\n') if line]
+        d = delimiter.encode()
+        if how != 'scrub' and open_compressed_tail(store):
+            # An append to a compressed file joins its unterminated last line, in either tool:
+            # neither looks at a compressed file's last line before it appends (docs/limitations.md).
+            return []
+        if how == 'delete':
+            if not rows:
+                return []
+            key = rows[len(rows) // 2].split(d)[0].decode('utf-8', errors='replace')
+            if '<' in key or '\ufffd' in key or '\0' in key:
+                return []  # printed encoded, not as it was written, or no argument can hold it
+            op = ['delete', key]
+            want = [r for r in rows if r.split(d)[0] != key.encode()]
+        elif how == 'set':
+            op = ['set', 'new', 'v']
+            want = None  # TSVZ.py's own set, below
+        else:
+            op = ['scrub']
+            want = rows
+        done = subprocess.run(rust + ['-q'] + op[:1] + [changed] + op[1:], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=60)
+        if done.returncode != 0:
+            return ['  %s: tsvz-rs exit %d: %s' % (' '.join(op), done.returncode, done.stderr[-300:])]
+        if want is None:
+            mine = directory + '-theirs'
+            shutil.copytree(directory, mine)
+            try:
+                theirs = os.path.join(mine, os.path.basename(store))
+                subprocess.run(python + ['-q', 'set', theirs, 'new', 'v'], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60)
+                want = [line for line in ask(python, theirs, ['read'])[1].split(b'\n') if line]
+            finally:
+                shutil.rmtree(mine, ignore_errors=True)
+        problems = []
+        python_after = ask(python, changed, ['read'])
+        got = [line for line in python_after[1].split(b'\n') if line]
+        if got != want:
+            problems.append('  %s, then TSVZ.py read: %r\n    wanted %r' % (' '.join(op), got[:20], want[:20]))
+        for o in LOOSE_OPS:
+            a, b = ask(rust, changed, o), ask(python, changed, o)
+            if a != b:
+                problems.append('  %s, then %s: tsvz-rs %s %r\n    TSVZ.py %s %r' % (' '.join(op), ' '.join(o), a[0], a[1][:300], b[0], b[1][:300]))
+        return problems
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+
+
 def ask_tty(command, store, op, columns=72):
     """(exit status, output) of an operation whose stdout is a terminal `columns` wide: its table."""
     import fcntl
@@ -295,6 +424,8 @@ def main():
                         help='also scrub a copy of each store with tsvz-rs and check that both tools read it as before')
     parser.add_argument('--handler', action='store_true',
                         help="send tsvz-rs's operations through a tsvz-rs handler; TSVZ.py still reads the files")
+    parser.add_argument('--loose', action='store_true',
+                        help='random loose files instead: reads must agree, and so must reads after a change by tsvz-rs')
     args = parser.parse_args()
     start, end = (int(x) for x in args.seeds.split(':'))
     rust = [os.path.abspath(args.rust)]
@@ -310,6 +441,24 @@ def main():
         rng = random.Random(seed)
         directory = tempfile.mkdtemp(prefix='seed%d-' % seed)
         try:
+            if args.loose:
+                store, delimiter = make_loose(rng, directory)
+                problems = []
+                for op in LOOSE_OPS:
+                    a, b = ask(rust, store, op), ask(python, store, op)
+                    if a != b:
+                        problems.append('  %s: tsvz-rs %s %r\n  %s  TSVZ.py %s %r' % (' '.join(op), a[0], a[1][:300], ' ' * len(' '.join(op)), b[0], b[1][:300]))
+                for how in (['scrub'] if args.scrub else ['delete', 'set']):
+                    problems += changed_reads(rust, python, store, delimiter, directory, how)
+                if problems:
+                    failed += 1
+                    if keep is None:
+                        keep = tempfile.mkdtemp(prefix='difftest-')
+                    target = os.path.join(keep, 'seed%d' % seed)
+                    shutil.rmtree(target, ignore_errors=True)
+                    shutil.copytree(directory, target)
+                    print('seed %d disagrees (files in %s):\n%s' % (seed, target, '\n'.join(problems)))
+                continue
             store, delimiter = make(rng, directory)
             problems = []
             handler = None

@@ -106,3 +106,37 @@ entries go last, in the same commit as the change:
   so it had to answer for every store a caller might pass, not only the ones `scrub` passes.
 - Lesson: make a function public only when a caller outside needs it; a public helper must answer for
   inputs its own callers never give it, and that answer is code and a promise to keep.
+
+## 2026-11-23 A loose file is read by TSVZ.py's line rule whole
+- Changed: tsvz-rs reads a loose file as TSVZ.py's `_processLine` does: keys and cells without the
+  whitespace at their end and decoded (`<sep>`, `<LF>`), `#_defaults_#` lines that fill the empty
+  cells after them, a key of only whitespace skipped, a row wider than the column count cut of its
+  empty end cells, the unterminated last line read; a requested key is taken without its end
+  whitespace, a missing key has no row, records print cells encoded as TSVZ.py prints them, and
+  writes encode cells so (a delimiter or newline is no longer refused). A rewrite plans from the same
+  parse, so its guard for lines "the two may read differently" went.
+- Why we had to change: 0.1.4 took TSVZ.py's column count and deletions but kept its own cell and key
+  rule, and the reviews of 0.1.4 and 0.2.0 found difference after difference between the two: six
+  ways a read differed, three edges where tsvz-rs named a key otherwise in its read, its rewrite and
+  its follow state, a delete beside a clear, and every rewrite of a file with a trailing space, a `<`
+  or a CR left uncompacted by a cautious guard.
+- Original design was wrong because: it ported the part of the other program's rule each finding
+  touched, so two half-rules met at every edge, and each edge needed state of its own (an odd-line
+  kind, a stand-in key spelling, a blank-key special case in delete) that the next review found wrong
+  in another case.
+- Lesson: when you read files another program owns and its rule is a single function, port that
+  function whole, with the other program as the test oracle, rather than the part a bug touched: the
+  edges between two rules are where the findings keep coming from.
+
+## 2026-11-23 A read begins at the last snapshot part, and a look only chooses where
+- Changed: a read of a multi-part store begins at its last snapshot part (§19.10.3); `verify` and a
+  rewrite's read replay every part. The part to begin at is chosen by a first look at each part's
+  first lines, newest first, and confirmed by the read of that part, from the lines it decodes.
+- Why we had to change: reading every part cost about 11 times as much on 20 parts of history, and
+  0.1.4's attempt, a look inside the read, decoded each part's start twice and left bzip2 out, so the
+  answer depended on the codec.
+- Original design was wrong because: the look decided where the read began, and the read trusted it;
+  making that look exact meant a second decoder held to the read's rules.
+- Lesson: when a cheap look guides an expensive read, let the look only choose and have the read
+  confirm from what it decodes anyway, falling back when it does not: the look then needs no rules of
+  its own, and cannot make the result depend on how it looked.

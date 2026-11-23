@@ -100,7 +100,7 @@ fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
 /// The snapshot content of §19.2.3 for a strict store read whole, as TSVZ.py writes it: the
 /// header comment, the markers, then one fully resolved row per live key, padded with empty
 /// cells to the width of the final defaults; the compensating layout of §19.4 when a row would
-/// not read back the same. (A loose file's scrub keeps its lines instead: `loose::scrub`.)
+/// not read back the same. (A loose file's scrub keeps its lines instead: `loose::ScrubPlan`.)
 pub(crate) fn snapshot(s: &Store) -> String {
     let d = s.format().delimiter;
     let m = s.markers();
@@ -479,8 +479,8 @@ fn planned<P: loose::Planner + 'static>(options: &Options, plan: &Arc<Mutex<P>>)
 }
 
 /// The second read of a loose rewrite: the lines `kept` keeps, as the file has them or as the
-/// plan puts them, and the bytes after its last newline. None when the file no longer gives the
-/// lines the plan was made from (it changed between the reads).
+/// plan puts them. None when the file no longer gives the lines the plan was made from (it
+/// changed between the reads).
 fn write_kept(
     store: &Path,
     options: &Options,
@@ -491,14 +491,12 @@ fn write_kept(
         warnings: None, // the first read said them
         ..options.clone()
     };
-    let again = Store::open(store, planned(&quiet, &writer))?;
+    Store::open(store, planned(&quiet, &writer))?;
     let mut w = writer.lock().expect("a planner never panics");
     if !w.same_lines() {
         return Ok(None);
     }
-    let mut content = std::mem::take(&mut w.out);
-    content.extend_from_slice(again.loose_tail());
-    Ok(Some(content))
+    Ok(Some(std::mem::take(&mut w.out)))
 }
 
 /// Compact a store with §19.4 fidelity (§20.2 `scrub`). A one-part store is compacted in place
@@ -758,8 +756,8 @@ fn attempt(
         Some(earlier)
     };
     // With no part before it (a one-part store, or part 0), there is nothing to skip: the
-    // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), and
-    // the bytes after its last newline, which TSVZ.py reads as a line.
+    // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), its
+    // unterminated last line too.
     let content = match (&earlier, plan) {
         (_, Some(plan)) => {
             let kept = plan.lock().expect("a planner never panics").finish();
@@ -1552,9 +1550,7 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
 #[cfg(feature = "cli")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LooseDelete {
-    /// Tombstones appended (this many): each key asked as TSVZ.py names it, when it has a name,
-    /// and, where that differs, as given; with no keyed line yet, only a key of only whitespace,
-    /// which has no name, as given.
+    /// Tombstones appended (this many): each key asked, as a reader names it.
     Appended(usize),
     /// The file rewritten without the lines of the keys asked.
     Rewrote,
@@ -1564,28 +1560,23 @@ pub(crate) enum LooseDelete {
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
-/// deletion, appended for each key asked, live or not, as TSVZ.py names it (without the
-/// whitespace at its end, unless nothing is left of it) and, where that differs, as given; one
-/// column, where a key alone is a row and no line can delete, a rewrite without the lines of the
-/// keys ([`loose::without`]); no keyed line yet, nothing, since a key alone would set one column
-/// and be a row (but a key of only whitespace, which sets none, is written as given). The file is
-/// read only as far as its first keyed line (a compressed one to the end of the member that holds
-/// it); the whole file is read for a rewrite, at one column only. A missing file is created
-/// (§20.2.2).
+/// deletion, appended for each key asked, live or not, as a reader names it (without the
+/// whitespace at its end; a key with nothing left names none), and only while the file is as the
+/// read found it; one column, where a key alone is a row and no line can delete, a rewrite without
+/// the lines of the keys ([`loose::WithoutPlan`]); no keyed line yet, nothing, since a key alone
+/// would set one column and be a row. The file is read only as far as its first keyed line (a
+/// compressed one to the end of the member that holds it); the whole file is read for a rewrite,
+/// at one column only. A missing file is created (§20.2.2).
 #[cfg(feature = "cli")]
 pub(crate) fn delete_loose(
     store: &Path,
     options: &Options,
     keys: &[String],
 ) -> Result<LooseDelete, Error> {
-    // Each key as TSVZ.py reads a line's key, without the whitespace at its end, and as given:
-    // tsvz-rs, which reads a key whole, deletes the row of either. A key with nothing left names
-    // no row to TSVZ.py, which skips such lines; tsvz-rs reads such a row, by its given spelling,
-    // at one column too: the line of that spelling goes, and no other.
-    use std::sync::{Arc, Mutex};
-    let asked: Vec<(&str, &str)> = keys
+    let names: Vec<&str> = keys
         .iter()
-        .map(|k| (k.as_str(), k.trim_end_matches(loose::py_space)))
+        .map(|k| k.trim_end_matches(loose::py_space))
+        .filter(|n| !n.is_empty())
         .collect();
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
@@ -1620,39 +1611,36 @@ pub(crate) fn delete_loose(
         };
         let one = head.one_column();
         if one != Some(true) {
-            say();
-            // More than one column: a tombstone for each key. No keyed line yet: a key alone would
-            // set one column and be a row, so none, but for a key with nothing left of it, which
-            // TSVZ.py skips (it sets no column count) and tsvz-rs reads as a row: its tombstone
-            // deletes that row, so that a `popitem` loop drains a file that holds only such rows
-            // (without it the row stays, and `popitem` returns it again).
-            let all = one == Some(false);
-            let tombstones: Vec<crate::write::Record> = asked
+            if one.is_none() || names.is_empty() {
+                say();
+                return Ok(LooseDelete::Nothing); // a key alone would set one column, and be a row
+            }
+            let tombstones: Vec<crate::write::Record> = names
                 .iter()
-                .flat_map(|&(given, name)| {
-                    let named = (all && !name.is_empty()).then_some(name);
-                    let as_given = (given != name && (all || name.is_empty())).then_some(given);
-                    named.into_iter().chain(as_given)
-                })
                 .map(|key| crate::write::Record::Tombstone {
                     key: key.to_string(),
                 })
                 .collect();
-            if tombstones.is_empty() && !all {
-                return Ok(LooseDelete::Nothing);
-            }
-            Writer::open(store)?
+            // Appended only to the file as it was read: one cleared meanwhile, with no keyed line
+            // left, would take a key alone for a row.
+            let appended = Writer::open(store)?
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
-                .append(&tombstones)?;
-            return Ok(LooseDelete::Appended(tombstones.len()));
+                .append_if_unchanged(&tombstones, before);
+            match appended {
+                Ok(false) => continue, // another writer changed it since the read
+                Ok(true) => {
+                    say();
+                    return Ok(LooseDelete::Appended(tombstones.len()));
+                }
+                Err(e) => {
+                    say();
+                    return Err(e);
+                }
+            }
         }
         // One column: planned in a whole read, written in a second.
-        let gone: std::collections::HashSet<String> = asked
-            .iter()
-            .map(|&(given, name)| if name.is_empty() { given } else { name })
-            .map(str::to_string)
-            .collect();
+        let gone: std::collections::HashSet<String> = names.iter().map(|n| n.to_string()).collect();
         let d = loose_delimiter(store, options)?.expect("a loose file");
         let plan = Arc::new(Mutex::new(loose::WithoutPlan::new(d, gone)));
         let s = Store::open(store, planned(options, &plan))?;

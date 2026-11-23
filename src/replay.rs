@@ -176,15 +176,20 @@ pub struct Replay {
     pub header: Option<String>,
     /// The store's width in value columns, which rows are padded to (§3.6 lets a reader pad):
     /// set by the first data row to the count of the defaults then active when there are any,
-    /// else to that row's written cells. None before any data row. A loose file's is that of its
-    /// first keyed line ([`crate::loose::keyed`]), a deletion or a `#_defaults_#` line included,
-    /// as TSVZ.py sets it.
+    /// else to that row's written cells. None before any data row. A loose file's is that of the
+    /// first line read as something ([`crate::loose::parse`]), a deletion or a `#_defaults_#` line
+    /// included, less its key, as TSVZ.py sets it.
     pub width: Option<usize>,
-    /// A loose file's column count is one ([`crate::loose::keyed`]): None before its first keyed
-    /// line.
+    /// A loose file's column count is one: None before the first line read as something.
     pub(crate) one_column: Option<bool>,
-    /// Where a loose file's committed lines go, without their `\n`, for a rewrite that plans
-    /// from them or writes them ([`crate::loose`]); None unless asked for.
+    /// A loose file's column count, the key's included (TSVZ.py's `correctColumnNum`), and the
+    /// `#_defaults_#` cells in force, the key first (its `defaults`).
+    loose_width: Option<usize>,
+    loose_defaults: Vec<String>,
+    /// How many lines of a loose file were read.
+    lines_read: u64,
+    /// Where a loose file's lines go, as the file has them, for a rewrite that plans from them or
+    /// writes them ([`crate::loose`]); None unless asked for. Rows are then not read.
     pub(crate) lines: Option<crate::loose::Sink>,
     /// Stop reading a loose file at its first keyed line.
     pub(crate) head: bool,
@@ -306,6 +311,9 @@ impl Replay {
             header: None,
             width: None,
             one_column: None,
+            loose_width: None,
+            loose_defaults: Vec::new(),
+            lines_read: 0,
             lines: None,
             head: false,
             first_line: false,
@@ -380,53 +388,71 @@ impl Replay {
                 }
             }
         }
-        // A loose file's line 1 begins with its byte-order mark, as TSVZ.py reads it (§5.2: the
-        // data semantics of a loose file are implementation-defined); the framer drops it (§4.7).
-        let marked: Vec<u8>;
-        let mark: &[u8] = if !self.format.strict && first && line.bom {
-            b"\xef\xbb\xbf"
-        } else {
-            b""
-        };
-        if !mark.is_empty() {
-            marked = [mark, body].concat();
-            body = &marked;
+        if !self.format.strict {
+            let mark = first && line.bom;
+            return self.loose(line.raw, body, mark, (line.number, line.offset), sink);
         }
-        if let (false, Some(lines)) = (self.format.strict, &self.lines) {
-            // A rewrite plans from the lines as the file has them, but for their `\n`, and reads
-            // no row.
+        let text = String::from_utf8_lossy(body);
+        if matches!(text, Cow::Owned(_)) {
+            self.not_utf8(line.number, line.offset);
+        }
+        self.strict_line(&text, line, first, sink);
+        true
+    }
+
+    /// A loose file's bytes after its last newline, `tail`: its last line, which TSVZ.py reads as
+    /// one; `bom`: it is line 1, and the file began with a byte-order mark; `at`: its number and
+    /// offset.
+    pub fn loose_tail(&mut self, tail: &[u8], bom: bool, at: (u64, u64), sink: &mut dyn Sink) {
+        let first = std::mem::replace(&mut self.first_line, false);
+        self.loose(tail, tail, first && bom, at, sink);
+    }
+
+    /// A loose file's line: `raw` as the file has it (with its `\n`, when it has one), `body`
+    /// without its `\n` and the one `\r` before it, `mark` whether line 1 began with a byte-order
+    /// mark, which is part of its key, as TSVZ.py reads it (§5.2: a loose file's data semantics
+    /// are implementation-defined; the framer drops it, §4.7), and `at` its number and offset.
+    fn loose(
+        &mut self,
+        raw: &[u8],
+        body: &[u8],
+        mark: bool,
+        at: (u64, u64),
+        sink: &mut dyn Sink,
+    ) -> bool {
+        const BOM: &[u8] = b"\xef\xbb\xbf";
+        let marked: Vec<u8>;
+        let body = if mark {
+            marked = [BOM, body].concat();
+            &marked[..]
+        } else {
+            body
+        };
+        if let Some(lines) = &self.lines {
+            // A rewrite plans from the lines as the file has them, and reads no row.
             if self.warn.is_some() && std::str::from_utf8(body).is_err() {
-                self.not_utf8(line);
+                self.not_utf8(at.0, at.1);
             }
-            let raw = &line.raw[..line.raw.len() - 1];
-            let raw: Cow<[u8]> = if mark.is_empty() {
-                Cow::Borrowed(raw)
+            let raw: Cow<[u8]> = if mark {
+                Cow::Owned([BOM, raw].concat())
             } else {
-                Cow::Owned([mark, raw].concat())
+                Cow::Borrowed(raw)
             };
             lines.lock().expect("a planner never panics").line(&raw);
             return true;
         }
         let text = String::from_utf8_lossy(body);
         if matches!(text, Cow::Owned(_)) {
-            self.not_utf8(line);
+            self.not_utf8(at.0, at.1);
         }
-        if self.format.strict {
-            self.strict_line(&text, line, first, sink);
-        } else {
-            self.loose_line(&text, first, sink);
-            return !(self.head && self.one_column.is_some());
-        }
-        true
+        self.loose_line(&text, raw.last() == Some(&b'\n'), sink);
+        !(self.head && self.one_column.is_some())
     }
 
-    fn not_utf8(&self, line: &Line<'_>) {
+    fn not_utf8(&self, number: u64, offset: u64) {
         self.warn(
-            Some(line.offset),
-            format!(
-                "line {} is not valid UTF-8; replaced the bad bytes with U+FFFD",
-                line.number
-            ),
+            Some(offset),
+            format!("line {number} is not valid UTF-8; replaced the bad bytes with U+FFFD"),
         );
     }
 
@@ -561,38 +587,83 @@ impl Replay {
         }
     }
 
-    /// A loose file: lines split on the delimiter, no markers, escaping or stripping (§5.2). A key
-    /// alone, or with only blank cells, is a deletion, but a row in a one-column file, as TSVZ.py
-    /// reads it ([`crate::loose`]).
-    fn loose_line(&mut self, text: &str, first: bool, sink: &mut dyn Sink) {
+    /// A loose file's line, as TSVZ.py reads it (`_processLine`, [`crate::loose`]): its cells
+    /// ([`crate::loose::parse`]); the first line read as something sets the column count (that of
+    /// the `#_defaults_#` cells in force when there are some, else its own); a key with no value is
+    /// a row in a one-column file, a reset of the defaults on a `#_defaults_#` line, and a deletion
+    /// elsewhere; a line of another count is fitted to it (`_fitRow`: padded, or cut of the empty
+    /// cells at its end past it); its empty cells take the defaults in force; and a `#_defaults_#`
+    /// line sets those (its own empty cells taking the ones before), and is no row. A line read as
+    /// nothing is a comment, or empty, or a key of only whitespace; line 1 there is the header.
+    fn loose_line(&mut self, text: &str, terminated: bool, sink: &mut dyn Sink) {
+        use crate::loose::{DEFAULTS, parse, valueless};
         let d = self.format.delimiter;
-        let text = crate::loose::body(text);
-        if self.one_column.is_none() && crate::loose::keyed(text, d) {
-            self.one_column = Some(!text.as_bytes().contains(&d));
-            self.set_width(split_first(text, d).1);
-        }
-        if crate::loose::is_comment(text, d) {
-            if first {
+        let Some(mut cells) = parse(text, d, terminated) else {
+            if self.lines_read == 0 && text.trim_start_matches('\0').starts_with('#') {
                 self.header = Some(text.to_string());
             }
+            self.lines_read += 1;
+            return;
+        };
+        self.lines_read += 1;
+        let defaults = &mut self.loose_defaults;
+        let width = *self.loose_width.get_or_insert(if defaults.len() > 1 {
+            defaults.len()
+        } else {
+            cells.len()
+        });
+        if self.one_column.is_none() {
+            self.one_column = Some(width == 1);
+            self.width = Some(width - 1);
+        }
+        let is_defaults = cells[0] == DEFAULTS;
+        if valueless(&cells) {
+            if width == 1 {
+                self.put_loose(&cells, sink);
+            } else if is_defaults {
+                *defaults = vec![DEFAULTS.to_string()];
+            } else {
+                sink.delete(&cells[0]);
+            }
             return;
         }
-        let (key, rest) = split_first(text, d);
-        if key.is_empty() {
-            return;
-        }
-        if crate::loose::deletes(rest, d, self.one_column == Some(true)) {
-            sink.delete(key);
-            return;
-        }
-        let binding = self.binding();
-        let mut cells = Cells::default();
-        if let (true, Some(rest)) = (sink.wants_cells(key), rest) {
-            for field in rest.split(d as char) {
-                cells.push(field);
+        if cells.len() < width {
+            cells.resize(width, Cow::Borrowed(""));
+        } else {
+            while cells.len() > width && cells.last().is_some_and(|c| c.is_empty()) {
+                cells.pop();
             }
         }
-        sink.put(key, cells, &binding);
+        if is_defaults && cells.len() < defaults.len() {
+            cells.resize(defaults.len(), Cow::Borrowed(""));
+        }
+        if defaults.len() > 1 {
+            for (i, cell) in cells.iter_mut().enumerate().skip(1) {
+                match defaults.get(i) {
+                    Some(fill) if cell.is_empty() && !fill.is_empty() => {
+                        *cell = Cow::Owned(fill.clone())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if is_defaults {
+            *defaults = cells.iter().map(|c| c.to_string()).collect();
+            return;
+        }
+        self.put_loose(&cells, sink);
+    }
+
+    /// A loose row, `cells` with its key first, as it is read: the replay fills nothing more.
+    fn put_loose(&mut self, cells: &[Cow<'_, str>], sink: &mut dyn Sink) {
+        let binding = self.binding();
+        let mut row = Cells::default();
+        if sink.wants_cells(&cells[0]) {
+            for cell in &cells[1..] {
+                row.push(cell);
+            }
+        }
+        sink.put(&cells[0], row, &binding);
     }
 
     /// A member was cut short (§16.6): its whole lines are read.
@@ -853,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_lines_are_split_raw() {
+    fn loose_lines_are_read_as_tsvz_py_reads_them() {
         let (r, rows, _) = run(
             Format {
                 delimiter: b',',
@@ -864,7 +935,7 @@ mod tests {
         );
         assert_eq!(r.header.as_deref(), Some("#h,dr"));
         assert!(r.markers.defaults.is_empty());
-        assert_eq!(table(&rows), vec![row("k", &["x<lt>", "y "])]);
+        assert_eq!(table(&rows), vec![row("k", &["x<lt>", "y"])]);
     }
 
     #[test]
@@ -882,7 +953,7 @@ mod tests {
                 row("a", &[]),
                 row("b", &["1"]),
                 row("c", &[""]),
-                row("d", &[" "])
+                row("d", &[""])
             ]
         );
         // The first keyed line, a #_defaults_# line included, sets the column count.
@@ -961,7 +1032,7 @@ mod tests {
         assert_eq!(r.one_column, Some(false));
         assert_eq!(
             table(&rows),
-            vec![row("#_defaults_#x", &["1"]), row("a", &["", "q"])]
+            vec![row("#_defaults_#x", &["1"]), row("a", &["P", "q"])]
         );
     }
 
@@ -987,7 +1058,7 @@ mod tests {
         });
         assert_eq!(
             kept.lock().unwrap().0,
-            [&b"\xef\xbb\xbfa\t1\r"[..], b"#c\r\r", b"", b"b\t2"]
+            [&b"\xef\xbb\xbfa\t1\r\n"[..], b"#c\r\r\n", b"\n", b"b\t2\n"]
         );
     }
 

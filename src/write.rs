@@ -133,8 +133,9 @@ fn snapshot_refused(key: &str) -> Error {
     ))
 }
 
-/// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file has no
-/// escaping, so a field holding its delimiter, `\n` or `\r` is refused.
+/// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file's fields are
+/// encoded as TSVZ.py writes them ([`crate::loose::sanitize`]); one that holds `</sep/>` or
+/// `</LF/>`, which would read back as another, is refused.
 pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Result<(), Error> {
     let d = format.delimiter;
     let (key, values, marker) = match record {
@@ -158,16 +159,16 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
             )));
         }
         for field in std::iter::once(key).chain(values) {
-            if field.bytes().any(|b| b == d || b == b'\n' || b == b'\r') {
+            if let Some(token) = crate::loose::unwritable(field) {
                 return Err(Error::Refused(format!(
-                    "{field:?} holds the delimiter or a line break, which a loose file cannot hold; nothing was written"
+                    "{field:?} holds {token}, which a loose file reads back as another; nothing was written"
                 )));
             }
         }
-        out.push_str(key);
+        out.push_str(&crate::loose::sanitize(key, d));
         for v in values {
             out.push(d as char);
-            out.push_str(v);
+            out.push_str(&crate::loose::sanitize(v, d));
         }
         out.push('\n');
         return Ok(());
@@ -329,6 +330,33 @@ impl Writer {
     /// before and after it: what the handler needs to tell its own appends from other writers'.
     #[doc(hidden)]
     pub fn append_at(&mut self, payload: &[u8], member_size: u64) -> Result<Appended, Error> {
+        let appended = self.append_unless_changed(payload, member_size, None)?;
+        Ok(appended.expect("appended: nothing was expected of the part"))
+    }
+
+    /// Append `records` only while the part still has the stamp `expect`, which a read of it took:
+    /// false, with nothing written, when another writer changed it since (a loose delete decides
+    /// from what it read).
+    #[cfg(feature = "cli")]
+    pub(crate) fn append_if_unchanged(
+        &mut self,
+        records: &[Record],
+        expect: parts::Stamp,
+    ) -> Result<bool, Error> {
+        let payload = encode(records, self.format)?;
+        let appended =
+            self.append_unless_changed(payload.as_bytes(), self.member_size as u64, Some(expect))?;
+        Ok(appended.is_some())
+    }
+
+    /// [`Writer::append_at`], which writes nothing and answers None when `expect` is a stamp the
+    /// part no longer has under the lock.
+    fn append_unless_changed(
+        &mut self,
+        payload: &[u8],
+        member_size: u64,
+        expect: Option<parts::Stamp>,
+    ) -> Result<Option<Appended>, Error> {
         // The part is locked as it was opened; when by then it is no longer the store's active
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
         // rotated away), the active part is looked up again. Only a store with no part yet is
@@ -391,27 +419,41 @@ impl Writer {
             let mut cut = None;
             let locked = (|| {
                 let before = stamp(&file).map_err(io)?;
+                if expect.is_some_and(|e| e != before) {
+                    return Ok(None);
+                }
+                let mut bytes = Cow::Borrowed(&bytes[..]);
                 let start = match part.codec {
                     Some(_) => before.size,
-                    None => {
+                    None if self.format.strict => {
                         cut = self.cut_torn_tail(&file, path).map_err(io)?;
                         file.metadata().map_err(io)?.len()
                     }
+                    None => {
+                        // TSVZ.py ends a loose file's unterminated last line, which it reads as a
+                        // row, before it appends.
+                        if !ends_a_line(&file, before.size).map_err(io)? {
+                            bytes = Cow::Owned([&b"\n"[..], &bytes].concat());
+                        }
+                        before.size
+                    }
                 };
                 self.write_batch(&file, path, &bytes, start)?;
-                Ok::<_, Error>((before, stamp(&file).map_err(io)?))
+                Ok::<_, Error>(Some((before, stamp(&file).map_err(io)?)))
             })();
             drop(guard);
             if let (Some(w), Some(warning)) = (&self.warn, &cut) {
                 w(warning);
             }
-            let (before, after) = locked?;
-            return Ok(Appended {
+            let Some((before, after)) = locked? else {
+                return Ok(None);
+            };
+            return Ok(Some(Appended {
                 part: part.path.clone(),
                 before,
                 after,
                 file,
-            });
+            }));
         }
         if let Some(e) = missing {
             return Err(e);
@@ -450,9 +492,8 @@ impl Writer {
         ))
     }
 
-    /// An uncommitted tail would join the first appended record, so it is cut first: TSVZ.py
-    /// does that in a store, but in a loose file it ends the last line instead, and the cut here
-    /// loses that row (docs/limitations.md). Says what was cut, as the warning to send.
+    /// An uncommitted tail would join the first appended record, so it is cut first, as TSVZ.py
+    /// does in a store (§4.3). Says what was cut, as the warning to send.
     fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<Option<Warning>> {
         let size = file.metadata()?.len();
         if size == 0 {
@@ -474,6 +515,16 @@ impl Writer {
             ),
         }))
     }
+}
+
+/// Whether `file`, `size` bytes long, is empty or ends with a newline.
+fn ends_a_line(file: &File, size: u64) -> io::Result<bool> {
+    if size == 0 {
+        return Ok(true);
+    }
+    let mut last = [0u8; 1];
+    file.read_exact_at(&mut last, size - 1)?;
+    Ok(last[0] == b'\n')
 }
 
 fn last_newline_end(file: &File, size: u64) -> io::Result<u64> {
@@ -691,13 +742,16 @@ mod tests {
             delimiter: b',',
             strict: false,
         };
+        // A loose file's cells as TSVZ.py writes them (`_sanitize`): what reads back as another
+        // token is refused.
         assert_eq!(enc(d("k", &["a<b", "#c"]), loose).unwrap(), "k,a<b,#c\n");
+        assert_eq!(enc(d("k", &["a,b"]), loose).unwrap(), "k,a<sep>b\n");
+        assert_eq!(
+            enc(d("k\nl", &["a\nb<sep>", "x<LF>\r"]), loose).unwrap(),
+            "k<LF>l,a<LF>b</sep/>,x</LF/>\r\n"
+        );
         assert!(matches!(
-            enc(d("k", &["a,b"]), loose),
-            Err(Error::Refused(_))
-        ));
-        assert!(matches!(
-            enc(d("k", &["a\nb"]), loose),
+            enc(d("k", &["a</sep/>b"]), loose),
             Err(Error::Refused(_))
         ));
     }
@@ -1112,6 +1166,38 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cli")]
+    #[test]
+    fn an_append_made_on_what_was_read_writes_nothing_once_the_file_changed() {
+        // A loose delete appends its key alone only to the file it read: cleared meanwhile, with
+        // no keyed line left, the key alone would be a row.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        let read = parts::Stamp::of(&fs::metadata(&p).unwrap());
+        let gone = [Record::from_args("a", &[])];
+        let mut w = Writer::open(&p).unwrap();
+        fs::write(&p, "").unwrap(); // the clear
+        assert!(!w.append_if_unchanged(&gone, read).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"");
+        let now = parts::Stamp::of(&fs::metadata(&p).unwrap());
+        assert!(w.append_if_unchanged(&gone, now).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\n");
+    }
+
+    #[test]
+    fn a_loose_files_unterminated_last_line_is_ended_before_an_append() {
+        // TSVZ.py reads it as a row, and ends it before it appends; a store's is cut (§4.3).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2").unwrap();
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("c", &["3".into()])])
+            .unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\nc\t3\n");
+    }
+
     #[test]
     fn loose_writer_with_a_delimiter() {
         let dir = tempfile::tempdir().unwrap();
@@ -1120,11 +1206,9 @@ mod tests {
         w.append(&[Record::from_args("k", &["a\tb".into()])])
             .unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
-        assert!(
-            w.append(&[Record::from_args("k", &["x;y".into()])])
-                .is_err()
-        );
-        assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
+        w.append(&[Record::from_args("k", &["x;y".into()])])
+            .unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\nk;x<sep>y\n");
     }
 
     #[test]

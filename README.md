@@ -33,19 +33,15 @@ applies the store's `#_rotate_#`; writers keep appending throughout. A read begi
 snapshot part (§19.10.3) and does not open the parts before it; `verify` reads every part.
 `scrub` and `clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
-Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
-except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
-unterminated last line, reads `#_defaults_#` lines as comments (it fills no empty cell from
-them), keeps the whitespace at the end of a key or a cell and decodes neither, and keeps the empty
-cells at the end of a row longer than the file's column count. A rewrite writes each line it keeps
-as the file has it, but for three things: a byte-order mark an unterminated first line loses, the
-key a one-column `delete` puts where the line that set the column count went, and the blank
-`#_defaults_#` line a `clear` may write before the defaults it keeps. `scrub` keeps the lines a
-read depends on (a key's last line may take the place of its first, where nothing TSVZ.py reads
-changes), and `clear` the `#_defaults_#` lines in force
-([docs/silent-choices.md](docs/silent-choices.md)). One more limit an operator can meet: a
-`delete` of a loose file that runs at the very moment of a `clear` of it can leave the key as a
-row.
+Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them
+(`_processLine`): keys and cells without the whitespace at their end and decoded (`<sep>`, `<LF>`),
+`#_defaults_#` lines that fill the empty cells after them, the last line read also without its
+newline, and no row for a missing key. Writes encode cells as TSVZ.py's do. A rewrite writes each
+line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
+line that set the column count went, and the blank `#_defaults_#` line a `clear` may write before
+the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
+place of its first, where nothing a reader reads changes), and `clear` the `#_defaults_#` lines in
+force ([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
 
@@ -102,6 +98,24 @@ against TSVZ.py on random stores, with and without its handler. Rust and Python 
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.1 from 0.2.0
+
+Stores need nothing; the library's documented API does not change.
+
+- A read of a multi-part strict store begins at its last snapshot part (§19.10.3) and does not
+  open the parts before it, as TSVZ.py's does: a part there that is damaged under
+  `#_on_corruption_# stop` no longer stops the read. `verify`, `scrub` and `clear` still read
+  every part.
+- Loose files are read as TSVZ.py reads them: a key or cell loses the whitespace at its end
+  (`a ` and `a` are one key), `<sep>` and `<LF>` in a cell are the delimiter and a newline,
+  `#_defaults_#` lines fill the empty cells after them, a line whose key is only whitespace is
+  no row, the last line is read even without its newline, and `get` of a missing key prints
+  nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
+  (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, and ends an unterminated last line with a
+  newline before it appends (0.2.0 cut that line).
+- A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
+  less memory.
 
 ## Upgrading to 0.2.0 from 0.1.4
 

@@ -41,96 +41,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: an operator shares a store with another writer on a system without either lock.
 - Approved: 2026-11-17, the user's pick (relayed by chief): "Switch, accept it (Recommended)".
 
-### A loose file's unterminated last line is ignored, and cut before an append
+### An append to a compressed loose file joins its unterminated last line
 - Kind: deferred
-- What the operator sees: a `.tsv` whose last line has no newline (a file saved by an editor or
-  written with `printf`) shows that line in TSVZ.py, which reads it as a row and adds a newline
-  before it appends. tsvz-rs reads it as an uncommitted tail, as §4.3 says of a part (§5.2 gives a
-  loose file no further guarantee): `read` skips it with a warning, and `set`, or a `delete` in a
-  file of more than one column, cuts it first ("cut N uncommitted bytes"), so that row is lost. A
-  loose `scrub`, and a delete that rewrites a one-column file, keep it as it is (the scrub's warning
-  says "ignored": its read ignores the bytes, and the file keeps them), so TSVZ.py goes on reading
-  a row there that tsvz-rs does not list. A one-column delete picks the key that takes the place of
-  a column-count line that goes without seeing that row, so `a`, then `b<TAB>1` with no newline,
-  after `delete a`, reads two columns to TSVZ.py (`b<TAB>1`), where its own delete writes `b`, a
-  newline and `b<TAB>1` (one column), and a key alone written later is then a deletion to it. A
-  byte-order mark in front of the line, in a file with no other line, is dropped by a scrub. A
-  loose `clear` drops an unterminated last line with the rows, as 0.1.3's did, a comment or not.
-- Why: tsvz-rs applies the strict-store tail rule to loose files; changing it touches how a store
-  follows appends (`Store::refresh` holds the tail until a newline completes it). Found in 0.1.4's
-  differential runs against TSVZ.py 5.18; the other differences are in the entry below.
-- Revisit when: 0.2.1. The plan: read a loose file's tail as a line, and write a
-  newline before an append instead of cutting it, as TSVZ.py does.
-- Noted: 2026-11-15, in the 0.1.4 build; a deferral under the user's standing rule that deferrals
-  are noted, not asked.
-
-### Loose reads still differ from TSVZ.py's in six ways
-- Kind: deferred
-- What the operator sees: in a loose file, `tsvz read`, `get` and `keys` differ from TSVZ.py's command line in
-  six ways (one shape is new in 0.1.4: a line of only whitespace alone in a one-column file is a row, as every
-  key alone there is since 0.1.4, where 0.1.3 read every key alone as a deletion):
-  - the values of a `#_defaults_#` line are not filled into the empty cells of the rows after it (tsvz-rs reads
-    the line as a comment);
-  - a `#_defaults_#` line with no value, bare or with blank cells, in a one-column file is a row to TSVZ.py,
-    and no row to tsvz-rs;
-  - a key is not stripped of the whitespace at its end or decoded (`<sep>`, `<LF>`): `a ` and `a` are two keys
-    to tsvz-rs, and one to TSVZ.py; nor is a cell, which keeps its trailing whitespace (a CR among it);
-  - a line whose key is only whitespace is a row to tsvz-rs when it holds a value (or in a one-column file), and
-    a deletion of that key when it is alone or its cells are blank; TSVZ.py skips every such line (`delete`
-    writes such a key as given, so that `popitem` drains a file that holds one);
-  - TSVZ.py cuts every CR before a line's newline, tsvz-rs one (it keeps the rest in the last cell);
-  - a row longer than the file's column count keeps the empty cells at its end, which TSVZ.py cuts (`a<TAB>1`,
-    then `b<TAB>2<TAB><TAB>`: TSVZ.py reads `b<TAB>2`, tsvz-rs `b<TAB>2<TAB><TAB>`).
-- Why: tsvz-rs reads a loose file by its own simple rule (§20.2.4 leaves the data semantics to the implementation);
-  0.1.4 brought the column count (and with it the width rows are padded to), deletions, rewrites and keys alone in
-  line with TSVZ.py's, which was what the user asked for ("Fix both in 0.1.4"), and left the read of cells and keys
-  as it was.
-- Revisit when: 0.2.1. The plan: port TSVZ.py's line rule (`_processLine`, with `_unsanitize`
-  and `_fitRow`) as one function for loose reads, with TSVZ.py as the oracle.
-- Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that deferrals are
-  noted, not asked.
-
-### A loose delete beside a clear can leave the key as a row
-- Kind: deferred
-- What the operator sees: `tsvz delete f.tsv k` running at the same moment as `tsvz clear f.tsv`
-  can leave `k` in the cleared file as a row with no cells. The delete read the file's first
-  keyed line, saw more than one column, and then appended `k` alone, which in the file as the
-  clear left it, with no keyed line, sets one column and is a row. 0.1.3 read a key alone as a deletion at
-  any column count, so that leftover `k` did not show; tsvz-rs 0.1.4 lists it.
-- Why: the delete reads the first keyed line, then appends under the lock without checking that the
-  file is still the one it read. The window is the time between the two.
-- Revisit when: 0.2.1. The plan: append only while the file still has the stamp
-  it was read with, and read again otherwise, as the one-column rewrite already does.
-- Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that
-  deferrals are noted, not asked.
-
-### Three edges of how a loose file names its keys, left to the port of TSVZ.py's line rule
-- Kind: deferred
-- What the operator sees: three narrow cases where tsvz-rs 0.1.4 names a loose line's key differently from
-  TSVZ.py. None is worse than 0.1.3 or loses data.
-  - A one-column `delete` that leaves only `#_defaults_#` lines: `c`, `#_defaults_#<TAB>P`,
-    `#_defaults_#<TAB>`, then `delete c`. tsvz-rs writes a bare `#_defaults_#` line in front, where TSVZ.py's
-    own delete writes none. TSVZ.py then lists `#_defaults_#` as a key of tsvz-rs's file (a bare line at one
-    column is a row to it) and no key of its own; tsvz-rs lists none of either. 0.1.3 appended `c`, and TSVZ.py
-    listed `c` and `#_defaults_#`.
-  - A loose file followed through `Store::refresh` (the library: no command follows a loose file) whose line 1
-    was not complete when the store was opened: `<BOM>a<TAB>x` with no newline, then a newline appended. The
-    followed store lists `a`, a store opened afterwards `<BOM>a`, the key TSVZ.py reads. 0.1.3 listed `a` both
-    ways.
-  - A `.nsv` file whose `#_defaults_#` line begins with a NUL: `0`, then `<NUL>#_defaults_#<NUL><NUL>`, then
-    `delete 0`. The two name the file's keys differently before the delete (TSVZ.py lists `0` and
-    `#_defaults_#`, tsvz-rs `0` only) and write the same bytes after it: tsvz-rs gives the file no stand-in
-    key, so its width goes from one cell to three and the line becomes a reset, as TSVZ.py's own delete does.
-    The same lines without the first NUL get the bare stand-in of the first case from tsvz-rs, and none from
-    TSVZ.py.
-- Why: tsvz-rs names a loose line's key in several places, each by a rule of its own (the rewrite's stand-in
-  key, the line kinds of a scrub, the follow state's byte-order mark), where TSVZ.py has one function; these
-  cases fall between them.
-- Revisit when: 0.2.1. The plan: the port of `_processLine` that "Loose reads still differ
-  from TSVZ.py's in six ways" plans, as one function for a line's key and kind in the read, the rewrite and the
-  follow state, with TSVZ.py as the oracle; these cases go into its tests.
-- Noted: 2026-11-16, in the 0.1.4 re-review; a deferral under the user's standing rule that deferrals are
-  noted, not asked.
+- What the operator sees: a compressed loose file (`.tsv.gz` and the like) whose decoded text does not end with a
+  newline (a file compressed from one saved without a final newline) has its last line joined by the next `set`,
+  `append` or `delete`: the appended member's first record continues that line, so the record is not read, and
+  the last row reads with its cells run on (`b<TAB>1` then `delete b` reads `b<TAB>1b`). TSVZ.py's writers do
+  the same ("a compressed file's last line is not looked at"). A plain loose file gets a newline first, as
+  TSVZ.py's does.
+- Why: whether the decoded text ends with a newline is known only by decoding the file to its end, which an
+  append does not do.
+- Revisit when: 0.2.2. The plan: begin each member a writer appends to a compressed loose file that holds
+  something with a newline: an empty line is read as nothing by both tools, so the cost is a byte per append,
+  and the line before it is ended; or learn the end from the last member, found by the part reader.
+- Noted: 2026-11-23, in the 0.2.1 build (the loose differential test); a deferral under the user's standing rule
+  that deferrals are noted, not asked.
 
 ### A handler on a cifs (SMB) mount is unreachable for the command line
 - Kind: deferred

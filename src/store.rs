@@ -29,7 +29,7 @@ pub enum Scope {
     All,
     /// Keys and their order, no cells (`len`, `keys`, `has`).
     KeysOnly,
-    /// Only these keys (as requested, and with trailing space and tab removed), with cells (`get`).
+    /// Only these keys (as requested, and as a reader resolves them), with cells (`get`).
     Keys(Vec<String>),
 }
 
@@ -173,7 +173,7 @@ impl Table {
                         let resolved = if format.strict {
                             crate::write::resolve(k, format.delimiter).into_owned()
                         } else {
-                            k.clone()
+                            k.trim_end_matches(crate::loose::py_space).to_string()
                         };
                         [k.clone(), resolved]
                     })
@@ -485,8 +485,6 @@ pub struct Store {
     last: Option<(File, u64)>,
     /// Whether its directory's timestamp shows every change of its names.
     pub(crate) dirs: parts::DirTrust,
-    /// The bytes after a loose file's last newline, kept with its lines.
-    tail: Vec<u8>,
     /// The first part read: the last snapshot part, or 0 (§19.10.3).
     start: usize,
     /// The first part read began with `#_snapshot_#` (§19.10.1), by the lines the read decoded.
@@ -610,7 +608,6 @@ impl Store {
             };
             let mut store = Store {
                 replay,
-                tail: Vec::new(),
                 table: Table::new(scope, format),
                 path: path.clone(),
                 format,
@@ -783,9 +780,17 @@ impl Store {
         if self.replay.stopped.is_some() {
             return Ok(());
         }
-        self.replay.tail(framer.tail().len());
-        if self.replay.lines.is_some() {
-            self.tail = framer.tail().to_vec();
+        if self.format.strict {
+            self.replay.tail(framer.tail().len());
+        } else if (!framer.tail().is_empty() || framer.tail_after_bom())
+            && !(self.replay.head && self.replay.one_column.is_some())
+        {
+            // TSVZ.py reads a loose file's unterminated last line as a line (a file of only a
+            // byte-order mark holds one: the mark).
+            let at = (framer.number() + 1, framer.committed());
+            let bom = framer.tail_after_bom();
+            self.replay
+                .loose_tail(framer.tail(), bom, at, &mut self.table);
         }
         if last && part.codec.is_none() {
             self.follow.offset = framer.committed();
@@ -846,8 +851,11 @@ impl Store {
 
     /// The key a requested KEY names (§20.2.7): while the final stripping is on, a key a reader
     /// would strip names the live key equal to it, else what a reader resolves it to (§7.7).
-    /// A loose file's keys name themselves.
+    /// In a loose file, the key without the whitespace at its end, as TSVZ.py reads a key.
     pub fn lookup_key<'k>(&self, requested: &'k str) -> Cow<'k, str> {
+        if !self.format.strict {
+            return Cow::Borrowed(requested.trim_end_matches(crate::loose::py_space));
+        }
         let strip = self.format.strict && self.replay.markers.strip;
         crate::write::name_key(requested, self.format.delimiter, strip, |k| {
             self.table.index.contains_key(k)
@@ -861,8 +869,9 @@ impl Store {
     }
 
     /// What a read of a missing key returns (§14.5): the current defaults, or None (not-found).
+    /// A loose file returns none, as TSVZ.py's command line does.
     pub fn missing(&self) -> Option<Row<'_>> {
-        if self.format.strict && !self.replay.markers.return_missing {
+        if !self.format.strict || !self.replay.markers.return_missing {
             return None;
         }
         Some(Row::new(
@@ -970,12 +979,6 @@ impl Store {
         &self.replay.mismatches
     }
 
-    /// The bytes after a loose file's last newline, when the store was opened with a planner of
-    /// its lines.
-    pub(crate) fn loose_tail(&self) -> &[u8] {
-        &self.tail
-    }
-
     pub fn header(&self) -> Option<&str> {
         self.replay.header.as_deref()
     }
@@ -1062,19 +1065,21 @@ impl Store {
         let mut reader: &File = file;
         reader.seek(SeekFrom::Start(offset)).map_err(io)?;
         reader.read_to_end(&mut data).map_err(io)?;
+        if !self.format.strict && (!self.follow.tail.is_empty() || !data.ends_with(b"\n")) {
+            // A loose file's unterminated last line is read as a line (TSVZ.py's): read again
+            // where one was, or is.
+            return Ok(false);
+        }
         let mut framer = Framer::resume(offset, self.follow.line);
         let (replay, table) = (&mut self.replay, &mut self.table);
         replay.begin_part(&path, last == self.start && offset == 0);
         framer.push(&data, &mut |l| replay.line(l, table));
         let committed = (framer.committed() - offset) as usize;
-        if self.replay.stopped.is_none() {
-            if !framer.tail().is_empty() && framer.tail() != self.follow.tail.as_slice() {
-                self.replay.tail(framer.tail().len());
-            }
-            // Also an empty tail: an append that completes the last line leaves none.
-            if self.replay.lines.is_some() {
-                self.tail = framer.tail().to_vec();
-            }
+        if self.replay.stopped.is_none()
+            && !framer.tail().is_empty()
+            && framer.tail() != self.follow.tail.as_slice()
+        {
+            self.replay.tail(framer.tail().len());
         }
         let mut check = std::mem::take(&mut self.follow.check);
         check.extend_from_slice(&data[..committed.min(data.len())]);
@@ -1759,28 +1764,28 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_that_completes_a_loose_files_last_line_leaves_no_tail() {
+    fn a_loose_files_unterminated_last_line_is_read_and_a_follow_reads_it_again_once_ended() {
+        // TSVZ.py reads it as a line; a follow that appends to it reads the file again, so the
+        // line is read whole (`b<TAB>23`), and a byte-order mark stays part of line 1's key.
         let dir = tempfile::tempdir().unwrap();
-        let p = write(dir.path(), "s.tsv", b"a\t1\nb\t2");
-        struct Count(usize);
-        impl crate::loose::Planner for Count {
-            fn line(&mut self, _: &[u8]) {
-                self.0 += 1;
-            }
-        }
-        let count = Arc::new(std::sync::Mutex::new(Count(0)));
-        let options = Options {
-            lines: Some(count.clone()),
-            ..Options::default()
-        };
-        let mut s = Store::open(&p, options).unwrap();
-        assert_eq!(s.loose_tail(), b"b\t2");
-        append(&p, b"\n");
+        let p = write(dir.path(), "s.tsv", b"\xef\xbb\xbfa\t1");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(keys(&s), ["\u{feff}a"]);
+        append(&p, b"\nb\t2");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(s.get("b").unwrap().to_vec(), ["2"]);
+        append(&p, b"3\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(s.get("b").unwrap().to_vec(), ["23"]);
+        append(&p, b"c\t4\n");
         assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
-        assert_eq!((count.lock().unwrap().0, s.loose_tail()), (2, &b""[..]));
-        append(&p, b"c\t3");
-        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
-        assert_eq!(s.loose_tail(), b"c\t3");
+        assert_eq!(keys(&s), ["\u{feff}a", "b", "c"]);
+        // A file of only a byte-order mark holds one line, the mark, a key alone.
+        let m = write(dir.path(), "m.tsv", b"\xef\xbb\xbf");
+        assert_eq!(
+            keys(&Store::open(&m, Options::default()).unwrap()),
+            ["\u{feff}"]
+        );
     }
 
     #[test]

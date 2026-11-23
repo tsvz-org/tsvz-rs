@@ -390,7 +390,7 @@ fn table_format_on_request() {
 }
 
 #[test]
-fn loose_files_by_the_simple_rule() {
+fn loose_files_as_tsvz_py_reads_and_writes_them() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     fs::write(
@@ -399,8 +399,11 @@ fn loose_files_by_the_simple_rule() {
     )
     .unwrap();
     assert_eq!(records(dir, &["read", "s.csv"]).1, "alice,30\ncarol,<lt>\n");
-    let (code, _, err) = records(dir, &["set", "s.csv", "dave", "a,b"]);
-    assert!(code == 1 && err.contains("loose file"), "{err}");
+    // A cell that holds the delimiter is written `<sep>`, as TSVZ.py writes it, and reads back.
+    assert_eq!(records(dir, &["set", "s.csv", "dave", "a,b"]).0, 0);
+    assert_eq!(records(dir, &["get", "s.csv", "dave"]).1, "dave,a<sep>b\n");
+    let (code, _, err) = records(dir, &["set", "s.csv", "eve", "x</sep/>"]);
+    assert!(code == 1 && err.contains("reads back as another"), "{err}");
     assert_eq!(records(dir, &["set", "s.csv", "dave", "41"]).0, 0);
     assert_eq!(
         records(dir, &["verify", "s.csv"]),
@@ -414,6 +417,45 @@ fn loose_files_by_the_simple_rule() {
     );
     assert_eq!(records(dir, &["clear", "s.csv"]).0, 0);
     assert_eq!(file(dir, "s.csv"), "#name,age\n");
+}
+
+/// A loose file is read as TSVZ.py's command line reads it (`_processLine`): keys and cells
+/// without the whitespace at their end and decoded (`<sep>`, `<LF>`), `#_defaults_#` lines that
+/// fill the empty cells after them, a row wider than the column count without the empty cells at
+/// its end, the unterminated last line as a line, and no row for a missing key.
+#[test]
+fn loose_files_are_read_as_tsvz_py_reads_them() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(
+        dir.join("f.tsv"),
+        "#_defaults_#\tP\tQ\na \t\t1 \r\r\nb\t2\nc\tx<sep>y</sep/><LF>\t\t\nw\t1\t2\t\t\n  \t9\nlast\t5",
+    )
+    .unwrap();
+    assert_eq!(
+        records(dir, &["read", "f.tsv"]).1,
+        "a\tP\t1\nb\t2\tQ\nc\tx<sep>y</sep/><LF>\tQ\nw\t1\t2\nlast\t5\tQ\n"
+    );
+    assert_eq!(
+        records(dir, &["get", "f.tsv", "a  "]),
+        (0, "a\tP\t1\n".into(), String::new())
+    );
+    assert_eq!(
+        records(dir, &["get", "f.tsv", "zz"]),
+        (3, String::new(), String::new())
+    );
+    // A write ends the unterminated last line first, as TSVZ.py's does.
+    assert_eq!(records(dir, &["set", "f.tsv", "n", "7"]).0, 0);
+    assert!(file(dir, "f.tsv").ends_with("last\t5\nn\t7\n"));
+    assert_eq!(
+        records(dir, &["get", "f.tsv", "last", "n"]).1,
+        "last\t5\tQ\nn\t7\tQ\n"
+    );
+    // Lines on standard input are in the file's own encoding, as TSVZ.py takes them.
+    let bulk = run_in(dir, &["set", "f.tsv", "-"], b"m\tx<sep>y\t1\n");
+    assert_eq!(bulk.0, 0, "{}", bulk.2);
+    assert!(file(dir, "f.tsv").ends_with("m\tx<sep>y\t1\n"));
+    assert_eq!(records(dir, &["get", "f.tsv", "m"]).1, "m\tx<sep>y\t1\n");
 }
 
 #[test]
@@ -447,14 +489,13 @@ fn a_loose_delete_decides_from_the_column_count_alone() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     // More than one column: a key alone deletes, and one is appended for each key asked, live
-    // or not, as TSVZ.py appends it, and also without the whitespace at its end, which TSVZ.py
-    // strips when it reads a key and tsvz-rs does not.
+    // or not, as a reader names it: without the whitespace at its end.
     fs::write(dir.join("m.tsv"), "b\t1\nc\t3\n").unwrap();
     let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "b ", "zz"]);
     assert_eq!(code, 0, "{err}");
-    assert!(err.contains("appended 3 tombstones"), "{err}");
-    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nb\nb \nzz\n");
-    // tsvz-rs reads the deletion as TSVZ.py does: `b` is gone. A row it reads as `b ` goes too.
+    assert!(err.contains("appended 2 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\nc\t3\nb\nzz\n");
+    // `b` is gone, and a line whose key is `b ` is `b` too.
     assert_eq!(records(dir, &["keys", "m.tsv"]).1, "c\n");
     fs::write(dir.join("w.tsv"), "b \t1\nc\t3\n").unwrap();
     assert_eq!(records(dir, &["delete", "w.tsv", "b "]).0, 0);
@@ -488,29 +529,26 @@ fn a_loose_delete_decides_from_the_column_count_alone() {
 }
 
 #[test]
-fn a_loose_delete_writes_a_blank_key_as_given_and_says_what_the_head_says_once() {
+fn a_loose_delete_of_a_key_of_only_whitespace_writes_nothing() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    // A key of only whitespace is a row to tsvz-rs, which reads a key whole (TSVZ.py skips such
-    // a line): at more than one column its given spelling is the tombstone, and nothing is
-    // written for the name TSVZ.py would read, which is empty. A tab is no key a loose file can
-    // hold, and is refused, as in 0.1.3.
+    // A key of only whitespace names nothing: a reader skips a line whose key is only
+    // whitespace, as TSVZ.py does. A tab is such a key too, cut as a reader cuts a key's end.
     fs::write(dir.join("m.tsv"), "b\t1\n \t2\nc\t3\n").unwrap();
-    let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", "\t"]);
-    assert!(
-        code == 1 && err.contains("holds the delimiter"),
-        "{code} {err}"
-    );
-    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\n");
+    assert_eq!(records(dir, &["keys", "m.tsv"]).1, "b\nc\n");
+    for key in ["\t", " "] {
+        let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", key]);
+        assert_eq!((code, err.as_str()), (0, ""), "{key:?}");
+    }
     let (code, _, err) = records(dir, &["-v", "delete", "m.tsv", " ", "zz"]);
     assert_eq!(code, 0, "{err}");
-    assert!(err.contains("appended 2 tombstones"), "{err}");
-    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\n \nzz\n");
-    assert_eq!(records(dir, &["keys", "m.tsv"]).1, "b\nc\n");
-    // At one column the lines whose key is only whitespace go.
+    assert!(err.contains("appended 1 tombstones"), "{err}");
+    assert_eq!(file(dir, "m.tsv"), "b\t1\n \t2\nc\t3\nzz\n");
+    // At one column too.
     fs::write(dir.join("o.tsv"), "a\n \nb\n").unwrap();
     assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
-    assert_eq!(file(dir, "o.tsv"), "a\nb\n");
+    assert_eq!(file(dir, "o.tsv"), "a\n \nb\n");
+    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\nb\n");
 }
 
 /// What the read of the head warns of is said once, though a file of one column is read again
@@ -555,9 +593,9 @@ fn a_compressed_loose_delete_says_its_warnings_once_and_names_the_file() {
     }
 }
 
-/// A file whose only rows have a key of only whitespace has no keyed line (TSVZ.py skips them),
-/// and tsvz-rs lists them: a delete of such a key still writes it, which sets no column count, so
-/// that a `popitem` loop ends. A key that is not blank is not written there.
+/// A file whose only lines have a key of only whitespace has no keyed line and no row (a reader
+/// skips such lines, as TSVZ.py does): `popitem` finds nothing, and a delete writes nothing there,
+/// since a key alone would set one column and be a row.
 #[test]
 fn a_blank_key_is_deleted_in_a_file_with_no_keyed_line() {
     let d = tempfile::tempdir().unwrap();
@@ -577,31 +615,15 @@ fn a_blank_key_is_deleted_in_a_file_with_no_keyed_line() {
     assert_eq!(file(dir, "z.tsv"), " \t5\n");
 }
 
-/// At one column too, a key of only whitespace is deleted by its own spelling: TSVZ.py skips such
-/// lines, and tsvz-rs reads each spelling as a row of its own, as a row at more than one column.
-/// A delete of one used to take every line whose key is only whitespace.
-#[test]
-fn a_one_column_delete_of_a_blank_key_takes_that_spelling_only() {
-    let d = tempfile::tempdir().unwrap();
-    let dir = d.path();
-    fs::write(dir.join("o.tsv"), "a\n  \t1\n \t2\n \nb\n").unwrap();
-    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\n  \n \nb\n");
-    assert_eq!(records(dir, &["delete", "o.tsv", " "]).0, 0);
-    assert_eq!(file(dir, "o.tsv"), "a\n  \t1\nb\n");
-    assert_eq!(records(dir, &["keys", "o.tsv"]).1, "a\n  \nb\n");
-    assert_eq!(records(dir, &["delete", "o.tsv", "  "]).0, 0);
-    assert_eq!(file(dir, "o.tsv"), "a\nb\n");
-}
-
 /// `popitem` until the file is empty: it ends within as many calls as there are keys, so a loop
-/// that drains a file ends. A row whose key is only whitespace is one of them.
+/// that drains a file ends. A line whose key is only whitespace is no row.
 #[test]
 fn popitem_drains_a_loose_file_with_a_blank_key() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     for (name, text, rows) in [
-        ("m.tsv", " \t2\na\t1\nb\t3\n", 3),
-        ("o.tsv", "a\n \nb\n", 3),
+        ("m.tsv", " \t2\na\t1\nb\t3\n", 2),
+        ("o.tsv", "a\n \nb\n", 2),
     ] {
         fs::write(dir.join(name), text).unwrap();
         let mut popped = Vec::new();
