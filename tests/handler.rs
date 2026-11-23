@@ -613,19 +613,23 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
 }
 
 #[test]
-fn a_row_taken_and_not_printed_is_named_when_the_handler_has_hung_up() {
+fn a_row_taken_and_not_printed_is_put_back_on_the_files_when_the_handler_has_hung_up() {
     // `pop` took the row and cannot print it (a socket nobody reads), and the handler has hung up
-    // since, so the row cannot be put back either: the command exits 1 naming the row, not ended
-    // by SIGPIPE. A stand-in handler shuts its end for reading before it answers, so that the
-    // put-back fails whatever the timing.
+    // since, so the row cannot be put back through it: it is put back on the files, and the
+    // command exits 1, not ended by SIGPIPE. A stand-in handler deletes the row, then shuts its
+    // end for reading before it answers, so that the put-back through it fails whatever the
+    // timing.
     use std::io::BufRead;
     let dir = tempfile::tempdir().unwrap();
-    let s = store(dir.path(), "a\t1\n");
+    let s = store(dir.path(), "a\t1\nb\t2\n");
     let listener = stand_in_handler(dir.path(), &s);
+    let part = s.clone();
     let handler = std::thread::spawn(move || {
         let conn = accept_within_10s(&listener);
         let mut request = String::new();
         BufReader::new(&conn).read_line(&mut request).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&part).unwrap();
+        file.write_all(b"a\n").unwrap(); // the row's tombstone
         conn.shutdown(std::net::Shutdown::Read).unwrap();
         (&conn).write_all(b"a\t1\n#0\n").unwrap();
     });
@@ -641,11 +645,16 @@ fn a_row_taken_and_not_printed_is_named_when_the_handler_has_hung_up() {
     handler.join().unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(
-        text(&out.stderr).contains("could not be printed nor put back")
-            && text(&out.stderr).contains("a\t1"),
+        text(&out.stderr).contains("it was put back"),
         "{}",
         text(&out.stderr)
     );
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    assert_eq!(
+        left.get("a").map(|r| r.to_vec()),
+        Some(vec!["1".to_string()])
+    );
+    assert!(left.get("b").is_some());
 }
 
 #[test]

@@ -159,20 +159,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### A routed pop whose row cannot be printed, with the handler gone, loses the row
-- Kind: deferred
-- What the operator sees: a `pop` or `popitem` through a handler whose standard output cannot be written (a closed
-  pipe, a full disk) puts the row back with `setdefault`, over the same connection. If the handler has hung up since
-  (a stop in its finish window, or it is gone), the put-back fails: the command exits 1 and says `the row taken could
-  not be printed nor put back (...): ROW`, and the row is gone from the store, named on stderr only. On the files a
-  pop prints before it deletes, so it never loses a row this way. 0.1.4 does the same.
-- Why: the handler writes the row's tombstone before it answers, so the command can undo the pop only through the
-  handler.
-- Revisit when: 0.2.1. The plan: when the put-back fails because the handler is gone, redo the `setdefault` on the
-  files (no handler is left to race with).
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
-
 ### Overlapping `tsvz stop`s: the loser names a dead handler, and a stop can exit 0 with the handler still running
 - Kind: deferred
 - What the operator sees: when two `tsvz stop STORE` overlap (or the second comes in the handler's finish window, or
