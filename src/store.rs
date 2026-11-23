@@ -319,6 +319,12 @@ impl SnapshotLines {
         }
         let d = self.delimiter;
         self.seen += 1;
+        if d != 0 && l.text().contains(&0) {
+            // Zero-filled bytes (a torn write, a file system that wrote the size before the data)
+            // in a first line are damage: its comment is no comment, whatever else it holds.
+            self.damage();
+            return false;
+        }
         let text = String::from_utf8_lossy(l.text());
         let (key, rest) = match memchr::memchr(d, text.as_bytes()) {
             Some(i) => (&text[..i], Some(&text[i + 1..])),
@@ -1593,6 +1599,9 @@ mod tests {
             ("third-line", b"#c\n#d\n#_snapshot_#\nb\t2\n", false),
             ("uncommitted", b"#_snapshot_#", false),
             ("zero-fill", b"\0\0#_snapshot_#\nb\t2\n", false),
+            // Zeros in a comment before the marker are damage, which no snapshot part has.
+            ("zero-in-comment", b"#h\0\0\n#_snapshot_#\nb\t2\n", false),
+            ("zero-in-marker", b"#_snapshot_#\0\nb\t2\n", false),
             ("first", b"#_snapshot_#\nb\t2\n", true),
             ("after-a-comment", b"#h\n#_snapshot_#\nb\t2\n", true),
             // The key in any case, an empty value as none, after a byte order mark, with CRLF.
@@ -1615,6 +1624,29 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_part_that_only_looks_marked_for_the_zeros_in_its_comment_does_not_hide_a_stop() {
+        // Part 0 stops the read at the damage that follows (§4.10); part 1 is no snapshot part
+        // for it, so the read begins at part 0 as the read of every part does, and stops there.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "s.tsvz", b"#_on_corruption_#\tstop\na\t1\n");
+        write(
+            dir.path(),
+            "s.tsvz.1",
+            b"#h\0\0\n#_snapshot_#\na\t1\nb\t2\n",
+        );
+        let p = dir.path().join("s.tsvz");
+        let s = Store::open(&p, Options::default()).unwrap();
+        let every = Options {
+            every_part: true,
+            ..Options::default()
+        };
+        let all = Store::open(&p, every).unwrap();
+        assert_eq!(keys(&s), ["a"]);
+        assert_eq!(keys(&s), keys(&all));
+        assert!(s.incomplete() && all.incomplete());
     }
 
     #[test]
