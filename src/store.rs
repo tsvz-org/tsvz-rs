@@ -1043,6 +1043,10 @@ impl Store {
             || stamp.size < offset
             || stamp.size <= old.size
             || self.follow.check.len() != want
+            // The read ended on a byte-order mark alone, which the framer took off: an appended
+            // line is the part's line 1 (its header, its key, its column count), which a follow
+            // that resumes after the mark does not make it.
+            || (offset > 0 && self.follow.line == 0)
         {
             return Ok(false); // an append only ever grows the same file
         }
@@ -1786,6 +1790,29 @@ mod tests {
             keys(&Store::open(&m, Options::default()).unwrap()),
             ["\u{feff}"]
         );
+    }
+
+    #[test]
+    fn an_append_to_a_file_of_only_a_byte_order_mark_is_read_again_not_followed() {
+        // The appended line is line 1, joined with the mark: a loose file's key `\u{feff}k` (not a
+        // row `\u{feff}` and a key `k` of one column), a strict store's header comment.
+        let dir = tempfile::tempdir().unwrap();
+        let m = write(dir.path(), "m.tsv", b"\xef\xbb\xbf");
+        let mut s = Store::open(&m, Options::default()).unwrap();
+        append(&m, b"k\t1\nj\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        let fresh = Store::open(&m, Options::default()).unwrap();
+        assert_eq!(keys(&s), keys(&fresh));
+        assert_eq!(keys(&s), ["\u{feff}k"]);
+        let z = write(dir.path(), "m.tsvz", b"\xef\xbb\xbf");
+        let mut s = Store::open(&z, Options::default()).unwrap();
+        append(&z, b"#name\tage\nk\t1\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), ["k"]);
+        assert_eq!(s.header(), Some("#name\tage"));
+        append(&z, b"j\t2\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(keys(&s), ["k", "j"]);
     }
 
     #[test]
