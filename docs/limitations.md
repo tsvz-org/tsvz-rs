@@ -159,25 +159,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### Overlapping `tsvz stop`s: the loser names a dead handler, and a stop can exit 0 with the handler still running
-- Kind: deferred
-- What the operator sees: when two `tsvz stop STORE` overlap (or the second comes in the handler's finish window, or
-  just after its listener closed), the first exits 0 and the handler stops; the other exits 1 with `the handler does
-  not answer (... Connection refused ...)` or `(... No such file or directory ...)`, or `the handler went away
-  (Connection reset by peer)`, where it could say the handler is stopping. In 150 overlapping pairs on 0.2.0, 25
-  losers said one of these; 0.1.4 said `stop failed: the handler is stopping` in 7 of 150 and `does not answer` in 16.
-  A stop that comes after the first has finished says `no handler is running` and exits 1, as designed. Also, a
-  `tsvz stop` waits up to 10 s for the handler to be gone and then exits 0 whether or not it is, and its wait for the
-  handler's reply has no limit. From reading; a handler that takes longer than 10 s to close was not reproduced.
-  0.1.4 does the same.
-- Why: `server::stop` turns a failed connect, write or read into `does not answer` or `went away` without asking
-  whether the handler is already stopping, and ends its wait with `Ok(())`; the 10 s has no reason written next to it.
-- Revisit when: 0.2.1. The plan: a stop that loses the race joins the wait for the handler to be gone, and every stop
-  exits by whether the handler is gone; the 10 s gets a reason from a measure of how long a close takes (the finish
-  window is at most 5 s, then the writer's queue and its syncs), and the reply gets a bound.
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
-
 ### The handler can end with SIGSEGV under a flood of connections on a loaded host
 - Kind: deferred
 - What the operator sees: `tsvz serve` ends by SIGSEGV (exit 139, a core where core dumps are on)
