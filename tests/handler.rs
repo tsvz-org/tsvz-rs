@@ -70,6 +70,29 @@ impl Served {
         // SAFETY: kill only sends a signal to the child, which is still ours to reap.
         unsafe { libc::kill(self.child.id() as i32, signal) };
     }
+
+    /// Stop the handler with SIGSTOP and return once it has stopped: `kill` returns before the
+    /// signal has taken hold, and a request sent meanwhile can be answered (in the runs where a
+    /// test failed so, no thread of the handler had stopped just after `kill`).
+    fn pause(&self) {
+        self.signal(libc::SIGSTOP);
+        let mut status = 0;
+        loop {
+            // SAFETY: waits for a change of state of the child, which is still ours to reap;
+            // WUNTRACED reports its stop, which comes once every thread of it has stopped.
+            let pid =
+                unsafe { libc::waitpid(self.child.id() as i32, &mut status, libc::WUNTRACED) };
+            if pid < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert!(
+                pid > 0 && libc::WIFSTOPPED(status),
+                "the handler did not stop: {pid} {status:#x}"
+            );
+            return;
+        }
+    }
 }
 
 impl Drop for Served {
@@ -329,13 +352,16 @@ fn a_child_spawned_while_a_client_connects_never_inherits_its_connection() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "a\t1\n");
-    let _served = Served::start(&s, &[]);
+    let mut served = Served::start(&s, &[]);
     let done = Arc::new(AtomicBool::new(false));
     let connector = {
         let (done, s) = (done.clone(), s.clone());
         std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
-                drop(tsvz::handler::Client::connect(&s).unwrap());
+                // A connect the handler is too slow to take (its queue full under this flood
+                // on a busy host: "not accepting connections") still made its socket, which is
+                // what a child must not inherit.
+                let _ = tsvz::handler::Client::connect(&s);
             }
         })
     };
@@ -355,6 +381,12 @@ fn a_child_spawned_while_a_client_connects_never_inherits_its_connection() {
         inherited, 0,
         "{inherited} of 600 children inherited a client socket"
     );
+    let ended = served.child.try_wait().unwrap();
+    assert!(
+        ended.is_none(),
+        "the handler ended {ended:?}: {}",
+        served.stderr()
+    );
 }
 
 #[test]
@@ -365,7 +397,7 @@ fn a_zero_timeout_is_the_shortest_wait_not_none() {
     let served = Served::start(&s, &[]);
     let client = tsvz::handler::Client::connect(&s).unwrap();
     let mut client = client.timeout(Some(Duration::ZERO));
-    served.signal(libc::SIGSTOP);
+    served.pause();
     let (done, answered) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = done.send(client.get("a").is_err());
@@ -1196,7 +1228,7 @@ fn a_client_never_reads_an_answer_meant_for_a_request_it_gave_up_on() {
     let c = Client::connect(&s)
         .unwrap()
         .timeout(Some(Duration::from_millis(100)));
-    served.signal(libc::SIGSTOP);
+    served.pause();
     let mut c = c;
     let lost = c.get("a");
     served.signal(libc::SIGCONT);

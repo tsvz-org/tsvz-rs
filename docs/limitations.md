@@ -178,15 +178,24 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### Two older handler tests fail now and then when the whole test binary runs in parallel
+### The handler can end with SIGSEGV under a flood of connections on a loaded host
 - Kind: deferred
-- What the operator sees: nothing; a test run. Running the handler test binary again and again with its tests in
-  parallel, `a_client_never_reads_an_answer_meant_for_a_request_it_gave_up_on` failed in 4 of 940 runs, at its first
-  assertion with `Ok(Some(["a", "1"]))`: the `get` made while the handler had been sent SIGSTOP was answered. In 120
-  runs of a variant, `a_zero_timeout_is_the_shortest_wait_not_none` failed once (its panic text was not kept). Both
-  tests are older than 0.2.0.
-- Why: not diagnosed. For the first, the stop signal may take hold of the handler's threads after it has answered.
-- Revisit when: 0.2.1. The plan: run each in a loop beside the other tests with the panic text kept, and fix the
-  test, or the code if it is wrong.
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
+- What the operator sees: `tsvz serve` ends by SIGSEGV (exit 139, a core where core dumps are on)
+  while a client makes and closes connections in a tight loop on a heavily loaded host: its clients
+  then find it gone (a write exits 1, a read uses the files), and writes it had acknowledged but not
+  yet written are lost. Seen in 5 of 4,000 runs of the handler test binary, eight copies at once
+  (`a_child_spawned_while_a_client_connects_never_inherits_its_connection`; debug builds, Rust
+  1.100, glibc 2.41, Linux 7.0); a flood alone (16 processes, up to 990,000 connections in 10 s, 16
+  rounds, with and without a 120-task limit) did not reproduce it. 0.2.0 is the same.
+- Why: not diagnosed. The four cores kept (of five crashes) all stop in `pthread_detach`, called by
+  the drop of the `JoinHandle` that `std::thread::Builder::spawn` had just returned in
+  `server::start_connection`; the one read that far faults at `pthread_detach+28`, reading the new
+  thread's descriptor, whose memory is no longer mapped: the thread's stack was freed before its
+  handle was detached. Whether glibc, std or the handler is at fault is not known.
+- Revisit when: 0.2.2. The plan: reproduce with the test loop (eight lanes of the handler test
+  binary) on a release build and on Rust 1.85; read the cores with glibc's debug symbols; if it is
+  glibc's or std's, draft an upstream report and work around it in one place (a connection thread
+  that is joined rather than detached, say); else fix it.
+- Noted: 2026-11-23, in the 0.2.1 build (h021); a deferral under the user's standing rule that
+  deferrals are noted, not asked.
+
