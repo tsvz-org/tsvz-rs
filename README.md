@@ -117,6 +117,19 @@ Stores need nothing; the library's documented API does not change.
   newline before it appends (0.2.0 cut that line).
 - A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
   less memory.
+- Through a handler: `tsvz stop` exits 0 when another stop or a signal stopped the handler first
+  (it exited 1, "does not answer" or "went away"), and exits 1 when the handler is still there
+  30 s after the request (it waited 10 s and exited 0 either way). A stopping handler no longer
+  cuts off a `pop` or `popitem` that waits for its write, even past the stop's 5 s; until it has
+  written its queued writes, a command that reaches it finds it gone (a write exits 1, a read uses
+  the files) instead of working on the files beside it. A routed `pop` whose row cannot be
+  printed is put back on the files when the handler cannot put it back. While a `#_write_ack_#`
+  the handler queued is not yet written, every write through it is answered once written and
+  synced. A read that falls back from a lost handler no longer warns that it "may or may not have
+  been applied", and a command that meets a handler just as it stops no longer warns of a hard
+  link.
+- A `scrub` or `clear` whose part another scrub renames away while it waits for the part's lock
+  reads the store again, instead of rewriting the renamed file.
 
 ## Upgrading to 0.2.0 from 0.1.4
 
