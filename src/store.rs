@@ -1978,6 +1978,18 @@ mod tests {
     }
 
     #[test]
+    fn a_loose_files_header_is_line_1_without_the_nuls_at_its_start() {
+        // As a reader reads the line (`_processLine`), and as 0.2.0 gave the header.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "h.tsv", b"\0\0#name\tage\na\t1\n");
+        let s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(
+            (s.header(), keys(&s)),
+            (Some("#name\tage"), vec!["a".to_string()])
+        );
+    }
+
+    #[test]
     fn a_loose_files_last_member_cut_short_leaves_its_unfinished_line_unread() {
         // A line a cut member ends in is no line (TSVZ.py reads the whole lines of such a member):
         // the unterminated last line of a plain loose file is read, this one is not.

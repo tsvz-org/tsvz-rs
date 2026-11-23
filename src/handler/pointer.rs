@@ -78,16 +78,20 @@ fn read(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{} is not a regular file ({e})", path.display())),
     };
-    let meta = file
+    let kind = file
         .metadata()
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    if !meta.is_file() {
+    if !kind.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
     let mut data = Vec::new();
     Read::by_ref(&mut file)
         .take(SIZE_LIMIT + 1)
         .read_to_end(&mut data)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // Taken after the read, so that a pointer removed while it was read has no name left in it.
+    let meta = file
+        .metadata()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if data.len() as u64 > SIZE_LIMIT {
         return Err(format!(
@@ -185,7 +189,9 @@ fn trust(
     meta: &std::fs::Metadata,
 ) -> Result<Option<Info>, String> {
     if meta.nlink() == 0 {
-        // Removed since it was opened: its handler has stopped, as if there were none.
+        // Removed before `meta` was taken, after the file was read: its handler has stopped, as if
+        // there were none. A removal after that is not seen: the socket it names is gone or
+        // refuses, which a client reports as a handler that does not answer.
         return Ok(None);
     }
     // SAFETY: geteuid only reads the process's user id.
@@ -733,8 +739,9 @@ mod tests {
 
     #[test]
     fn a_pointer_removed_after_it_was_opened_names_no_handler() {
-        // A stopping handler removes its pointer file: a client that opened it just before finds
-        // it with no name left, which is no handler, not a second name (a hard link).
+        // A stopping handler removes its pointer file: a client that read it just before finds it
+        // with no name left, which is no handler, not a second name (a hard link). `trust` is given
+        // the open file's metadata as `read` takes it, after the read.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         plant(&s, &text("unix:/x/s", &hostname()), 0o644);

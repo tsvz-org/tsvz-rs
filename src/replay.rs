@@ -605,7 +605,7 @@ impl Replay {
         let d = self.format.delimiter;
         let Some(mut cells) = parse(text, d, terminated) else {
             if self.lines_read == 0 && text.trim_start_matches('\0').starts_with('#') {
-                self.header = Some(text.to_string());
+                self.header = Some(text.trim_start_matches('\0').to_string());
             }
             self.lines_read += 1;
             return;
