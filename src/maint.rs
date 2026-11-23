@@ -1204,30 +1204,9 @@ fn live_after_any_prefix(
 }
 
 /// Whether the file system holding `path` overwrites a file's blocks in place, so that the
-/// space `reserve` takes for a rewrite is really there (ext2/3/4, XFS, f2fs, tmpfs). Not a
-/// copy-on-write one (btrfs, ZFS, bcachefs, APFS), which needs new blocks to overwrite, and not
-/// one it cannot tell.
-#[cfg(target_os = "linux")]
+/// space `reserve` takes for a rewrite is really there ([`parts::Fs`]).
 fn overwrites_in_place(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
-        return false;
-    }
-    const EXT: i64 = 0xEF53;
-    const XFS: i64 = 0x5846_5342;
-    const F2FS: i64 = 0xF2F5_2010;
-    const TMPFS: i64 = 0x0102_1994;
-    matches!(fs.f_type as i64, EXT | XFS | F2FS | TMPFS)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn overwrites_in_place(_path: &Path) -> bool {
-    false
+    parts::fs_at(path).in_place
 }
 
 /// Whether `e` is a full disk or quota.
