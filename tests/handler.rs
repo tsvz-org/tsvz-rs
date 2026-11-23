@@ -967,6 +967,10 @@ fn a_handler_that_hangs_up_falls_back_for_reads_and_fails_writes() {
     let (code, out, err) = cli(d, &["--format", "records", "get", "s.tsvz", "k"], b"");
     assert_eq!((code, out.as_str()), (0, "k\tv\n"), "{err}");
     assert!(err.contains("lost the handler"), "{err}");
+    assert!(
+        !err.contains("may or may not"),
+        "a read applies nothing: {err}"
+    );
     let (code, _, err) = cli(d, &["set", "s.tsvz", "n", "w"], b"");
     assert_eq!(code, 1);
     assert!(err.contains("may or may not"), "{err}");

@@ -256,17 +256,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
   asked.
 
-### A read that falls back during a stop warns that it may or may not have been applied
-- Kind: deferred
-- What the operator sees: a `read`, `get`, `has`, `len` or `keys` that loses the connection to a stopping handler
-  runs on the files and gives the right answer, exit 0, but warns `lost the handler (Connection reset by peer (os
-  error 104)); the request may or may not have been applied; using the files directly`, though a read applies
-  nothing. Seen in 16 of 200 `get`s racing a stop. 0.1.4 says the same.
-- Why: the fallback warns with the whole `HandlerLost` error, whose text is written for a write.
-- Revisit when: 0.2.1. The plan: for a read-only operation, warn with the I/O reason alone.
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
-
 ### Two older handler tests fail now and then when the whole test binary runs in parallel
 - Kind: deferred
 - What the operator sees: nothing; a test run. Running the handler test binary again and again with its tests in

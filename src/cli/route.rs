@@ -114,8 +114,12 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
             Some(deliver(ctx, &mut client, &response))
         }
         Ok(response) => Some(print(ctx, &response)),
-        Err(e) if READ_ONLY.contains(&op.as_str()) => {
-            warn(ctx, format!("{e}; using the files directly"));
+        // A read applies nothing: the reason alone, not a write's "may or may not have been applied".
+        Err(Error::HandlerLost(why)) if READ_ONLY.contains(&op.as_str()) => {
+            warn(
+                ctx,
+                format!("lost the handler ({why}); using the files directly"),
+            );
             None
         }
         Err(e) => Some(Err(e)),
