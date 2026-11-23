@@ -1995,7 +1995,7 @@ mod tests {
         // 0.2.1's first build compared the file's stamp with the one before its head read, and
         // refused (`kept changing`) a delete that each of its three tries found overtaken by an
         // append (2 of 150 beside six writers). Only a clear or a rewrite matters: the file's head
-        // sets its column count. A stamp check fails this about every run (60 deletes, 3 tries).
+        // sets its column count. A stamp check fails this nearly every run (500 deletes, 3 tries each: 30 of 30 runs measured).
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
@@ -2014,7 +2014,7 @@ mod tests {
                 n
             })
         };
-        let deleted: Vec<_> = (0..60)
+        let deleted: Vec<_> = (0..500)
             .map(|i| delete_loose(&p, &opts(), &[format!("k{i}")]))
             .collect();
         stop.store(true, Ordering::Relaxed);
