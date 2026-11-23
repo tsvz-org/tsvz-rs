@@ -1409,9 +1409,7 @@ mod loose_round_trip {
         "a", "e", "s", "p", "L", "F", "<", ">", "/", "#", "_", "\0", " ", "\t", "\n", "\r",
         "<sep>", "<LF>", "</sep/>", "</LF/>", "#_defaults_#", "\u{1c}", "\u{a0}", ",", "x",
     ];
-    const DS: &[u8] = &[
-        b'\t', b',', b'e', b'<', b'/', b'#', b'>', b'L', b' ', b'\0', b's', b'_', b'x',
-    ];
+    const DS: &[u8] = b"\t,e</#>L \0s_x";
 
     /// The cells `line` reads back as equal `fields` less some whitespace at their ends.
     fn same(line: &str, d: u8, fields: &[String]) -> bool {
