@@ -176,3 +176,35 @@ entries go last, in the same commit as the change:
   `_cliStop` does the same).
 - Lesson: a command that asks for an outcome waits for that outcome, whoever brought it about, and
   reports a wait that runs out as not reached, never as success.
+
+## 2026-11-23 A writer checks that what it writes reads back
+- Changed: a loose `set` (and every loose write through `Writer`) refuses a cell whose encoding still holds the
+  delimiter (`-d e` and `set k hello`: `<sep>` has an `e`, so the line read back as `h<s` and `p>llo`), and a key that
+  could never be read back: one that begins with `#` (a comment), begins with a NUL (a reader drops it) or is only
+  whitespace (no key). A tombstone of such a key is still written (it deletes nothing). Before, 0.2.1's build wrote
+  all of them with exit 0.
+- Why we had to change: 0.2.0 refused any delimiter in a cell, which made a cell holding a delimiter unwritable;
+  0.2.1 encoded it as TSVZ.py does (`<sep>`) and so dropped the refusal, but the encoding itself holds the letters
+  `s e p L F < > /`, which a delimiter can be, and the keys a reader skips were written as before (0.2.0 wrote
+  them too; the whitespace key was a 0.2.1 regression, since 0.2.0 read such a key). Found by the second opinions of the
+  0.2.1 final review (R07a-1, R08-1 to R08-3), built in the fix round.
+- Original design was wrong because: the encoder was tested on the cells it was meant to carry, not on the
+  inputs the refusal it replaced had covered, and nothing asked the reader's own rule whether the line it was about to
+  write gave the key and cells back.
+- Lesson: when a port replaces a refusal with an encoding, run the reader's own rule over the output for every input the
+  refusal covered; an encoding is a promise only as wide as the cases it was tried on.
+
+## 2026-11-23 An optimistic check guards the property, not the stamp
+- Changed: a loose `delete` at more than one column appends its key alone to the file it read, or to that file with
+  more appended since by another writer: the writer checks the file's inode, that it is no shorter, and its last
+  4 KiB, instead of the part's stamp (inode, size, mtime). Before, any change refused the delete (three tries, then
+  `delete skipped`), and a `pop` had already printed its row.
+- Why we had to change: the stamp was added so that a `clear` between the read and the append cannot turn the key
+  alone into a one-column row; it also refused every other writer's append, which changes size and mtime, though the
+  decision (the file's column count, set by its first keyed line) is the same after an append. 0.2.0 appended
+  whatever happened; the check made a busy file harder to delete from than that.
+- Original design was wrong because: the check was written for the case that found the bug (a clear) as an equality on
+  everything the file has, not on the property the decision rested on.
+- Lesson: when a write is made only while the file is as it was read, check what the decision depended on (here: the same
+  file, no shorter, its end as it was), not a stamp of everything; a stamp refuses every change, the harmless ones
+  too, and so fails under the load it was meant to tolerate.
