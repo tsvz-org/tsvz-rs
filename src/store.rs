@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
 
@@ -259,6 +259,54 @@ pub(crate) struct Follow {
     pub tail: Vec<u8>,
     /// Up to CHECK_BYTES bytes just before `offset`.
     pub check: Vec<u8>,
+}
+
+/// What an attempt to read a store says, held while the attempt may still be thrown away: one that
+/// begins at a snapshot part says nothing until the read confirms the part, and is dropped with
+/// what it said when it does not (the store is then read again from an earlier part, and the
+/// damage the attempt met is met and said once).
+struct Hold {
+    real: Option<WarnFn>,
+    /// None: said as they come.
+    held: Mutex<Option<Vec<Warning>>>,
+}
+
+impl Hold {
+    fn new(real: Option<WarnFn>) -> Arc<Hold> {
+        Arc::new(Hold {
+            real,
+            held: Mutex::new(None),
+        })
+    }
+
+    /// Where the attempt says its warnings; None where nothing hears them.
+    fn sink(self: &Arc<Hold>) -> Option<WarnFn> {
+        self.real.as_ref()?;
+        let hold = self.clone();
+        Some(Arc::new(move |w: &Warning| {
+            let mut held = hold.held.lock().unwrap_or_else(|e| e.into_inner());
+            match held.as_mut() {
+                Some(list) => list.push(w.clone()),
+                None => {
+                    drop(held);
+                    hold.real.iter().for_each(|real| real(w));
+                }
+            }
+        }))
+    }
+
+    /// Hold what is said from now on.
+    fn begin(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+
+    /// The attempt is kept: say what was held, and the rest as it comes.
+    fn release(&self) {
+        let list = self.held.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(real) = &self.real {
+            list.iter().flatten().for_each(|w| real(w));
+        }
+    }
 }
 
 /// How many times a store is read when an earlier part changes under the read.
@@ -602,7 +650,12 @@ impl Store {
         }
         let mut below = usize::MAX;
         loop {
-            let mut replay = Replay::new(format, options.verify, options.warnings.clone());
+            let hold = Hold::new(options.warnings.clone());
+            let attempt = Options {
+                warnings: hold.sink(),
+                ..options.clone()
+            };
+            let mut replay = Replay::new(format, options.verify, attempt.warnings.clone());
             if !format.strict {
                 replay.lines = options.lines.clone();
             }
@@ -619,7 +672,7 @@ impl Store {
                 table: Table::new(scope, format),
                 path: path.clone(),
                 format,
-                options: options.clone(),
+                options: attempt,
                 parts: Vec::new(),
                 unreadable: Vec::new(),
                 limit,
@@ -630,8 +683,12 @@ impl Store {
                 start: 0,
                 marked: false,
             };
-            store.load(below)?;
-            if store.start == 0 || store.marked {
+            let loaded = store.load(below, &hold);
+            if loaded.is_err() || store.start == 0 || store.marked {
+                hold.release();
+                loaded?;
+                store.options.warnings = options.warnings.clone();
+                store.replay.set_warn(options.warnings.clone());
                 return Ok(store);
             }
             below = store.start;
@@ -639,8 +696,9 @@ impl Store {
         }
     }
 
-    /// Read the parts, from the last one before `below` that looks like a snapshot part.
-    fn load(&mut self, below: usize) -> Result<(), Error> {
+    /// Read the parts, from the last one before `below` that looks like a snapshot part; `hold`
+    /// holds what the read says while it begins at one, until the part is confirmed.
+    fn load(&mut self, below: usize, hold: &Hold) -> Result<(), Error> {
         // Sampled before the listing, so that a name made meanwhile shows as a change.
         let dir = self.dirs.stamp(&self.path);
         let (mut list, linked) = parts::list_linked(&self.path)?;
@@ -657,6 +715,9 @@ impl Store {
             0
         };
         let start = self.start;
+        if start > 0 {
+            hold.begin();
+        }
         if !self.options.skip_unreadable {
             if let Some(part) = list[start..]
                 .iter()
@@ -1550,7 +1611,8 @@ mod tests {
             let p = dir.path().join("s.tsvz.gz");
             let list = parts::list(&p).unwrap();
             assert!(looks_marked(&list[2], name::format_of(&p).unwrap()));
-            let s = Store::open(&p, Options::default()).unwrap();
+            let (said, options) = hearing();
+            let s = Store::open(&p, options).unwrap();
             let every = Options {
                 every_part: true,
                 ..Options::default()
@@ -1558,7 +1620,52 @@ mod tests {
             let all = keys(&Store::open(&p, every).unwrap());
             assert_eq!(keys(&s), all[from..], "{earlier:?}");
             assert!(s.damaged(), "{earlier:?}: the damaged part was read");
+            // The attempt that began at the part said nothing: the read says its damage once.
+            let said = said.lock().unwrap();
+            let used = said.iter().filter(|m| m.contains("not verified")).count();
+            assert_eq!(used, 1, "{earlier:?}: {said:?}");
         }
+    }
+
+    /// Options whose warnings are collected, as text.
+    fn hearing() -> (Arc<Mutex<Vec<String>>>, Options) {
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let sink = said.clone();
+        let options = Options {
+            warnings: Some(Arc::new(move |w: &Warning| {
+                sink.lock().unwrap().push(w.message.clone())
+            })),
+            ..Options::default()
+        };
+        (said, options)
+    }
+
+    #[test]
+    fn a_read_that_falls_back_from_a_part_that_only_looks_marked_says_what_the_policy_says() {
+        // Under stop in part 0 the damaged member stops the read: the attempt from the part before
+        // it, with the policy it began with (recover), used the member's bytes and said so, which
+        // never happened; the read that says the stop is the one said.
+        let gz = |t: &[u8]| crate::codec::encode_member(Codec::Gzip, t).unwrap();
+        let mut bad = gz(noise("#_snapshot_#\nc\t3\n", 2000).as_bytes());
+        let n = bad.len();
+        bad[n - 8] ^= 1;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "s.tsvz.gz",
+            &gz(b"#_on_corruption_#\tstop\na\t1\n"),
+        );
+        write(dir.path(), "s.tsvz.1.gz", &gz(b"b\t2\n"));
+        write(dir.path(), "s.tsvz.2.gz", &bad);
+        let p = dir.path().join("s.tsvz.gz");
+        let (said, options) = hearing();
+        let s = Store::open(&p, options).unwrap();
+        assert_eq!(keys(&s), ["a", "b"]);
+        assert!(s.stopped().is_some());
+        let said = said.lock().unwrap();
+        assert!(!said.iter().any(|m| m.contains("not verified")), "{said:?}");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("reading stopped there"), "{said:?}");
     }
 
     #[test]

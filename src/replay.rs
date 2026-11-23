@@ -326,6 +326,11 @@ impl Replay {
         self.format
     }
 
+    /// Say warnings to `warn` from now on.
+    pub fn set_warn(&mut self, warn: Option<WarnFn>) {
+        self.warn = warn;
+    }
+
     /// Start a part. `first` marks the store's first part, whose first line may be its header.
     pub fn begin_part(&mut self, path: &Path, first: bool) {
         self.part = path.to_path_buf();
