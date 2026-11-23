@@ -107,3 +107,176 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 build (h021); a deferral under the user's standing rule that
   deferrals are noted, not asked.
 
+### Reads of a loose file take more CPU than 0.2.0's, and pad every line
+- Kind: deferred
+- What the operator sees: reading a loose file (`.tsv .csv .nsv .psv`) costs more CPU than in 0.2.0: on a 120 MB
+  `.tsv` of 2,000,000 rows of four cells, `get` of one key takes 0.21 s (0.2.0: 0.10 s), `len` 1.27 s (1.01 s), `keys`
+  1.18 s (1.03 s) and `read` 1.64 s (1.28 s); memory is the same, and a strict store is not affected. A file whose
+  first keyed line is very wide (a second opinion's reading, not measured: 10,000 tabs, then a million rows) costs a
+  step per
+  padded cell on every line, and a whole read holds every row padded to that width (8 bytes a cell), where 0.2.0 held
+  each row's own cells and padded them when it printed them.
+- Why: a loose line is read by TSVZ.py's line rule, which splits and decodes every cell of every line, and pads it to
+  the file's column count, before the read asks whether it wants that key.
+- Revisit when: 0.2.2. The plan: decode a line's key, count its cells and test them for a value without building them;
+  decode and pad the cells only for a `#_defaults_#` line or a key the read wants (a row keeps its own cells and is
+  padded when it is read).
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A head read can hold what one page of compressed input decodes to
+- Kind: deferred
+- What the operator sees: a loose `delete` in a compressed file (a read that stops at the file's first keyed line)
+  holds about 1 MiB of a member and, by the formats' best ratios, as much as one 64 KiB page of input decodes to
+  before the next check: up to 64 MiB for deflate (1032 to one) and 2 GiB for zstd (a 128 KiB run-length block in 4
+  bytes). Only crafted input reaches that (from the formats' ratios, not measured); files compressed by tsvz-rs or
+  TSVZ.py stay near 1 MiB.
+- Why: the decoder takes a whole page of input per call, and the part reader checks the output's length after the
+  call.
+- Revisit when: 0.2.2. The plan: give the decoder a bounded output buffer per call (the part reader then tells a stop
+  at that cap from a stall), and say the real bound in `codec::read_items`'s comment.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A request's own `#_write_ack_#` marker does not make that request's writes durable
+- Kind: deferred
+- What the operator sees: a bulk `set -` through a handler that carries `#_write_ack_#<TAB>disk` and then `k<TAB>v` is
+  answered at once, and `k<TAB>v` is not synced, though the files now say `disk`: after a power loss it can be gone,
+  where §21.9.2 says a write made while `disk` is in force is acknowledged after its sync. TSVZ.py decides the same
+  way.
+- Why: durability is decided before the request's own markers are queued; whether a request's markers apply to the
+  rest of that request is a question of the specification (§21.9.2) that both tools answer alike.
+- Revisit when: 0.2.2. The plan: settle the rule with the TSVZ session (a request's markers apply from the line after
+  them), put it in §21.9.2 and a conformance case, then queue the request's markers before deciding its durability in
+  both tools.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### `tsvz stop` can wait 30 s and fail where the old stop answered at once
+- Kind: deferred
+- What the operator sees: two cases (a second opinion's reading of the code, not reproduced). (1) The handler closes a
+  connection unanswered for a reason of its own (no descriptor left, no thread to start): `tsvz stop` takes that for
+  "stopping already", waits 30 s and fails with `has not stopped within 30 s` while the handler serves (0.2.0 failed
+  at once). (2) A handler killed after it replied to a stop and before it removed its pointer file leaves the file,
+  which still names it: `tsvz stop` waits 30 s and fails (0.2.0 gave 0 after 10 s).
+- Why: the stop tells a handler that is gone from one that is not by the pointer file's name alone.
+- Revisit when: 0.2.2. The plan: also try the pointer file's `flock`, which the system releases when the handler's
+  process ends (gone when it can be taken), and after a close with no answer ask once more after a short wait: a
+  handler that answers is serving, and the stop says so at once.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A routed `pop` or `popitem` whose answer is lost in transit loses its row
+- Kind: deferred
+- What the operator sees: the handler deletes the row before its answer is written to the client: a client that times
+  out or hangs up in between (a killed command, a broken connection) has neither printed the row nor put it back, and
+  the error (`lost the handler`) names no row. 0.2.0 does the same; 0.2.1 puts back a row the command could not print,
+  not one it never received (a second opinion's finding, by reading).
+- Why: the pop is one step in the handler: take the row, queue its deletion, answer.
+- Revisit when: 0.2.2. The plan: a pop in two steps: the handler holds the row hidden from other requests until its
+  answer is written, then deletes it, and gives it back when the write fails; or accept it as a known limitation, with
+  the user's OK.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A stop that cannot write or sync its queue still ends cleanly
+- Kind: deferred
+- What the operator sees: a second opinion's reading of the code, not reproduced: `stop` flushes the queue and replies
+  `#0` though a batch of plain (not `--x-written`) writes failed, so a write the handler had acknowledged is lost; a
+  failed flush replies `#1` and the handler stops anyway; a failed sync at exit is only logged and the handler ends
+  with status 0; the close has a narrow window between its last sync and the pointer file's removal. The command
+  line's own writes are answered once written, so only a raw client sees the first.
+- Why: the stop path does not carry a failure of the writer's last batch into its answer, the handler's exit status or
+  its log.
+- Revisit when: 0.2.2. The plan: the writer remembers the first failed write or sync; a stop answers `#1` with it,
+  `serve` ends with status 1 and logs it as an error, and the sync at close is made before the pointer file goes.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### `serve` leaves SIGINT, SIGTERM and SIGHUP blocked once it has returned
+- Kind: deferred
+- What the operator sees: a program that embeds `handler::server::serve` (a hidden function) and goes on after a stop
+  has the three signals blocked in its calling thread, and a signal thread waiting in `sigwait` for the life of the
+  process. `tsvz serve` itself exits.
+- Why: `serve` blocks the signals for the thread it started in and never restores the mask.
+- Revisit when: 0.2.2. The plan: restore the mask and end the signal thread when `serve` returns.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### The stop's gone check compares the process id alone
+- Kind: deferred
+- What the operator sees: a pointer file of another handler that has the process id of the one `tsvz stop` stopped (a
+  pid that was reused) is that handler to `tsvz stop`, which waits for it to go (a second opinion's reading, not
+  reproduced).
+- Why: the gone check compares the pid alone.
+- Revisit when: 0.2.2. The plan: compare the pointer's address too.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A scrub of a loose file can change a row a strict TSVZ.py reader reads
+- Kind: deferred
+- What the operator sees: a loose `scrub` moves a key's last line into its first line's place even when it has fewer
+  cells (`K 1 2` then `K 9` becomes `K 9`): both tools' command lines read `K` alike before and after (`[K, 9, ]`),
+  but TSVZ.py's strict read of the library (`readTSV(strict=True)`, which drops a narrower line) read `K` as `[K, 1,
+  2]` before and finds no `K` after. TSVZ.py's scrub docstring promises that every reader reads the file as before.
+  0.2.0 does the same.
+- Why: the scrub keeps what a reader of the command line reads, and takes no strict reader's reading into account.
+- Revisit when: 0.2.2. The plan: decide with the TSVZ session whether a scrub must keep what a strict reader takes: if
+  so, move a key's last line into its first line's place only where it has at least as many cells; if not, record it
+  as a known limitation (the user's OK).
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### Bulk input to a loose file is read by its own rule, not the loose line rule
+- Kind: deferred
+- What the operator sees: `tsvz set f.tsv -` (and `append`, `delete -`) with a loose-format payload drops a
+  `#_defaults_#` line as a comment instead of writing it, and a key with NULs at its start keeps them, where a reader
+  reads the key without them. 0.2.0 does the same.
+- Why: `ops::parse_records` tests the raw first field for a comment and strips no NULs.
+- Revisit when: 0.2.2. The plan: give bulk input of a loose format to `loose::parse`, the one rule a reader uses (a
+  `#_defaults_#` line is a record, NULs at a line's start are dropped, a comment is skipped).
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A loose `clear` writes no blank line 1 before the defaults it keeps
+- Kind: deferred
+- What the operator sees: when line 1 of a loose file is neither a comment nor empty and `clear` keeps `#_defaults_#`
+  lines (it does, by the user's pick of 2026-11-14), the cleared file begins with a defaults line; TSVZ.py's `clear`
+  writes an empty line 1 (and keeps no defaults), so a TSVZ.py program that reads the file with a header takes the
+  defaults line for its header (a second opinion's reading of TSVZ.py, not run). Both tools' command lines read the
+  file alike.
+- Why: `ClearPlan` keeps line 1 only when it is a comment or empty.
+- Revisit when: 0.2.2. The plan: write the blank line 1 before the defaults it keeps (the tests in `loose.rs` that
+  encode its absence change), or record the departure in docs/silent-choices.md.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### `scrub` and `clear` refuse a loose file whose name ends in a number
+- Kind: deferred
+- What the operator sees: `tsvz scrub app.tsv.1` or `clear` of a loose file named `<x>.tsv.<number>` says it is one
+  part of a multi-part store and refuses; `delete` and `list` treat it as one file. 0.2.0 does the same.
+- Why: the name is read as a numbered part (§17.2), which a loose file has none of.
+- Revisit when: 0.2.2. The plan: a loose path's numeric suffix names a file, not a part, for `scrub` and `clear` as
+  for the rest (`name.rs`); check §17.2 and §5.2 with the TSVZ session first.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A loose `delete` names a key with a newline or a delimiter at its end by the key without it
+- Kind: deferred
+- What the operator sees: `tsvz delete f.tsv $'a\n'` writes the tombstone for `a`, and deletes it, though `a` and
+  `a<LF>` are two keys (a key with a NUL at its start the same, as its NUL-less form). 0.2.0 does the same.
+- Why: the key is trimmed of whitespace before it is encoded, where a reader trims the cell as the file has it.
+- Revisit when: 0.2.2. The plan: encode the key, then trim it (`loose::sanitize` and `py_space`), as a reader names
+  it.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
+
+### A loose delete that loses a race backs the file up again
+- Kind: deferred
+- What the operator sees: a loose `delete` that rewrites a damaged file, and whose rewrite is overtaken by another
+  writer's append, makes another `.damaged-<time>` copy on its next attempt and says the damage twice. 0.2.0 does the
+  same.
+- Why: the backup is made before each attempt's rewrite.
+- Revisit when: 0.2.2. The plan: make the backup once, when an attempt is about to commit its rewrite.
+- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
+  not asked.
