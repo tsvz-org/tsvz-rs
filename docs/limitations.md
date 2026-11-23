@@ -86,138 +86,24 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; a deferral under the
   user's standing rule that deferrals are noted, not asked.
 
-### A command that meets a handler just as it removes its pointer file can warn about a hard link
+### The handler can end with SIGSEGV under a flood of connections on a loaded host
 - Kind: deferred
-- What the operator sees: a command that opens the pointer file just before a stopping handler removes it says
-  `ignoring the pointer file: PATH has another name (a hard link), so its owner may not have put it there; using the
-  files directly`, then works on the files and exits 0. Only the text is wrong. `tsvz stop` does not fall back: it
-  exits 1 with the same words (`PATH has another name (a hard link), so its owner may not have put it there`).
-  Seen in 6 of about 141,000 `get` commands over three stress runs of 0.2.0 builds that stopped a handler under 24
-  clients (Rust 1.85.1), and in none of about 51,000 in the run of 0.1.4; the code that refuses is the same in 0.1.4.
-- Why: `lookup` refuses any link count but 1 (anyone may link a file they can see), and a file removed after it was
-  opened has link count 0.
-- Revisit when: 0.2.1. The plan: `lookup` treats link count 0 as no handler, without a warning (`tsvz stop` then
-  says `no handler is running`, and exits 1 as it does for a handler that is not there).
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
+- What the operator sees: `tsvz serve` ends by SIGSEGV (exit 139, a core where core dumps are on)
+  while a client makes and closes connections in a tight loop on a heavily loaded host: its clients
+  then find it gone (a write exits 1, a read uses the files), and writes it had acknowledged but not
+  yet written are lost. Seen in 5 of 4,000 runs of the handler test binary, eight copies at once
+  (`a_child_spawned_while_a_client_connects_never_inherits_its_connection`; debug builds, Rust
+  1.100, glibc 2.41, Linux 7.0); a flood alone (16 processes, up to 990,000 connections in 10 s, 16
+  rounds, with and without a 120-task limit) did not reproduce it. 0.2.0 is the same.
+- Why: not diagnosed. The four cores kept (of five crashes) all stop in `pthread_detach`, called by
+  the drop of the `JoinHandle` that `std::thread::Builder::spawn` had just returned in
+  `server::start_connection`; the one read that far faults at `pthread_detach+28`, reading the new
+  thread's descriptor, whose memory is no longer mapped: the thread's stack was freed before its
+  handle was detached. Whether glibc, std or the handler is at fault is not known.
+- Revisit when: 0.2.2. The plan: reproduce with the test loop (eight lanes of the handler test
+  binary) on a release build and on Rust 1.85; read the cores with glibc's debug symbols; if it is
+  glibc's or std's, draft an upstream report and work around it in one place (a connection thread
+  that is joined rather than detached, say); else fix it.
+- Noted: 2026-11-23, in the 0.2.1 build (h021); a deferral under the user's standing rule that
+  deferrals are noted, not asked.
 
-### A scrub or clear can rewrite a part that was rotated away between its open and its lock
-- Kind: deferred
-- What the operator sees: when the part a `scrub` or `clear` has opened (a scrub's target, the last of the parts
-  before the active one, or the only part of a one-part store; `clear` rewrites the only part) is renamed away by
-  another scrub's rotation (to `.rotated`, which the part listing skips) in the moment between its opening by path
-  and taking its lock, the rewrite goes into the renamed file, and the command reports success while the store
-  still holds the rows it meant to change. A loose file is never rotated. From reading; the window was not
-  reproduced.
-- Why: `maint::rewrite` opens the part by path and locks it, and compares only the stamp of the file it opened with
-  the one its caller read; `Writer::append_at` also checks, after its lock, that the path still names the file it
-  holds. 0.1.4 is the same.
-- Revisit when: 0.2.1. The plan: check `names` after the lock in `rewrite` as `append_at` does, so the rewrite is
-  refused as a change by another writer and the scrub tries again; a test with a hook that renames the part between
-  the open and the lock.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A row queued behind a failing `#_write_ack_# memory` batch is acknowledged without a sync
-- Kind: deferred
-- What the operator sees: a client sends `#_write_ack_# memory` to a store whose file says `disk`, and its batch
-  fails to write (a full disk or an I/O error; also a file size limit, when the handler ignores SIGXFSZ, whose
-  default action ends the process). A plain write another client sent before that failure was seen is acknowledged
-  before it is written, and written without a sync, while the file still says `disk` (§21.9): a crash before the
-  system writes it back loses a row the handler promised to sync. Rows sent after the failure was seen are synced
-  again. Checked by running (a file size limit, with SIGXFSZ ignored, makes the marker's batch fail); 0.1.4 does the
-  same.
-- Why: `Engine::submit` takes the acknowledgement mode and the member size from the markers still queued, which the
-  failed batch never clears; the engine drops them only when it next follows the files.
-- Revisit when: 0.2.1. The plan: a queued `memory` does not relax a `disk` the store has already written, until the
-  store has followed the file; the cost is latency for rows sent in that window.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A pop that is still waiting when a stop's five seconds end loses its row
-- Kind: deferred
-- What the operator sees: a stop by a signal (SIGINT, SIGTERM or SIGHUP), or a pop that arrives after a `tsvz stop`
-  request's flush, while a `pop` or `popitem`'s batch is still being written when the five seconds the stop allows
-  end (a slow disk, a flood of other writes): the pop has queued its tombstone, which the stop writes before it
-  ends, but its connection is cut before the row reaches the client. The row is gone from the store, the command
-  exits 1 with `may or may not have been applied`, and nobody has the row. A `tsvz stop` request flushes the queued
-  batches, with no limit, before it ends the accept loop, so a pop it had queued is answered. From reading; to be
-  reproduced first. 0.1.4 drains the same way.
-- Why: `finish_connections` gives requests already read `FINISH` (5 s) and then ends every connection still open;
-  `pop` and `popitem` delete the row, so their answer is the only copy of it.
-- Revisit when: 0.2.1. The plan: reproduce with a stalled write; then wait for a request whose batch is being
-  written with a bound of its own, whose reason is written next to it (a stalled disk must not hold a stop forever),
-  keeping the five seconds for a client that does not read its answer.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A pop on the files while a stopping handler has one in flight can take the same row
-- Kind: deferred
-- What the operator sees: once a stopping handler has closed its listener, a command that connects is refused and
-  works on the files. A `pop` there can read a row as live that a `pop` already in flight in the handler took, whose
-  tombstone the handler has not yet written, and take it too: two clients get the same row. The window lasts until
-  that batch is written, longer under a slow sync. From reading; to be reproduced first. 0.1.4 closes its listener
-  at the same point.
-- Why: the listener goes first and the pointer file stays until the queue is written, so a command in the window
-  finds a pointer file with nothing behind it and does what it does when a handler is gone.
-- Revisit when: 0.2.1. The plan: reproduce with a stalled batch; then hold the listener open until the queued
-  tombstones are written, so that a command in the window is closed (a write exits 1) and does not run on the files.
-- Noted: 2026-11-17, in the 0.2.0 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A routed pop whose row cannot be printed, with the handler gone, loses the row
-- Kind: deferred
-- What the operator sees: a `pop` or `popitem` through a handler whose standard output cannot be written (a closed
-  pipe, a full disk) puts the row back with `setdefault`, over the same connection. If the handler has hung up since
-  (a stop in its finish window, or it is gone), the put-back fails: the command exits 1 and says `the row taken could
-  not be printed nor put back (...): ROW`, and the row is gone from the store, named on stderr only. On the files a
-  pop prints before it deletes, so it never loses a row this way. 0.1.4 does the same.
-- Why: the handler writes the row's tombstone before it answers, so the command can undo the pop only through the
-  handler.
-- Revisit when: 0.2.1. The plan: when the put-back fails because the handler is gone, redo the `setdefault` on the
-  files (no handler is left to race with).
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
-
-### Overlapping `tsvz stop`s: the loser names a dead handler, and a stop can exit 0 with the handler still running
-- Kind: deferred
-- What the operator sees: when two `tsvz stop STORE` overlap (or the second comes in the handler's finish window, or
-  just after its listener closed), the first exits 0 and the handler stops; the other exits 1 with `the handler does
-  not answer (... Connection refused ...)` or `(... No such file or directory ...)`, or `the handler went away
-  (Connection reset by peer)`, where it could say the handler is stopping. In 150 overlapping pairs on 0.2.0, 25
-  losers said one of these; 0.1.4 said `stop failed: the handler is stopping` in 7 of 150 and `does not answer` in 16.
-  A stop that comes after the first has finished says `no handler is running` and exits 1, as designed. Also, a
-  `tsvz stop` waits up to 10 s for the handler to be gone and then exits 0 whether or not it is, and its wait for the
-  handler's reply has no limit. From reading; a handler that takes longer than 10 s to close was not reproduced.
-  0.1.4 does the same.
-- Why: `server::stop` turns a failed connect, write or read into `does not answer` or `went away` without asking
-  whether the handler is already stopping, and ends its wait with `Ok(())`; the 10 s has no reason written next to it.
-- Revisit when: 0.2.1. The plan: a stop that loses the race joins the wait for the handler to be gone, and every stop
-  exits by whether the handler is gone; the 10 s gets a reason from a measure of how long a close takes (the finish
-  window is at most 5 s, then the writer's queue and its syncs), and the reply gets a bound.
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
-
-### A read that falls back during a stop warns that it may or may not have been applied
-- Kind: deferred
-- What the operator sees: a `read`, `get`, `has`, `len` or `keys` that loses the connection to a stopping handler
-  runs on the files and gives the right answer, exit 0, but warns `lost the handler (Connection reset by peer (os
-  error 104)); the request may or may not have been applied; using the files directly`, though a read applies
-  nothing. Seen in 16 of 200 `get`s racing a stop. 0.1.4 says the same.
-- Why: the fallback warns with the whole `HandlerLost` error, whose text is written for a write.
-- Revisit when: 0.2.1. The plan: for a read-only operation, warn with the I/O reason alone.
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.
-
-### Two older handler tests fail now and then when the whole test binary runs in parallel
-- Kind: deferred
-- What the operator sees: nothing; a test run. Running the handler test binary again and again with its tests in
-  parallel, `a_client_never_reads_an_answer_meant_for_a_request_it_gave_up_on` failed in 4 of 940 runs, at its first
-  assertion with `Ok(Some(["a", "1"]))`: the `get` made while the handler had been sent SIGSTOP was answered. In 120
-  runs of a variant, `a_zero_timeout_is_the_shortest_wait_not_none` failed once (its panic text was not kept). Both
-  tests are older than 0.2.0.
-- Why: not diagnosed. For the first, the stop signal may take hold of the handler's threads after it has answered.
-- Revisit when: 0.2.1. The plan: run each in a loop beside the other tests with the panic text kept, and fix the
-  test, or the code if it is wrong.
-- Noted: 2026-11-17, in the 0.2.0 re-review; a deferral under the user's standing rule that deferrals are noted, not
-  asked.

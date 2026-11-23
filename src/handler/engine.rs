@@ -301,9 +301,11 @@ struct State {
     /// Warnings raised while handling the current request: its `#!` lines.
     said: Arc<Mutex<Vec<String>>>,
     closed: bool,
-    /// The last `#_write_ack_#` and `#_member_size_#` values queued, with their sequence
-    /// numbers: until the store follows the files past them, they govern later writes.
-    queued_ack: Option<(u64, &'static str)>,
+    /// The sequence number of the last `#_write_ack_#` queued: until the store follows the files
+    /// past it, later writes are made durable, whatever it says (its batch may fail).
+    queued_ack: Option<u64>,
+    /// The last `#_member_size_#` value queued, with its sequence number: until the store follows
+    /// the files past it, it governs later writes.
     queued_member_size: Option<(u64, u64)>,
     /// The last sequence number written when the store last followed the files, and the
     /// writer's count of batches that found other writers' data then.
@@ -511,9 +513,11 @@ impl Engine {
     }
 
     /// Encode `records` for the store and queue them; None when there is nothing to write.
-    /// Whether the write is made durable, and its member size, follow the markers as they stand
-    /// where it will be appended: the files followed now, then the markers still queued. The
-    /// request waits for a durable write, and for any when `written`.
+    /// Its member size follows the markers as they stand where it will be appended: the files
+    /// followed now, then the markers still queued. It is made durable when the files say
+    /// `#_write_ack_# disk`, and while a `#_write_ack_#` this handler queued is not yet followed,
+    /// whatever that says: a `memory` whose batch fails leaves the files saying `disk` (§21.9).
+    /// The request waits for a durable write, and for any when `written`.
     fn submit(
         &self,
         st: &mut State,
@@ -534,8 +538,14 @@ impl Engine {
         // a request arrived, another request's or a follow, already shows every write
         // committed before it came.
         let start = Instant::now();
-        if !(st.store.is_some() && st.checked.is_some_and(|c| c > arrived)) {
-            let others = self.batcher.others_wrote(st.foreign)
+        // A `#_write_ack_#` of ours that its batch has written, or failed to write: the files
+        // say which, so they are followed past it.
+        let ack_landed = st
+            .queued_ack
+            .is_some_and(|seq| seq > st.reflected && seq <= self.batcher.progress().0);
+        if ack_landed || !(st.store.is_some() && st.checked.is_some_and(|c| c > arrived)) {
+            let others = ack_landed
+                || self.batcher.others_wrote(st.foreign)
                 || !st
                     .store
                     .as_mut()
@@ -548,18 +558,19 @@ impl Engine {
         }
         let reflected = st.reflected;
         let markers = st.store.as_ref().map(Store::markers);
-        let ack = queued(st.queued_ack, reflected).or(markers.map(|m| m.write_ack));
+        let ack_queued = st.queued_ack.is_some_and(|seq| seq > reflected);
+        let ack = markers.map(|m| m.write_ack);
         let member_size = member_size
             .or(queued(st.queued_member_size, reflected))
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
         let payload = crate::write::encode(records, self.format)?;
-        let durable = sync || ack == Some("disk");
+        let durable = sync || ack_queued || ack == Some("disk");
         let waited = durable || written;
         let seq = self.batcher.submit(payload, member_size, durable, waited);
         for (key, m) in records.iter().filter_map(crate::write::marker_effect) {
             match key.as_str() {
-                "#_write_ack_#" => st.queued_ack = Some((seq, m.write_ack)),
+                "#_write_ack_#" => st.queued_ack = Some(seq),
                 "#_member_size_#" => st.queued_member_size = Some((seq, m.member_size)),
                 _ => {}
             }
@@ -1040,14 +1051,119 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
         }
         submit(&marker("#_member_size_#", "7"));
-        assert!(!submit(&data()).waited, "#_write_ack_# memory, queued");
+        assert!(
+            submit(&data()).waited,
+            "#_write_ack_# memory, queued: its batch may yet fail"
+        );
         let last_size = || lock(&e.batcher.queue).entries.last().unwrap().member_size;
         assert_eq!(last_size(), 7);
         submit(&marker("#_member_size_#", "zero")); // invalid: ignored, as a reader ignores it
         submit(&data());
         assert_eq!(last_size(), 7);
         drop(held);
+        e.batcher.barrier();
+        assert!(!submit(&data()).waited, "written: the files say memory");
         assert_eq!(ask(&e, "get\tk").lines, ["k\tv"]);
+    }
+
+    #[test]
+    fn a_queued_write_ack_memory_relaxes_nothing_until_the_files_show_it() {
+        // The store says disk, and a client sets #_write_ack_# memory whose batch fails (a full
+        // disk): a write sent meanwhile is not acknowledged before it is written and synced, as
+        // if the marker had been written.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        let content = "#_write_ack_#\tdisk\na\t1\n";
+        fs::write(&p, content).unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, Instant::now(), records, false, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let data = |k: &str| {
+            [Record::Data {
+                key: k.into(),
+                values: vec!["v".into()],
+            }]
+        };
+        let memory = [Record::Marker {
+            key: "#_write_ack_#".into(),
+            values: vec!["memory".into()],
+        }];
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
+        let marker = submit(&memory);
+        assert!(marker.waited, "the store says disk");
+        // The writer waits for the lock on this part, which it has opened: the part can go.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while crate::lock::waiters_on(&p) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never waited for the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let row = submit(&data("b"));
+        assert!(row.waited, "the marker is not written yet");
+        // The marker's batch fails, and so does the row's: a directory where the part was.
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        drop(held);
+        assert!(e.batcher.wait(marker.seq).is_err());
+        assert!(
+            e.batcher.wait(row.seq).is_err(),
+            "the row's client is told, not answered before it was written"
+        );
+        fs::remove_dir(&p).unwrap();
+        fs::write(&p, content).unwrap();
+        assert!(submit(&data("c")).waited, "the files still say disk");
+        e.batcher.barrier();
+        assert!(submit(&memory).waited);
+        e.batcher.barrier();
+        assert!(!submit(&data("d")).waited, "written and followed: memory");
+    }
+
+    #[test]
+    fn a_queued_write_ack_disk_applies_at_once_and_a_memory_after_it_relaxes_nothing() {
+        // A client sets #_write_ack_# disk and goes on writing before the marker is written: its
+        // writes are made durable at once. A `memory` queued after it relaxes nothing either: the
+        // `disk` may be written and the `memory` fail.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, Instant::now(), records, false, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let data = [Record::Data {
+            key: "k".into(),
+            values: vec!["v".into()],
+        }];
+        let ack = |value: &str| {
+            [Record::Marker {
+                key: "#_write_ack_#".into(),
+                values: vec![value.into()],
+            }]
+        };
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
+        assert!(!submit(&ack("disk")).waited, "the store says memory");
+        while !lock(&e.batcher.queue).entries.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
+        }
+        assert!(submit(&data).waited, "#_write_ack_# disk, queued");
+        submit(&ack("memory"));
+        assert!(submit(&data).waited, "a disk, then a memory, both queued");
+        drop(held);
+        e.batcher.barrier();
+        assert!(!submit(&data).waited, "written and followed: memory");
     }
 
     #[test]

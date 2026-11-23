@@ -140,3 +140,39 @@ entries go last, in the same commit as the change:
 - Lesson: when a cheap look guides an expensive read, let the look only choose and have the read
   confirm from what it decodes anyway, falling back when it does not: the look then needs no rules of
   its own, and cannot make the result depend on how it looked.
+
+## 2026-11-23 A stopping handler keeps its listener until its queue is written
+- Changed: a handler that stops goes on accepting connections, and closes each unread, until every
+  queued write is written; it then removes its pointer file, and only then closes its listener. A
+  `pop` or `popitem` still in flight when the stop's 5 s end is no longer cut off: the stop writes
+  its tombstone, as before, and its answer is given 5 s more to be written; the other connections
+  are cut off then, and a connection cut off begins no other request. Before, the listener closed
+  first and every connection was cut off at 5 s.
+- Why we had to change: a command that found the listener closed ran on the files, where a `pop` read
+  a row as live that a `pop` in the handler had taken and whose tombstone was still queued, so two
+  clients got one row; and a pop cut off at 5 s lost its row, whose tombstone the stop went on to
+  write (deferrals of the 0.2.0 final review, built in 0.2.1).
+- Original design was wrong because: it closed the handler's front door before the work it still
+  held was written, so the clients' fallback ran against files that did not yet show that work; and
+  it cut connections off by time alone, though the stop makes their requests' writes anyway, so for
+  a pop the cut lost the only copy of the row.
+- Lesson: a server that stops keeps telling new clients it is gone (closing them unread) until the
+  work they could race with is written, and announces it is gone only then; it never cuts off an
+  answer that is the only copy of what its own write removed, since the stop makes that write anyway.
+
+## 2026-11-23 A stop exits by whether the handler is gone
+- Changed: `tsvz stop` (and `handler::server::stop`) exits 0 once the handler's pointer file no longer
+  names it, also when another stop, a signal or the idle timeout stopped it first: a connection the
+  handler closes unread means it is stopping, and the stop waits for it as the first stop does. It
+  exits 1 when the handler is still there 30 s after the request, the wait for its answer included.
+  Before, a stop that lost the race exited 1 with "does not answer" or "went away", and every stop
+  waited at most 10 s for the handler to go and then exited 0 whether it had or not; the wait for the
+  answer had no limit.
+- Why we had to change: two stops that overlap both mean "stop it", and the handler stops; one of them
+  failed (48 of 150 overlapping pairs on 0.2.0, under 24 clients). And a stop that exits 0 is read as
+  "it is gone", which the 10 s wait did not check (0.2.0 re-review deferrals, built in 0.2.1).
+- Original design was wrong because: it reported which request had reached the handler, not the
+  outcome the operator asked for, and it ended its wait with success when its time ran out (TSVZ.py's
+  `_cliStop` does the same).
+- Lesson: a command that asks for an outcome waits for that outcome, whoever brought it about, and
+  reports a wait that runs out as not reached, never as success.

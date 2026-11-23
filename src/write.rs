@@ -218,7 +218,7 @@ pub struct Appended {
 }
 
 /// Whether `path` still names the file `file` is open on.
-fn names(path: &Path, file: &File) -> bool {
+pub(crate) fn names(path: &Path, file: &File) -> bool {
     use std::os::unix::fs::MetadataExt;
     let (Ok(open), Ok(named)) = (file.metadata(), std::fs::metadata(path)) else {
         return false;

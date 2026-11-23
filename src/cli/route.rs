@@ -3,11 +3,11 @@
 use std::io::{BufWriter, Write};
 
 use crate::cli::output::{Printer, stdout_error};
-use crate::cli::write::bulk;
+use crate::cli::write::{self, bulk};
 use crate::cli::{Ctx, NoSigpipe};
 use crate::handler::protocol::{Response, decode, decode_fields, field};
 use crate::handler::{Client, pointer};
-use crate::ops::{Out, protocol_record};
+use crate::ops::{Out, protocol_record, record_line};
 use crate::{Error, Warning};
 
 /// What a command line forwards. `verify` and `parts` read the files themselves and gain nothing
@@ -114,8 +114,12 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
             Some(deliver(ctx, &mut client, &response))
         }
         Ok(response) => Some(print(ctx, &response)),
-        Err(e) if READ_ONLY.contains(&op.as_str()) => {
-            warn(ctx, format!("{e}; using the files directly"));
+        // A read applies nothing: the reason alone, not a write's "may or may not have been applied".
+        Err(Error::HandlerLost(why)) if READ_ONLY.contains(&op.as_str()) => {
+            warn(
+                ctx,
+                format!("lost the handler ({why}); using the files directly"),
+            );
             None
         }
         Err(e) => Some(Err(e)),
@@ -125,7 +129,8 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
 /// Print the row a `pop` or `popitem` took. The handler deleted it before answering (on the
 /// files the row is printed first): when it cannot be printed (a closed pipe, a full disk), it
 /// is put back with `setdefault`, which keeps a row written for its key since, and the command
-/// fails.
+/// fails. When the handler does not put it back (it went away, is stopping, or failed), the
+/// `setdefault` is made on the files: a stopping handler has written its queue first.
 fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i32, Error> {
     let printed = {
         let _sigpipe = NoSigpipe::new();
@@ -150,25 +155,49 @@ fn deliver(ctx: &mut Ctx, client: &mut Client, response: &Response) -> Result<i3
     }
     // As `read --format records` prints it: given to `set STORE -`, it is the same row again.
     let row = &response.lines[0];
-    let store = ctx.store.display();
+    let store = ctx.store.display().to_string();
     let put_back = {
         let _sigpipe = NoSigpipe::new();
         client.send(&line, None)
     };
-    match put_back {
-        Ok(r) if r.status == 0 && r.lines.first() == Some(row) => {
+    // The row its key now reads, as a response line; or why it could not be put back.
+    let now: Result<Option<String>, String> = match put_back {
+        Ok(r) if r.status == 0 => Ok(r.lines.first().cloned()),
+        not_back => {
+            let why = match not_back {
+                Ok(r) => r.message,
+                Err(lost) => lost.to_string(),
+            };
+            match write::put_back(ctx, &fields) {
+                Ok(Some((key, cells))) => {
+                    let mut now = String::new();
+                    record_line(
+                        &mut now,
+                        &key,
+                        cells.iter().map(String::as_str),
+                        b'\t',
+                        true,
+                    );
+                    now.pop();
+                    Ok(Some(now))
+                }
+                Ok(None) => Err(format!(
+                    "{why}; on the files: could not read every part of the store"
+                )),
+                Err(files) => Err(format!("{why}; on the files: {files}")),
+            }
+        }
+    };
+    match now {
+        Ok(Some(now)) if now == *row => {
             diag!("tsvz: {store}: the row taken could not be printed; it was put back");
         }
-        Ok(r) if r.status == 0 => diag!(
+        Ok(now) => diag!(
             "tsvz: {store}: the row taken could not be printed; put back, its key reads {} (written since, or stripped as the store now strips); the row taken was: {row}",
-            r.lines.first().map_or("", String::as_str)
+            now.unwrap_or_default()
         ),
-        Ok(r) => diag!(
-            "tsvz: {store}: the row taken could not be printed nor put back ({}): {row}",
-            r.message
-        ),
-        Err(put) => {
-            diag!("tsvz: {store}: the row taken could not be printed nor put back ({put}): {row}")
+        Err(why) => {
+            diag!("tsvz: {store}: the row taken could not be printed nor put back ({why}): {row}")
         }
     }
     Err(e)
