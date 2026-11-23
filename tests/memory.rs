@@ -29,7 +29,7 @@ fn peak_rss_kib(dir: &Path, args: &[&str]) -> (i32, i64) {
     (status, usage.ru_maxrss)
 }
 
-/// Write `rows` rows of the layout the measurements in docs/limitations.md use (`key%07d`, two
+/// Write `rows` rows of the layout the release notes' measurements use (`key%07d`, two
 /// cells of 16 hex digits, `some text here`) after a header line, as one gzip member: the bytes
 /// of text written.
 fn one_gzip_member(path: &Path, rows: u64) -> u64 {

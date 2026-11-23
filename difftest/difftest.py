@@ -253,6 +253,11 @@ def changed_reads(rust, python, store, delimiter, directory, how):
             key = rows[len(rows) // 2].split(d)[0].decode('utf-8', errors='replace')
             if '<' in key or '\ufffd' in key or '\0' in key:
                 return []  # printed encoded, not as it was written, or no argument can hold it
+            with open(store, 'rb') as f:
+                if f.read().endswith(b'\0'):
+                    # An unterminated last line that ends in NULs reads with them once a write ends it
+                    # (TSVZ.py's own delete does the same), so the rows no longer follow from the old ones.
+                    return []
             op = ['delete', key]
             want = [r for r in rows if r.split(d)[0] != key.encode()]
         elif how == 'set':

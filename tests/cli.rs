@@ -597,7 +597,7 @@ fn a_compressed_loose_delete_says_its_warnings_once_and_names_the_file() {
 /// skips such lines, as TSVZ.py does): `popitem` finds nothing, and a delete writes nothing there,
 /// since a key alone would set one column and be a row.
 #[test]
-fn a_blank_key_is_deleted_in_a_file_with_no_keyed_line() {
+fn a_file_of_blank_keys_has_no_row_and_a_delete_writes_nothing_there() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     for text in [" \t5\n", "#h\n \n\x0b\t2\n"] {
@@ -692,8 +692,7 @@ fn a_loose_scrub_and_clear_keep_what_tsvz_py_reads() {
 fn a_loose_rewrite_keeps_the_bytes_after_the_last_newline() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    // TSVZ.py reads that line as a row; tsvz-rs does not list it (docs/limitations.md), but
-    // a scrub and a one-column delete leave it where it is.
+    // Both read that line as a row; a scrub and a one-column delete leave it where it is.
     fs::write(dir.join("s.tsv"), "#h\na\t1\na\t2\nb\t9").unwrap();
     assert_eq!(records(dir, &["scrub", "s.tsv"]).0, 0);
     assert_eq!(file(dir, "s.tsv"), "#h\na\t2\nb\t9");
