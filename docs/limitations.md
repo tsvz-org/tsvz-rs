@@ -104,33 +104,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-16, in the 0.1.4 final review; a deferral under the user's standing rule that
   deferrals are noted, not asked.
 
-### A read replays every part, also those before a snapshot part
-- Kind: deferred
-- What the operator sees: a read of a multi-part strict store replays every part, as in 0.1.3, however much of
-  the store lies before its last snapshot part. TSVZ.py begins at that part and skips the ones before it
-  (§19.10.3 lets a reader do so, it does not oblige it). On a store that follows §19.10.2 the rows are the
-  same, and the time differs: a `get` on 20 gzip parts of history (50,000 keys written 20 times), a snapshot
-  part in 1 MiB members and a small active part takes 0.18 s (0.1.3: 0.18 s), where a read that begins at the
-  snapshot part takes 0.02 s. Two cases differ in more than time:
-  - a part before the snapshot part that is damaged under `#_on_corruption_# stop`: tsvz-rs, as §4.10 says,
-    reads nothing after the damage, in that part or a later one, snapshot part included, and TSVZ.py, which
-    begins at the snapshot part, reads it and does not see the damage; under `recover`, both read the same
-    rows, and only tsvz-rs warns that the damaged part's recovered bytes are not verified;
-  - a snapshot part that does not restate the parts before it, which a producer must not write: tsvz-rs reads
-    every part and TSVZ.py only from the snapshot part.
-  A `scrub` writes the marker and finds a part marked.
-- Why: finding the part to begin at takes a look at the start of every part, apart from the read. 0.1.4 tried
-  that look in the read and removed it from the read (a scrub still uses it to find a marked part): it cost a second decode of each part's start (most on bzip2 parts and on a
-  snapshot part of one large member), and leaving bzip2 out of it made the answer on such a store depend on
-  the codec.
-- Revisit when: 0.2.1. The plan: the read judges a part from its first lines as it decodes
-  them, one rule for every codec, and a look before the read only chooses where to begin, from each part's
-  first page; the read of that part confirms it, or the store is read again from part 0. It must also choose,
-  for the first case, between §4.10 and TSVZ.py's start (§19.10.3 says the result is the same, which does not
-  hold there).
-- Noted: 2026-11-16, in the 0.1.4 fix rounds; a deferral under the user's standing rule that deferrals are
-  noted, not asked.
-
 ### A loose scrub and a one-column delete hold every line of the file in memory
 - Kind: deferred
 - What the operator sees: `tsvz scrub` of a loose file, and `delete`, `pop` and `popitem` in a loose file of

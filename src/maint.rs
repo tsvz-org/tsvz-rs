@@ -447,13 +447,14 @@ fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// A whole read for a rewrite: never past a part it cannot read, since what it writes would
-/// lose that part's rows.
+/// A whole read for a rewrite: of every part, also those before the last snapshot part, and never
+/// past a part it cannot read, since what it writes would lose that part's rows.
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
         verify: false,
         skip_unreadable: false,
+        every_part: true,
         lines: true,
         ..options.clone()
     }
@@ -869,9 +870,12 @@ fn snapshot_part(
     // One that other parts precede must also carry #_snapshot_# (a part a 0.1.3 scrub wrote does
     // not), or readers would go on replaying them: such a part gets a marked copy, once.
     let others = &prefix[..prefix.len() - 1];
-    let marked = others.is_empty() || crate::store::is_snapshot_part(last, s.format());
     let size = std::fs::metadata(&last.path).map(|m| m.len());
-    if marked && size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
+    let alone = match size {
+        Ok(len) if len <= bytes.len() as u64 => Store::open(&last.path, all_rows()).ok(),
+        _ => None,
+    };
+    if alone.is_some_and(|a| (others.is_empty() || a.marked()) && same_reading(&a, s)) {
         if others.is_empty() || action == "keep" {
             return Ok(Snapshotted::Done(Outcome::Unchanged));
         }
@@ -1064,11 +1068,15 @@ fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, 
 /// Whether the recovery copy reads as the store it compacts: the same rows (padding aside, §3.6)
 /// and the same final markers (§19.4). A guard before a part is rewritten.
 fn reads_as(recovery: &Path, s: &Store) -> bool {
-    let options = Options {
+    Store::open(recovery, all_rows()).is_ok_and(|r| same_reading(&r, s))
+}
+
+/// A read of every row, for a check of what a part reads as alone.
+fn all_rows() -> Options {
+    Options {
         scope: Scope::All,
         ..Options::default()
-    };
-    Store::open(recovery, options).is_ok_and(|r| same_reading(&r, s))
+    }
 }
 
 /// Whether the recovery copy, read after the parts `earlier` read, reads as the store it
@@ -2787,8 +2795,9 @@ mod tests {
     #[test]
     fn a_scrub_keeps_the_rows_of_every_part_also_those_before_a_snapshot_part() {
         // The snapshot part restates nothing of part 0, against §19.10.2: a reader that begins
-        // at it never sees `a`, but one that replays every part does (§19.10.3, as tsvz-rs
-        // does), and what a scrub writes must read the same to both.
+        // at it (§19.10.3, a read of tsvz-rs or TSVZ.py) never sees `a`, but one that replays
+        // every part does (a scrub's read, `verify`), and what a scrub writes must read the same
+        // to both.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();

@@ -29,9 +29,9 @@ Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz,
 into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
 one-part store in place. In a multi-part store it writes the parts before the active one as a
 new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
-applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
-as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to 0.2.1. `scrub` and
-`clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
+applies the store's `#_rotate_#`; writers keep appending throughout. A read begins at the last
+snapshot part (§19.10.3) and does not open the parts before it; `verify` reads every part.
+`scrub` and `clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
 Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
 except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
@@ -97,7 +97,7 @@ Build without the command line and C libraries with
 ## Conformance and compatibility
 
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
-every codec, every digest and multi-part scrub claimed, and is checked
+every codec, every digest, multi-part scrub and the snapshot skip claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those

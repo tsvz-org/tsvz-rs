@@ -326,6 +326,7 @@ impl GzipDecoder {
     }
 }
 
+#[cfg(test)]
 enum Judged {
     Complete(usize),
     Short,
@@ -333,6 +334,7 @@ enum Judged {
 }
 
 /// Decode the member at the start of `data` into `out`, which is cleared first.
+#[cfg(test)]
 fn member_into(codec: Codec, data: &[u8], out: &mut Vec<u8>) -> Judged {
     out.clear();
     match Decoder::new(codec).feed(data, out) {
@@ -677,49 +679,6 @@ pub fn for_each_item(codec: Codec, data: &[u8], each: &mut dyn FnMut(Item<'_>) -
     read_items(codec, data, usize::MAX, each).expect("bytes in memory read without error");
 }
 
-/// How [`for_each_complete_member`] ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Walk {
-    /// `each` stopped it, or the bytes ran out at the end of a member.
-    Done,
-    /// A member runs past the bytes: with the rest of the part it may complete.
-    Short,
-    /// A member is not valid: no bytes after those given can change that.
-    Bad,
-}
-
-/// The members at the start of `data` that complete (§16.6 rule 1), each as the bytes it decodes
-/// to, until `each` returns false or a member does not complete. For a look at the start of a
-/// part, where `data` is only a prefix of it: unlike `for_each_item` it never splits a member that
-/// does not complete at a codec magic found inside it (§16.6 rule 2), since that member may
-/// complete in the rest of the part and the magic be bytes of its own. It says which kind of end
-/// the member that did not complete has: only `Bad` is settled.
-pub(crate) fn for_each_complete_member(
-    codec: Codec,
-    data: &[u8],
-    each: &mut dyn FnMut(&[u8]) -> bool,
-) -> Walk {
-    let mut buf = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        if codec == Codec::Gzip && data[pos] == 0 {
-            pos += data[pos..].iter().take_while(|&&b| b == 0).count(); // padding before a member
-            continue;
-        }
-        match member_into(codec, &data[pos..], &mut buf) {
-            Judged::Complete(end) => {
-                if !each(&buf) {
-                    return Walk::Done;
-                }
-                pos += end.max(1);
-            }
-            Judged::Short => return Walk::Short,
-            Judged::Bad => return Walk::Bad,
-        }
-    }
-    Walk::Done
-}
-
 /// All the items of a compressed part, owned (`for_each_item` streams them instead).
 pub fn items(codec: Codec, data: &[u8]) -> Vec<Item<'static>> {
     let mut all = Vec::new();
@@ -964,67 +923,6 @@ mod tests {
                 Item::Data(b"b\ty\n".to_vec().into())
             ]
         );
-    }
-
-    #[test]
-    fn the_complete_members_at_the_start_and_how_the_walk_ends() {
-        for codec in codecs() {
-            let (a, b) = (fixture(codec, b"a\tx\n"), fixture(codec, b"b\ty\n"));
-            let walk = |data: &[u8], stop_after: usize| {
-                let mut seen = Vec::new();
-                let end = for_each_complete_member(codec, data, &mut |out| {
-                    seen.push(out.to_vec());
-                    seen.len() < stop_after
-                });
-                (seen, end)
-            };
-            let two = [a.clone(), b.clone()].concat();
-            let one = |s: &[u8]| vec![s.to_vec()];
-            assert_eq!(walk(&[], 9), (vec![], Walk::Done), "{codec:?}");
-            assert_eq!(walk(&a, 9), (one(b"a\tx\n"), Walk::Done), "{codec:?}");
-            assert_eq!(
-                walk(&two, 9),
-                (vec![b"a\tx\n".to_vec(), b"b\ty\n".to_vec()], Walk::Done),
-                "{codec:?}"
-            );
-            assert_eq!(
-                walk(&two, 1),
-                (one(b"a\tx\n"), Walk::Done),
-                "stopped {codec:?}"
-            );
-            // A member that does not complete ends the walk, whatever follows it: cut short, with
-            // a magic after it (which `for_each_item` would take for the next member's start) or
-            // none, or not valid.
-            let mut cut = a[..a.len() - 3].to_vec();
-            assert_eq!(walk(&cut, 9), (vec![], Walk::Short), "{codec:?}");
-            cut.extend(&b);
-            assert_ne!(walk(&cut, 9).1, Walk::Done, "{codec:?}");
-            let mut early = b.clone();
-            early.extend(&a[..a.len() - 3]);
-            early.extend(&b);
-            let (seen, end) = walk(&early, 9);
-            assert_eq!(
-                (seen, end != Walk::Done),
-                (one(b"b\ty\n"), true),
-                "{codec:?}"
-            );
-            let mut bad = a.clone();
-            bad[0] ^= 1;
-            assert_eq!(walk(&bad, 9), (vec![], Walk::Bad), "{codec:?}");
-            let mut after = a.clone();
-            after.extend(&bad);
-            assert_eq!(walk(&after, 9), (one(b"a\tx\n"), Walk::Bad), "{codec:?}");
-        }
-        // gzip's zero padding between members is skipped
-        let mut padded = vec![0u8; 5];
-        padded.extend(fixture(Codec::Gzip, b"a\tx\n"));
-        padded.extend([0u8; 9]);
-        let mut seen = Vec::new();
-        let walk = for_each_complete_member(Codec::Gzip, &padded, &mut |out| {
-            seen.push(out.to_vec());
-            true
-        });
-        assert_eq!((seen, walk), (vec![b"a\tx\n".to_vec()], Walk::Done));
     }
 
     #[test]

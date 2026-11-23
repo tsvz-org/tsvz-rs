@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use hashbrown::HashMap;
 
-use crate::codec::{self, Item, Walk};
+use crate::codec::{self, Item};
 use crate::escape;
 use crate::frame::{Framer, Line};
 use crate::name::{self, Codec, Format};
@@ -50,6 +50,10 @@ pub struct Options {
     pub skip_unreadable: bool,
     /// Keep a loose file's lines, for a rewrite that keeps them ([`crate::loose`]).
     pub(crate) lines: bool,
+    /// Replay every part, also those before the last snapshot part, where a read otherwise begins
+    /// (§19.10.3): a rewrite reads all it compacts. [`Options::verify`] reads every part too
+    /// (§19.10.4).
+    pub(crate) every_part: bool,
     /// Read a loose file only as far as its first keyed line, which sets its column count
     /// ([`Store::one_column`]). A compressed file's member is still decoded to its check before
     /// its lines are used (§16.6), holding no more of it than a member of the default size.
@@ -285,12 +289,12 @@ fn unsupported(part: &parts::Part) -> Error {
     }
 }
 
-/// The page a part's first member is decoded from to look at its first lines, and the least the
-/// doubling reads after it take. A gzip or xz member gives its first lines from its first 4 KiB
-/// (a zstd member from its first 56 KiB, a bzip2 one from a whole block, 184 KiB of input in a
-/// probe of 0.8 MB of text), and a first line that is no comment settles a part, so 4 KiB judges
-/// nearly every gzip or xz part, and a larger page only decodes more of each.
-const SNAPSHOT_HINT: u64 = 1 << 12;
+/// The page a part's first lines are looked at from. A gzip or xz member gives its first lines
+/// from its first 4 KiB (a zstd member from its first 56 KiB, a bzip2 one from a whole block, 184
+/// KiB of input in a probe of 0.8 MB of text), and a first line that is no comment settles a
+/// part, so 4 KiB settles nearly every plain, gzip or xz part, and a larger page only decodes
+/// more of each.
+const SNAPSHOT_HINT: usize = 1 << 12;
 
 /// What the first committed lines of a part say (§19.10.1), fed one at a time.
 struct SnapshotLines {
@@ -310,6 +314,9 @@ impl SnapshotLines {
 
     /// Judge one more line; false once the verdict is in.
     fn line(&mut self, l: &Line<'_>) -> bool {
+        if self.verdict.is_some() {
+            return false;
+        }
         let d = self.delimiter;
         self.seen += 1;
         let text = String::from_utf8_lossy(l.text());
@@ -324,26 +331,11 @@ impl SnapshotLines {
         }
         self.verdict.is_none()
     }
-}
 
-/// What the members at the start of the compressed bytes `data` say: whether the part is a
-/// snapshot part, judged only from members that passed their checks, as TSVZ.py reads a part.
-/// None when those end before the verdict and the part may go on: the bytes end between members,
-/// or, with `more`, in a member that runs past `data` (it is not split at a codec magic found
-/// inside it: that is its own bytes, or the part's damage, which only the whole member shows). A
-/// member that is corrupt, or cut short at the end of the part, before the verdict makes it no
-/// snapshot part.
-fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> Option<bool> {
-    let mut lines = SnapshotLines::new(delimiter);
-    let mut framer = Framer::new();
-    let walk = codec::for_each_complete_member(codec, data, &mut |out| {
-        framer.push(out, &mut |l| lines.line(l))
-    });
-    match (lines.verdict, walk) {
-        (Some(verdict), _) => Some(verdict),
-        (None, Walk::Bad) => Some(false),
-        (None, Walk::Short) if !more => Some(false),
-        (None, _) => None,
+    /// Damage met before the verdict: the part's first lines cannot be read whole, so it is no
+    /// snapshot part (§19.10.3).
+    fn damage(&mut self) {
+        self.verdict.get_or_insert(false);
     }
 }
 
@@ -351,23 +343,17 @@ fn compressed_verdict(codec: Codec, data: &[u8], delimiter: u8, more: bool) -> O
 /// after member (a line can span members; gzip's zero padding between them is skipped), and
 /// given to `on_line` as they come out, until it returns false, the part ends or a data error
 /// stops it. What a page decodes before an error is dropped with it. The output is used before
-/// its member's check, so what it says is only a first look. `data` gets the bytes read.
-fn first_lines(
-    codec: Codec,
-    reader: &mut impl Read,
-    data: &mut Vec<u8>,
-    on_line: &mut dyn FnMut(&Line<'_>) -> bool,
-) {
+/// its member's check, so what it says is only a first look.
+fn first_lines(codec: Codec, reader: &mut impl Read, on_line: &mut dyn FnMut(&Line<'_>) -> bool) {
     let mut decoder = codec::Decoder::new(codec);
     let mut between = false; // a member ended: what follows begins another
     let mut framer = Framer::new();
-    let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT as usize], Vec::new());
+    let (mut page, mut out) = (vec![0u8; SNAPSHOT_HINT], Vec::new());
     loop {
         let n = match reader.read(&mut page) {
             Ok(n) if n > 0 => n,
             _ => return,
         };
-        data.extend_from_slice(&page[..n]);
         let mut input = &page[..n];
         while !input.is_empty() {
             if between {
@@ -392,68 +378,29 @@ fn first_lines(
                 break;
             }
             between = true;
-            input = &input[used.max(1)..]; // as `for_each_item` steps past a member
+            input = &input[used.max(1)..]; // as `codec::read_items` steps past a member
         }
     }
 }
 
-/// Whether the first lines of a part say "no" (§19.10.1) before the part is whole. A "no" stands
-/// whether the member that holds it later passes its check or not, as a damaged member before the
-/// verdict also makes it no snapshot part, so a part that is none is settled by the first block
-/// bzip2 gives, not by the doubling reads below. `data` gets the bytes read, for those to start
-/// from. A "yes" and a data error are left to them: only members that passed their checks can
-/// say yes.
-fn first_lines_say_no(
-    codec: Codec,
-    reader: &mut impl Read,
-    delimiter: u8,
-    data: &mut Vec<u8>,
-) -> bool {
-    let mut lines = SnapshotLines::new(delimiter);
-    first_lines(codec, reader, data, &mut |l| lines.line(l));
-    lines.verdict == Some(false)
-}
-
-/// Whether `part` is a snapshot part (§19.10.1): its first committed line, or its second after a
-/// comment, is `#_snapshot_#` without a value. Only the start of the part is read, a compressed
-/// one a piece at a time: a "no" comes as soon as its lines show it, whether or not their member
-/// passes its check later, and a "yes" only from first lines that come out of members that passed
-/// their checks (bzip2 gives nothing before a whole block, up to 900 kB of text). A part whose
-/// start cannot be read, or holds damage before the marker, is not one (§19.10.3).
-pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
+/// Whether the first lines of `part` look like a snapshot part's (§19.10.1): its first committed
+/// line, or its second after a comment, is `#_snapshot_#` without a value. Only the start of the
+/// part is read, a page at a time, until those lines say yes or no (a compressed one's before its
+/// member's check, and as far as the first block of a bzip2 one: up to 900 kB of text). A look
+/// only chooses where a read begins: the read of that part confirms it (`Store::marked`).
+fn looks_marked(part: &parts::Part, format: Format) -> bool {
     let Ok(file) = File::open(&part.path) else {
         return false;
     };
     let mut reader: &File = &file;
-    let d = format.delimiter;
+    let mut lines = SnapshotLines::new(format.delimiter);
     match part.codec {
-        Some(c) if !c.supported() => false,
-        Some(c) => {
-            let mut data = Vec::new();
-            if first_lines_say_no(c, &mut reader, d, &mut data) {
-                return false;
-            }
-            // at least one byte more, so that `more` says whether the part goes on past `data`
-            let mut want = (data.len() as u64 + 1).max(SNAPSHOT_HINT);
-            loop {
-                let room = want - data.len() as u64;
-                let Ok(n) = (&mut reader).take(room).read_to_end(&mut data) else {
-                    return false;
-                };
-                let more = n as u64 == room;
-                match compressed_verdict(c, &data, d, more) {
-                    Some(verdict) => return verdict,
-                    None if more => want = want.saturating_mul(2),
-                    None => return false,
-                }
-            }
-        }
+        Some(c) if !c.supported() => return false,
+        Some(c) => first_lines(c, &mut reader, &mut |l| lines.line(l)),
         None => {
-            let mut lines = SnapshotLines::new(d);
             let mut framer = Framer::new();
-            // One page at a time: a first line that is no comment settles a part from the first
-            // read, and a snapshot part's marker follows at most one comment, a long one read on.
-            let mut buf = vec![0u8; 1 << 12];
+            // A snapshot part's marker follows at most one comment, a long one read on.
+            let mut buf = vec![0u8; SNAPSHOT_HINT];
             let mut first = true;
             loop {
                 let n = match reader.read(&mut buf) {
@@ -471,7 +418,39 @@ pub(crate) fn is_snapshot_part(part: &parts::Part, format: Format) -> bool {
                     break;
                 }
             }
-            lines.verdict == Some(true)
+        }
+    }
+    lines.verdict == Some(true)
+}
+
+/// Where a read of `list` begins (§19.10.3): the last part before `below` whose first lines look
+/// like a snapshot part's (part 0 is read from the start anyway), else 0.
+fn snapshot_start(list: &[parts::Part], below: usize, format: Format) -> usize {
+    (1..below.min(list.len()))
+        .rev()
+        .find(|&i| looks_marked(&list[i], format))
+        .unwrap_or(0)
+}
+
+/// Where the lines of a part being read go: the replay, and the judge of its first lines.
+struct Feed<'a> {
+    replay: &'a mut Replay,
+    table: &'a mut Table,
+    judge: Option<&'a mut SnapshotLines>,
+}
+
+impl Feed<'_> {
+    fn line(&mut self, l: &Line<'_>) -> bool {
+        if let Some(j) = self.judge.as_deref_mut() {
+            j.line(l);
+        }
+        self.replay.line(l, self.table)
+    }
+
+    /// Damage met in the part: before the verdict, it is no snapshot part.
+    fn damage(&mut self) {
+        if let Some(j) = self.judge.as_deref_mut() {
+            j.damage();
         }
     }
 }
@@ -508,6 +487,10 @@ pub struct Store {
     pub(crate) dirs: parts::DirTrust,
     /// The bytes after a loose file's last newline, kept with its lines.
     tail: Vec<u8>,
+    /// The first part read: the last snapshot part, or 0 (§19.10.3).
+    start: usize,
+    /// The first part read began with `#_snapshot_#` (§19.10.1), by the lines the read decoded.
+    marked: bool,
 }
 
 impl Store {
@@ -541,7 +524,7 @@ impl Store {
             codec,
         };
         self.replay.begin_part(path, false);
-        self.read_part(&part, true)?;
+        self.read_part(&part, true, None)?;
         Ok(self)
     }
 
@@ -590,11 +573,15 @@ impl Store {
         })
     }
 
+    /// Read the store once: from the last part whose first lines look like a snapshot part's
+    /// (§19.10.3), unless every part is to be read; when the read of that part does not confirm
+    /// it (damage before its marker, or a member that fails its check), from the last one before
+    /// it that looks so, down to part 0.
     fn open_once(
         path: &Path,
         options: Options,
         limit: Option<usize>,
-        dirs: parts::DirTrust,
+        mut dirs: parts::DirTrust,
     ) -> Result<Store, Error> {
         let path = path.to_path_buf();
         let mut format = name::format_of(&path).ok_or_else(|| Error::BadPath(path.clone()))?;
@@ -607,38 +594,48 @@ impl Store {
             }
             format.delimiter = d;
         }
-        let mut replay = Replay::new(format, options.verify, options.warnings.clone());
-        if options.lines && !format.strict {
-            replay.lines = Some(Vec::new());
+        let mut below = usize::MAX;
+        loop {
+            let mut replay = Replay::new(format, options.verify, options.warnings.clone());
+            if options.lines && !format.strict {
+                replay.lines = Some(Vec::new());
+            }
+            replay.head = options.head && !format.strict;
+            // A loose rewrite works on the lines it keeps and reads no row: no key is wanted.
+            let no_rows = Scope::Keys(Vec::new());
+            let scope = if options.lines && !format.strict {
+                &no_rows
+            } else {
+                &options.scope
+            };
+            let mut store = Store {
+                replay,
+                tail: Vec::new(),
+                table: Table::new(scope, format),
+                path: path.clone(),
+                format,
+                options: options.clone(),
+                parts: Vec::new(),
+                unreadable: Vec::new(),
+                limit,
+                follow: Follow::default(),
+                torn: false,
+                last: None,
+                dirs,
+                start: 0,
+                marked: false,
+            };
+            store.load(below)?;
+            if store.start == 0 || store.marked {
+                return Ok(store);
+            }
+            below = store.start;
+            dirs = store.dirs;
         }
-        replay.head = options.head && !format.strict;
-        // A loose rewrite works on the lines it keeps and reads no row: no key is wanted.
-        let no_rows = Scope::Keys(Vec::new());
-        let scope = if options.lines && !format.strict {
-            &no_rows
-        } else {
-            &options.scope
-        };
-        let mut store = Store {
-            replay,
-            tail: Vec::new(),
-            table: Table::new(scope, format),
-            path,
-            format,
-            options,
-            parts: Vec::new(),
-            unreadable: Vec::new(),
-            limit,
-            follow: Follow::default(),
-            torn: false,
-            last: None,
-            dirs,
-        };
-        store.load()?;
-        Ok(store)
     }
 
-    fn load(&mut self) -> Result<(), Error> {
+    /// Read the parts, from the last one before `below` that looks like a snapshot part.
+    fn load(&mut self, below: usize) -> Result<(), Error> {
         // Sampled before the listing, so that a name made meanwhile shows as a change.
         let dir = self.dirs.stamp(&self.path);
         let (mut list, linked) = parts::list_linked(&self.path)?;
@@ -648,8 +645,15 @@ impl Store {
         if list.is_empty() {
             return Err(Error::Missing(self.path.clone()));
         }
+        let skips = self.format.strict && !self.options.verify && !self.options.every_part;
+        self.start = if skips {
+            snapshot_start(&list, below, self.format)
+        } else {
+            0
+        };
+        let start = self.start;
         if !self.options.skip_unreadable {
-            if let Some(part) = list
+            if let Some(part) = list[start..]
                 .iter()
                 .find(|p| p.codec.is_some_and(|c| !c.supported()))
             {
@@ -660,10 +664,18 @@ impl Store {
             dir: dir.filter(|_| !linked),
             ..Follow::default()
         };
+        // The parts before it are not read, but they are stamped: a change to one of them is a
+        // change to the store (§19.10.3), which `refresh` reads again.
+        for part in &list[..start] {
+            let meta = std::fs::metadata(&part.path).ok();
+            self.follow.stamps.push(meta.map(|m| Stamp::of(&m)));
+        }
         let last = list.len() - 1;
-        for (i, part) in list.iter().enumerate() {
-            self.replay.begin_part(&part.path, i == 0);
-            if let Err(e) = self.read_part(part, i == last) {
+        let mut judge = SnapshotLines::new(self.format.delimiter);
+        for (i, part) in list.iter().enumerate().skip(start) {
+            self.replay.begin_part(&part.path, i == start);
+            let judging = (i == start).then_some(&mut judge);
+            if let Err(e) = self.read_part(part, i == last, judging) {
                 if !self.options.skip_unreadable {
                     return Err(e);
                 }
@@ -673,6 +685,7 @@ impl Store {
                 break; // a stop policy ends the read of the whole store (§4.10)
             }
         }
+        self.marked = judge.verdict == Some(true);
         // Parts a stop left unread are stamped too, so that `refresh` sees whether they change.
         for part in &list[self.follow.stamps.len()..] {
             let meta = std::fs::metadata(&part.path).ok();
@@ -693,7 +706,13 @@ impl Store {
     }
 
     /// Replay one part; `last` marks the store's last part, whose end the follow state records.
-    fn read_part(&mut self, part: &parts::Part, last: bool) -> Result<(), Error> {
+    /// `judge` gets the part's first lines, and the damage met before its verdict.
+    fn read_part(
+        &mut self,
+        part: &parts::Part,
+        last: bool,
+        judge: Option<&mut SnapshotLines>,
+    ) -> Result<(), Error> {
         let file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
         let mut reader: &File = &file;
         let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
@@ -707,30 +726,39 @@ impl Store {
         if part.codec.is_some_and(|c| !c.supported()) {
             return Err(unsupported(part));
         }
-        let (replay, table) = (&mut self.replay, &mut self.table);
+        // A read that stops at a file's first keyed line holds no more of a compressed member
+        // than a member of the default size: a larger one is decoded again once it passed its
+        // check. A whole read holds each member's output once.
+        let keep = if self.replay.head {
+            DEFAULT_MEMBER_SIZE as usize
+        } else {
+            usize::MAX
+        };
+        let mut feed = Feed {
+            replay: &mut self.replay,
+            table: &mut self.table,
+            judge,
+        };
         let mut framer = Framer::new();
         match part.codec {
             Some(codec) => {
-                // A read that stops at a file's first keyed line holds no more of a member than
-                // a member of the default size: a larger one is decoded again once it passed its
-                // check. A whole read holds each member's output once.
-                let keep = if replay.head {
-                    DEFAULT_MEMBER_SIZE as usize
-                } else {
-                    usize::MAX
-                };
                 codec::read_items(codec, &file, keep, &mut |item| match item {
-                    Item::Data(out) => framer.push(&out, &mut |l| replay.line(l, table)),
+                    Item::Data(out) => framer.push(&out, &mut |l| feed.line(l)),
                     Item::CutShort { offset, out } => {
-                        replay.cut_short(offset);
-                        framer.push(&out, &mut |l| replay.line(l, table))
+                        feed.damage();
+                        feed.replay.cut_short(offset);
+                        framer.push(&out, &mut |l| feed.line(l))
                     }
-                    Item::Corrupt { offset, out } => match replay.corrupt(offset, out.len()) {
-                        Policy::Recover => framer.push(&out, &mut |l| replay.line(l, table)),
-                        Policy::Skip => true,
-                        Policy::Stop => false,
-                    },
+                    Item::Corrupt { offset, out } => {
+                        feed.damage();
+                        match feed.replay.corrupt(offset, out.len()) {
+                            Policy::Recover => framer.push(&out, &mut |l| feed.line(l)),
+                            Policy::Skip => true,
+                            Policy::Stop => false,
+                        }
+                    }
                     Item::Break => {
+                        feed.damage();
                         framer.brk();
                         true
                     }
@@ -746,7 +774,7 @@ impl Store {
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(Error::io(&part.path, e)),
                     };
-                    if !framer.push(&buf[..n], &mut |l| replay.line(l, table)) {
+                    if !framer.push(&buf[..n], &mut |l| feed.line(l)) {
                         break;
                     }
                 }
@@ -877,6 +905,13 @@ impl Store {
 
     pub fn stopped(&self) -> Option<&Damage> {
         self.replay.stopped.as_ref()
+    }
+
+    /// Whether the first part this read replayed begins with `#_snapshot_#` (§19.10.1), as its
+    /// lines came out of the read: its first committed line, or its second after a comment, with
+    /// no damage met before it.
+    pub(crate) fn marked(&self) -> bool {
+        self.marked
     }
 
     /// The highest spec version a `#_version_#` line of the read declared (1 when none did).
@@ -1031,7 +1066,7 @@ impl Store {
         reader.read_to_end(&mut data).map_err(io)?;
         let mut framer = Framer::resume(offset, self.follow.line);
         let (replay, table) = (&mut self.replay, &mut self.table);
-        replay.begin_part(&path, last == 0 && offset == 0);
+        replay.begin_part(&path, last == self.start && offset == 0);
         framer.push(&data, &mut |l| replay.line(l, table));
         let committed = (framer.committed() - offset) as usize;
         if self.replay.stopped.is_none() {
@@ -1389,33 +1424,156 @@ mod tests {
         );
     }
 
-    /// Whether part 1 of the store `path` is a snapshot part (§19.10.1), as a scrub asks.
+    /// Whether part 1 of the store `path` is a snapshot part (§19.10.1), as a scrub asks: read
+    /// alone, it begins with the marker.
     fn part_1_is_snapshot_part(path: &Path) -> bool {
         let list = parts::list(path).unwrap();
-        is_snapshot_part(&list[1], name::format_of(path).unwrap())
+        Store::open(&list[1].path, Options::default()).is_ok_and(|s| s.marked())
+    }
+
+    /// Whether the first lines of part 1 of the store `path` look like a snapshot part's.
+    fn part_1_looks_marked(path: &Path) -> bool {
+        let list = parts::list(path).unwrap();
+        looks_marked(&list[1], name::format_of(path).unwrap())
     }
 
     #[test]
-    fn a_read_replays_every_part_also_those_before_a_snapshot_part() {
-        // §19.10.3 lets a reader begin at the last snapshot part, and does not oblige it; tsvz-rs
-        // does not, as 0.1.3 did not (conformance case
-        // 19.10.1-a-reader-without-the-skip-reads-every-part). These parts break §19.10.2a on
-        // purpose (part 2 restates neither a nor b), so that a skip would show.
+    fn a_read_begins_at_the_last_snapshot_part_and_verify_reads_every_part() {
+        // §19.10.3, conformance case 19.10.3-a-reader-starts-at-the-last-snapshot-part. These
+        // parts break §19.10.2a on purpose (part 2 restates neither a nor b), so that the skip
+        // shows. Its header is the snapshot part's (§19.10.2b).
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "s.tsvz", b"a\t1\n");
+        write(dir.path(), "s.tsvz", b"#old\na\t1\n");
         write(dir.path(), "s.tsvz.1", b"#_snapshot_#\nb\t2\n");
         write(dir.path(), "s.tsvz.2", b"#h\n#_snapshot_#\nc\t3\n");
         write(dir.path(), "s.tsvz.3", b"d\t4\n");
         let p = dir.path().join("s.tsvz");
         let s = Store::open(&p, Options::default()).unwrap();
-        assert_eq!(keys(&s), ["a", "b", "c", "d"]);
-        assert_eq!(s.parts().len(), 4);
+        assert_eq!(keys(&s), ["c", "d"]);
+        assert_eq!((s.parts().len(), s.header()), (4, Some("#h")));
+        // verify replays every part (§19.10.4), and so does a rewrite (a scrub's read).
+        let all = |o: Options| keys(&Store::open(&p, o).unwrap());
+        let verifying = Options {
+            verify: true,
+            ..Options::default()
+        };
+        assert_eq!(all(verifying), ["a", "b", "c", "d"]);
+        let every = Options {
+            every_part: true,
+            ..Options::default()
+        };
+        assert_eq!(all(every), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn the_parts_before_a_snapshot_part_are_not_read() {
+        // Part 1 cannot be read (a directory): the read never opens it.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "s.tsvz", b"x\t0\n");
+        fs::create_dir(dir.path().join("s.tsvz.1")).unwrap();
+        write(dir.path(), "s.tsvz.2", b"#_snapshot_#\nb\t2\n");
+        let s = Store::open(dir.path().join("s.tsvz"), Options::default()).unwrap();
+        assert_eq!(keys(&s), ["b"]);
+        assert!(!s.incomplete());
+    }
+
+    #[test]
+    fn damage_before_the_snapshot_part_is_not_met() {
+        // §4.10 governs damaged data a reader meets; one that begins at the snapshot part
+        // (§19.10.3) meets none before it, as TSVZ.py's read does: under stop it reads the store.
+        for (codec, part0) in [
+            (None, b"#_on_corruption_#\tstop\na\t1\n\0\0b\t2\n".to_vec()),
+            (Some(Codec::Gzip), {
+                let mut bad = crate::codec::encode_member(Codec::Gzip, b"b\t2\n").unwrap();
+                let n = bad.len();
+                bad[n - 8] ^= 1;
+                let head = b"#_on_corruption_#\tstop\na\t1\n";
+                [crate::codec::encode_member(Codec::Gzip, head).unwrap(), bad].concat()
+            }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let name = |n: &str| match codec {
+                Some(c) => format!("{n}.{}", c.name()),
+                None => n.to_string(),
+            };
+            write(dir.path(), &name("s.tsvz"), &part0);
+            write(dir.path(), &name("s.tsvz.1"), &{
+                let snap = b"#_snapshot_#\n#_on_corruption_#\tstop\na\t1\n";
+                match codec {
+                    Some(c) => crate::codec::encode_member(c, snap).unwrap(),
+                    None => snap.to_vec(),
+                }
+            });
+            let p = dir.path().join(name("s.tsvz"));
+            let s = Store::open(&p, Options::default()).unwrap();
+            assert_eq!(keys(&s), ["a"], "{codec:?}");
+            assert!(!s.incomplete() && !s.damaged(), "{codec:?}");
+            let verifying = Options {
+                verify: true,
+                ..Options::default()
+            };
+            assert!(Store::open(&p, verifying).unwrap().stopped().is_some());
+        }
+    }
+
+    #[test]
+    fn a_part_that_only_looks_marked_is_read_after_the_parts_before_it() {
+        // The marker is in a member that fails its check at its end, past the look's first page:
+        // the look, from output before the check, takes it for a snapshot part; the read of it
+        // says no, and the store is read from the last part before it that is one, or from part
+        // 0.
+        let gz = |t: &[u8]| crate::codec::encode_member(Codec::Gzip, t).unwrap();
+        let mut bad = gz(noise("#_snapshot_#\nc\t3\n", 2000).as_bytes());
+        let n = bad.len();
+        bad[n - 8] ^= 1;
+        for (earlier, from) in [(&b"b\t2\n"[..], 0), (b"#_snapshot_#\nb\t2\n", 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "s.tsvz.gz", &gz(b"a\t1\n"));
+            write(dir.path(), "s.tsvz.1.gz", &gz(earlier));
+            write(dir.path(), "s.tsvz.2.gz", &bad);
+            write(dir.path(), "s.tsvz.3.gz", &gz(b"d\t4\n"));
+            let p = dir.path().join("s.tsvz.gz");
+            let list = parts::list(&p).unwrap();
+            assert!(looks_marked(&list[2], name::format_of(&p).unwrap()));
+            let s = Store::open(&p, Options::default()).unwrap();
+            let every = Options {
+                every_part: true,
+                ..Options::default()
+            };
+            let all = keys(&Store::open(&p, every).unwrap());
+            assert_eq!(keys(&s), all[from..], "{earlier:?}");
+            assert!(s.damaged(), "{earlier:?}: the damaged part was read");
+        }
+    }
+
+    #[test]
+    fn a_read_from_a_snapshot_part_follows_appends_and_reads_again_when_a_part_before_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "s.tsvz", b"a\t1\n");
+        write(dir.path(), "s.tsvz.1", b"#h\n#_snapshot_#\nb\t2\n");
+        let last = write(dir.path(), "s.tsvz.2", b"c\t3\n");
+        let mut s = Store::open(&p, Options::default()).unwrap();
+        assert_eq!(keys(&s), ["b", "c"]);
+        append(&last, b"d\t4\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Followed);
+        assert_eq!(
+            (keys(&s), s.header()),
+            (vec!["b".to_string(), "c".into(), "d".into()], Some("#h"))
+        );
+        // A part before the snapshot part changed (against §17.7): a change to the store.
+        append(&p, b"z\t9\n");
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), ["b", "c", "d"]);
+        // The snapshot part loses its marker: every part is read again.
+        fs::write(dir.path().join("s.tsvz.1"), "#h\nb\t2\n").unwrap();
+        assert_eq!(s.refresh().unwrap(), Refreshed::Reloaded);
+        assert_eq!(keys(&s), ["a", "z", "b", "c", "d"]);
     }
 
     #[test]
     fn what_is_not_a_snapshot_part() {
         // The verdict a scrub reads a part by (§19.10.1): its first committed line, or its second
-        // after a comment, is `#_snapshot_#` with no value.
+        // after a comment, is `#_snapshot_#` with no value. The look and the read agree on it.
         let dir = tempfile::tempdir().unwrap();
         for (name, part1, yes) in [
             ("later", &b"b\t2\n#_snapshot_#\n"[..], false),
@@ -1427,6 +1585,7 @@ mod tests {
             ("with-a-value", b"#_snapshot_#\tx\nb\t2\n", false),
             ("third-line", b"#c\n#d\n#_snapshot_#\nb\t2\n", false),
             ("uncommitted", b"#_snapshot_#", false),
+            ("zero-fill", b"\0\0#_snapshot_#\nb\t2\n", false),
             ("first", b"#_snapshot_#\nb\t2\n", true),
             ("after-a-comment", b"#h\n#_snapshot_#\nb\t2\n", true),
             // The key in any case, an empty value as none, after a byte order mark, with CRLF.
@@ -1436,6 +1595,18 @@ mod tests {
             write(dir.path(), &format!("{name}.tsvz.1"), part1);
             let p = dir.path().join(format!("{name}.tsvz"));
             assert_eq!(part_1_is_snapshot_part(&p), yes, "{name}");
+            assert_eq!(part_1_looks_marked(&p), yes, "{name}");
+            let every = Options {
+                every_part: true,
+                ..Options::default()
+            };
+            let all = keys(&Store::open(&p, every).unwrap());
+            let read = keys(&Store::open(&p, Options::default()).unwrap());
+            assert_eq!(
+                read,
+                if yes { vec!["b".to_string()] } else { all },
+                "{name}"
+            );
         }
     }
 
@@ -1455,74 +1626,40 @@ mod tests {
         write(dir.path(), "d.tsvz", b"a\t1\n");
         write(dir.path(), "d.tsvz.1.gz", &bad);
         assert!(!part_1_is_snapshot_part(&dir.path().join("d.tsvz")));
-        // Larger than its start, decoded first: the marker shows there, then it is read whole.
+        // Its one large member fails its check at the end: the marker is in a corrupt member, so
+        // it is no snapshot part, though its start alone showed the marker.
         let part = encode_member(Gzip, noise("#_snapshot_#\n", 20000).as_bytes()).unwrap();
-        assert!(part.len() as u64 > SNAPSHOT_HINT);
-        write(dir.path(), "big.tsvz", b"a\t1\n");
-        write(dir.path(), "big.tsvz.1.gz", &part);
-        assert!(part_1_is_snapshot_part(&dir.path().join("big.tsvz")));
-        // Its one member fails its check at the end: the marker is in a corrupt member, so it is
-        // no snapshot part, though its start alone showed the marker.
+        assert!(part.len() > SNAPSHOT_HINT);
         let mut bad = part.clone();
         let n = bad.len();
         bad[n - 8] ^= 1;
+        write(dir.path(), "big.tsvz", b"a\t1\n");
+        write(dir.path(), "big.tsvz.1.gz", &part);
+        assert!(part_1_is_snapshot_part(&dir.path().join("big.tsvz")));
         write(dir.path(), "big.tsvz.1.gz", &bad);
+        assert!(part_1_looks_marked(&dir.path().join("big.tsvz")));
         assert!(!part_1_is_snapshot_part(&dir.path().join("big.tsvz")));
     }
 
     #[test]
-    fn a_member_that_runs_past_the_look_is_not_split_at_a_codec_magic_in_what_was_read() {
-        // §16.6 rule 2 ends a damaged member's bytes at the next magic, but a member that only
-        // runs past the bytes the look has read is not damaged, and a magic in them is its own
-        // bytes: in a stored block the data, in compressed data any three bytes. A part whose
-        // first member held `1f 8b 08` in what the look had read was no snapshot part to it for
-        // that (3 of 3,000 random 65 KB gzip parts did).
+    fn a_member_with_a_codec_magic_in_its_first_bytes_is_one_member() {
+        // §16.6 rule 2 ends a damaged member's bytes at the next magic, but a magic inside a
+        // member that passes its check is its own bytes: in a stored block the data, in
+        // compressed data any three bytes. A look that split a member there once said no (3 of
+        // 3,000 random 65 KB gzip parts).
         let mut content = b"#_snapshot_#\nm\t\x1f\x8b\x08\n".to_vec();
         content.extend(noise("", 600).bytes());
         let mut member = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
         member.write_all(&content).unwrap(); // stored blocks keep the row's bytes as they are
         let part = member.finish().unwrap();
         let at = memchr::memmem::find(&part[1..], Codec::Gzip.magic()).unwrap() + 1;
-        assert!(at + 3 < SNAPSHOT_HINT as usize && part.len() as u64 > 3 * SNAPSHOT_HINT);
+        assert!(at + 3 < SNAPSHOT_HINT && part.len() > 3 * SNAPSHOT_HINT);
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "s.tsvz", b"a\t1\n");
         write(dir.path(), "s.tsvz.1.gz", &part);
-        assert!(part_1_is_snapshot_part(&dir.path().join("s.tsvz")));
-        // Each read of the look: read on until the member is whole, then its own verdict.
-        let say = |data: &[u8], more| compressed_verdict(Codec::Gzip, data, b'\t', more);
-        for len in [at + 3, SNAPSHOT_HINT as usize + 1, part.len() - 1] {
-            assert_eq!(say(&part[..len], true), None, "{len}");
-        }
-        assert_eq!(say(&part, true), Some(true));
-        assert_eq!(say(&part, false), Some(true));
-        // A member cut short at the end of the part is no snapshot part: nothing to read on.
-        assert_eq!(say(&part[..part.len() - 1], false), Some(false));
-        // Nor is one whose check fails, found when its end is read.
-        let mut bad = part.clone();
-        let n = bad.len();
-        bad[n - 8] ^= 1;
-        assert_eq!(say(&bad, true), Some(false));
-        write(dir.path(), "s.tsvz.1.gz", &bad);
-        assert!(!part_1_is_snapshot_part(&dir.path().join("s.tsvz")));
-    }
-
-    #[test]
-    fn a_member_that_is_not_valid_in_what_was_read_is_settled_at_once() {
-        // More of the part cannot make bytes that are already wrong right, so the look says no
-        // without reading on, as it did: a snapshot part's first member begins wrong (here, its
-        // first byte), and the part goes on past what was read.
-        use crate::codec::encode_member;
-        for codec in [Codec::Gzip, Codec::Bzip2, Codec::Xz, Codec::Zstd] {
-            if !codec.supported() {
-                continue;
-            }
-            let mut part = encode_member(codec, noise("#_snapshot_#\n", 20000).as_bytes()).unwrap();
-            assert!(part.len() as u64 > 2 * SNAPSHOT_HINT, "{codec:?}");
-            let first_page = |part: &[u8]| compressed_verdict(codec, &part[..4097], b'\t', true);
-            assert_eq!(first_page(&part), None, "{codec:?} valid, runs on");
-            part[0] ^= 1;
-            assert_eq!(first_page(&part), Some(false), "{codec:?}");
-        }
+        let p = dir.path().join("s.tsvz");
+        assert!(part_1_looks_marked(&p) && part_1_is_snapshot_part(&p));
+        assert_eq!(Store::open(&p, Options::default()).unwrap().len(), 601);
     }
 
     /// Rows of pseudo-random hex, which compress little: `n` of them after `head`.
@@ -1555,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn a_member_that_says_no_is_settled_before_it_is_read_whole_but_yes_waits_for_its_check() {
+    fn a_look_reads_no_more_of_a_part_than_its_first_lines_take() {
         use crate::codec::encode_member;
         for codec in [Codec::Gzip, Codec::Bzip2, Codec::Xz, Codec::Zstd] {
             if !codec.supported() {
@@ -1567,24 +1704,25 @@ mod tests {
                     rest: &member,
                     read: 0,
                 };
-                let no = first_lines_say_no(codec, &mut reader, b'\t', &mut Vec::new());
-                (no, reader.read, member.len())
+                let mut lines = SnapshotLines::new(b'\t');
+                first_lines(codec, &mut reader, &mut |l| lines.line(l));
+                (lines.verdict, reader.read, member.len())
             };
-            // A first line that is not a comment, or a second that is not the marker: no part
-            // begins its member so, whether or not the member passes its check, and what the
-            // decoder has given by then is enough (bzip2 gives nothing before a whole block).
-            for head in ["", "#h\n"] {
-                let (no, read, whole) = says(&noise(head, 100_000));
-                assert!(no, "{codec:?} {head:?}");
+            // A first line that is not a comment, or a second that is not the marker, and the
+            // marker: what the decoder has given by then settles it (bzip2 gives nothing before
+            // a whole block).
+            for (head, verdict) in [
+                ("", false),
+                ("#h\n", false),
+                ("#_snapshot_#\n", true),
+                ("#h\n#_snapshot_#\n", true),
+            ] {
+                let (got, read, whole) = says(&noise(head, 100_000));
+                assert_eq!(got, Some(verdict), "{codec:?} {head:?}");
                 assert!(
                     read * 2 < whole,
                     "{codec:?} {head:?}: {read} of {whole} bytes"
                 );
-            }
-            // The marker is no "no": it waits for the check of the member that holds it.
-            for head in ["#_snapshot_#\n", "#h\n#_snapshot_#\n"] {
-                let (no, ..) = says(&noise(head, 100_000));
-                assert!(!no, "{codec:?} {head:?}");
             }
         }
     }
@@ -1592,8 +1730,8 @@ mod tests {
     #[test]
     fn a_compressed_snapshot_part_is_found_however_far_its_first_lines_lie() {
         // bzip2 gives nothing before a whole block (up to 900 kB of text), and a long header
-        // comment compresses past any fixed first read: the part is read until its first lines
-        // come out of members that passed their checks, so that a scrub finds it marked.
+        // comment compresses past any fixed first read: the look reads on until its first lines
+        // come out, and the read confirms them, so that a read begins there whatever the codec.
         use crate::name::Codec;
         let long_header = format!("#{}\n", noise("", 15000).replace(['\t', '\n'], " "));
         for (what, content) in [
@@ -1611,10 +1749,13 @@ mod tests {
                 write(dir.path(), "s.tsvz", b"#h\na\t1\n");
                 let part =
                     crate::codec::encode_members(codec, content.as_bytes(), 1 << 20).unwrap();
-                assert!(part.len() as u64 > SNAPSHOT_HINT, "{what} {codec:?}");
+                assert!(part.len() > SNAPSHOT_HINT, "{what} {codec:?}");
                 write(dir.path(), &format!("s.tsvz.1.{}", codec.name()), &part);
                 let path = dir.path().join("s.tsvz");
+                assert!(part_1_looks_marked(&path), "{what} {codec:?}");
                 assert!(part_1_is_snapshot_part(&path), "{what} {codec:?}");
+                let s = Store::open(&path, Options::default()).unwrap();
+                assert!(s.get("a").is_none(), "{what} {codec:?}: begun at part 1");
             }
         }
     }
