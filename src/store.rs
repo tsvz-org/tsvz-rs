@@ -2145,6 +2145,21 @@ mod tests {
         );
     }
 
+    /// A loose header loses the NULs a reader drops: at its start, and at the end of an
+    /// unterminated line 1 (a torn write), not those of a terminated one.
+    #[test]
+    fn a_loose_header_loses_the_nuls_a_reader_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, data, header) in [
+            ("cut.tsv", &b"\0#h\0\0"[..], "#h"),
+            ("ended.tsv", b"\0#h\0\n", "#h\0"),
+        ] {
+            let p = write(dir.path(), name, data);
+            let s = Store::open(&p, Options::default()).unwrap();
+            assert_eq!(s.header(), Some(header), "{name}");
+        }
+    }
+
     #[test]
     fn degenerate_parts_are_empty_stores() {
         let dir = tempfile::tempdir().unwrap();

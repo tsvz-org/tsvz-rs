@@ -729,11 +729,12 @@ fn a_loose_delete_writes_what_tsvz_py_writes() {
         );
     }
     // One column: the same keys, in whatever order (TSVZ.py may move one first), whether or
-    // not the key as given has whitespace at its end.
+    // not the key as given has a blank at its end. (A tab there is the key's own, `b<sep>`, as a
+    // reader names it; TSVZ.py's library falls back to `b` when no `b<sep>` is live.)
     for (text, keys) in [
         ("a\nb\nc\n", &["b"][..]),
         ("#h\na\nb \nc\nb\n", &["b"]),
-        ("#h\na\nb\nc\nb\n", &["b\t", "zz"]),
+        ("#h\na\nb\nc\nb\n", &["b ", "zz"]),
         ("a\nb\t1\nc\n", &["a"]),
         ("a\n#_defaults_#\tP\nb\nc\n", &["a", "c"]),
     ] {
