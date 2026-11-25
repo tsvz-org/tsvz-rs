@@ -250,8 +250,10 @@ entries go last, in the same commit as the change:
 
 ## 2026-11-25 A stop reports a lost write it had acknowledged
 - Changed: the handler keeps the first failure that lost a write it answered before it made it (a failed batch of
-  such writes, a failed sync of them); every later `stop` answers 1 with it, `tsvz stop` exits 1, and `serve` ends
-  with status 1. 0.2.1's stop flushed the queue and answered `#0` if that flush worked, and `serve` exited 0.
+  such writes, a failed sync of them); every later `stop` it answers gets 1 with it (`tsvz stop` waits for the handler
+  to go, then exits 1; a stop that finds it already stopping is closed unread, and exits by whether it goes), and
+  `serve` ends with status 1, also for a write lost while it stops. 0.2.1's stop flushed the queue and answered `#0`
+  if that flush worked, and `serve` exited 0.
 - Why we had to change: a stop that answers `#0` says every acknowledged write is durable (§21.9.3); a write lost in
   a batch that failed earlier is not, and a later batch that works does not bring it back (0.2.1's final review).
 - Original design was wrong because: the stop judged by its own last step, the flush, and the failure state it read
@@ -283,7 +285,8 @@ entries go last, in the same commit as the change:
 ## 2026-11-25 A loose scrub keeps what TSVZ.py's strict reader reads
 - Changed: a loose `scrub` keeps the last line of each key that TSVZ.py's strict reader takes (it skips a line
   narrower than the column count), and moves a key's last line into its first line's place only where that reader
-  takes the last line, or none of the key's lines.
+  takes the last line, or none of the key's lines, where no `#_defaults_#` line holds a value (that case stays in
+  docs/limitations.md: such a line makes the reader take a narrower line, which the plan does not follow).
 - Why we had to change: `x 0 0`, `K 1 2`, `K 9` read `K` as `[K, 1, 2]` to that reader and had no `K` after a scrub;
   on 3,000 random files 0.2.1 changed that reader's reading of 78. TSVZ.py's scrub promises every reader reads the
   file as before.
@@ -294,10 +297,36 @@ entries go last, in the same commit as the change:
 
 ## 2026-11-25 A handler gives back a popped row whose answer it cannot write
 - Changed: when the handler cannot write the answer of a `pop` or `popitem` (the client hung up or gave up), it puts
-  the row back with `setdefault`, which keeps a row written since. 0.2.1 lost the row.
+  the row back with `setdefault`, which keeps a row written since (and prints the row taken then, as an error that
+  `-q` shows); one that is stopping puts nothing back and prints the row. 0.2.1 lost the row.
 - Why we had to change: the handler deletes the row before it answers, so the answer is the row's only copy (0.2.1's
   final review).
 - Original design was wrong because: it treated a failed answer as the client's problem, though the write it answered
   for had already removed the data the answer carried.
 - Lesson: when an answer is the only copy of what its request removed, undo the removal when the answer cannot be
   delivered; only an acknowledgement closes the window after delivery.
+
+## 2026-11-25 A loose clear writes the empty line 1 TSVZ.py's does
+- Changed: `clear` of a loose file writes an empty line 1 where line 1 was no comment (a row, a defaults line, or
+  nothing), as TSVZ.py's `clear` does. A comment line 1 stays (TSVZ.py's `clear` replaces it too; both tools read the
+  two files alike). 0.2.1 kept the `#_defaults_#` lines from line 1 on, so a defaults line, or nothing, was line 1.
+- Why we had to change: a TSVZ.py program that reads a loose file with a header takes line 1 for it: after a 0.2.1
+  `clear` that was a defaults line, or the first row written later (0.2.1's final review).
+- Original design was wrong because: the clear was planned from what the command lines read, which agree, and the
+  bytes of line 1 were left to follow from that; to a program that reads by position, line 1 is part of what the
+  file says.
+- Lesson: when another program reads the files you write by position (line 1 as a header), write that position as
+  it does, even where every reader you test reads the result alike.
+
+## 2026-11-25 A request's own `#_write_ack_#` is durable itself
+- Changed: a handler answers a request that sets `#_write_ack_#` (either value, `set -` with such a line among its
+  records) once its own writes are synced. 0.2.1 decided from the markers in force when the request arrived, so a
+  `disk` set by the request, followed by `k<TAB>v`, was answered at once and `k` not synced, though the files said
+  `disk` once it was written.
+- Why we had to change: a client that asked for `disk` was told its write was done, and could lose it (0.2.1's final
+  review).
+- Original design was wrong because: durability was a fact about the state before the request, and a request can
+  change that state before its own writes are made.
+- Lesson: when a request can change the rule that applies to the writes around it, take the stricter reading where
+  the spec is silent (§21.9.2 leaves it to TSVZ.py): a sync costs time, a write lost after its answer costs the
+  promise.

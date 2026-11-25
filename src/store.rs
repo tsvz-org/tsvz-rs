@@ -58,7 +58,7 @@ pub struct Options {
     /// ([`Store::one_column`]), and no further than its first `head` bytes as stored: a decision
     /// made from that line then rests on bytes a writer's check of the file covers
     /// ([`crate::write::Seen`]). A compressed file's member is still decoded to its check before
-    /// its lines are used (§16.6), holding no more of it than a member of the default size.
+    /// its lines are used (§16.6), holding a few MiB of it at most.
     pub(crate) head: Option<u64>,
 }
 

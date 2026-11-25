@@ -276,7 +276,8 @@ impl Seen {
         )
     }
 
-    /// How long the file was: the bytes the check of [`Seen::grew`] covers.
+    /// How long the file was: an append made on [`Seen::grew`] is made to a file that still has
+    /// those bytes' length (the same file, no shorter; only its last bytes are compared).
     #[cfg(feature = "cli")]
     pub(crate) fn size(&self) -> u64 {
         self.size

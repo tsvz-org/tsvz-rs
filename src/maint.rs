@@ -234,8 +234,8 @@ fn stamp(path: &Path) -> Result<Stamp, Error> {
 /// it: another scrub's rotation may rename it away between its opening and the lock, as
 /// [`Writer::append_at`] checks too. Ok(None): another writer changed it or renamed it;
 /// Ok(Some(false)): it already held these bytes. With `damaged`, the part's old bytes are first
-/// copied to a `.damaged-` backup ([`copy_damaged`]), under the same lock, only once the rewrite
-/// is sure to be made, and the backup's path is put there for the caller to tell
+/// copied to a `.damaged-` backup ([`copy_damaged`]), under the same lock, just before the rewrite,
+/// once the part is the one read and holds other bytes, and the backup's path is put there for the caller to tell
 /// ([`tell_kept`]) once the lock is let go.
 pub(crate) fn rewrite(
     path: &Path,
@@ -1636,8 +1636,8 @@ pub(crate) fn delete_loose(
             let held = held.clone();
             Arc::new(move |w: &Warning| held.lock().unwrap().push(w.clone()))
         };
-        // No further than the size seen: the decision (the column count) rests on bytes that the
-        // append's check covers, never on a first keyed line appended since.
+        // No further than the size seen: the decision (the column count) never rests on a first
+        // keyed line appended since.
         let head = Store::open(
             store,
             Options {

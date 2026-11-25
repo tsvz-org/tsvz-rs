@@ -40,7 +40,7 @@ newline, and no row for a missing key. A key you name is the cell a reader reads
 in a tab file `$'a\n'` and `$'a\t'` name only the row whose cell holds them, `a<LF>` and `a<sep>`, so
 with only `a` in the file they name no row (TSVZ.py's `get` reaches `a`:
 [docs/silent-choices.md](docs/silent-choices.md)); a blank at its end goes. Writes encode cells as
-TSVZ.py's do, and refuse a line that would not read back as its cells (a key that begins with `#`,
+TSVZ.py's do, and refuse a line that would not read back as its cells (a key such as `#tag`,
 a cell holding `</sep/>`), saying why; a `delete` of a key no row can have writes nothing and is
 no failure. An append ends an unterminated last line first, in a
 compressed file too (TSVZ.py's joins the compressed one's). A rewrite writes each
@@ -114,13 +114,16 @@ Stores need nothing; the library's documented API does not change.
 - Loose files: an append to a compressed one that holds something begins with a newline, so its
   last line is never joined (TSVZ.py's append joins it); `setdefault` of a missing key prints the
   row `get` then reads (none, exit 3, where the line it wrote is a deletion); `clear` writes an
-  empty line 1 where line 1 was no comment, as TSVZ.py's does; `scrub` keeps what TSVZ.py's strict
-  reader reads too; `scrub` and `clear` take a file named `app.tsv.1` as one file. Reads that
+  empty line 1 where line 1 was no comment, as TSVZ.py's does (TSVZ.py's also replaces a comment
+  line 1, which tsvz-rs keeps); `scrub` keeps what TSVZ.py's strict reader reads too, where no
+  `#_defaults_#` line holds a value ([docs/limitations.md](docs/limitations.md)); `scrub` and
+  `clear` take a file named `app.tsv.1` as one file. Reads that
   want few rows (`get`, `len`, `keys`) take less CPU, and a row holds only its own cells.
 - Through a handler: `tsvz stop` of a handler that died, or that closed one connection for want of
-  a thread, ends at once (it waited 30 s); a stop that cannot make every acknowledged write
-  durable exits 1, and so does `serve`; a request that sets `#_write_ack_#` is answered once its
-  own writes are synced; a `pop` whose client went away before its answer puts its row back.
+  a thread, ends at once (it waited 30 s); a stop that finds an acknowledged write lost answers 1
+  (`tsvz stop` waits for the handler to go, then exits 1), and `serve` ends with status 1; a
+  request that sets `#_write_ack_#` is answered once its own writes are synced; a `pop` whose
+  client went away before its answer gets its row put back, while the handler serves.
 
 ## Upgrading to 0.2.1 from 0.2.0
 
@@ -135,8 +138,8 @@ Stores need nothing; the library's documented API does not change.
   `#_defaults_#` lines fill the empty cells after them, a line whose key is only whitespace is
   no row, the last line is read even without its newline, and `get` of a missing key prints
   nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
-  (0.2.0 refused it), refuses a line that would not read back as its cells (a key that begins with
-  `#`, a cell holding `</sep/>`), and ends an unterminated last line of a plain file with a newline
+  (0.2.0 refused it), refuses a line that would not read back as its cells (a key such as
+  `#tag`, a cell holding `</sep/>`), and ends an unterminated last line of a plain file with a newline
   before it appends (0.2.0 cut that line). A key typed with a trailing
   line break, or in a tab file a trailing tab, names only the row whose cell holds it: `$'b\t'` no
   longer reaches row `b` in a tab file (0.2.0's `delete` removed `b` in a file of one column;

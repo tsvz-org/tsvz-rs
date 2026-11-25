@@ -424,9 +424,8 @@ impl Run {
 /// line 1, and the first keyed line after it, stay for a TSVZ.py program that takes line 1 for its
 /// header. So does TSVZ.py's strict reader (`readTSV(strict=True)`, given no header), which skips
 /// a line narrower than the column count: the last line of a key that it takes stays too, and the
-/// value line moves only when it is one it takes, or it takes none of the key's lines. (Under
-/// `#_defaults_#` that hold a value it takes every line, and the lines kept for it there are more
-/// than it needs.)
+/// value line moves only when it is one it takes, or it takes none of the key's lines. (Not where
+/// a `#_defaults_#` line that holds a value is in force: docs/limitations.md.)
 pub(crate) struct ScrubPlan {
     d: u8,
     pins: Pins,
@@ -489,7 +488,7 @@ impl ScrubPlan {
                 continue; // one line
             };
             if taken.is_some() {
-                continue; // moved, the last line would leave a strict reader no line of the key
+                continue; // kept last: moved before `t`, it would lose to `t` for a reader of a key's last line
             }
             if raw.last() != Some(&b'\n') {
                 continue; // an unterminated last line stays last: the end of a line is read otherwise
@@ -629,10 +628,11 @@ impl Planner for Writer {
 
 /// What `clear` leaves of a loose file, gathered in one read: line 1 when it is a comment or
 /// empty, else an empty line in its place, as TSVZ.py writes where a file has no header (a program
-/// that takes line 1 for a header then takes no row or defaults line for it); and, in a file of
-/// more than one column, the `#_defaults_#` lines that hold a value after the last one that holds
-/// none (which resets the defaults), so that rows written later read with the defaults they had
-/// before. They keep the file's column count too, which the first of them may not have: a
+/// that takes line 1 for a header then takes no row or defaults line for it; TSVZ.py's `clear`
+/// writes it over a comment line 1 too, which tsvz-rs keeps: both read the two files alike); and,
+/// in a file of more than one column, the `#_defaults_#` lines that hold a value after the last
+/// one that holds none (which resets the defaults), so that rows written later read with the
+/// defaults they had before. They keep the file's column count too, which the first of them may not have: a
 /// `#_defaults_#` line that holds no value, at that count, goes before it (it sets the count, and
 /// changes nothing else). A one-column file keeps none: its first keyed line would be a defaults
 /// line of more cells, and a key alone, a row there, would be a deletion.
