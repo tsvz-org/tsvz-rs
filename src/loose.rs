@@ -551,9 +551,11 @@ impl Planner for Writer {
 }
 
 /// What `clear` leaves of a loose file, gathered in one read: line 1 when it is a comment or
-/// empty (TSVZ.py writes an empty line where a file has no header), and, in a file of more than one
-/// column, the `#_defaults_#` lines that hold a value after the last one that holds none (which
-/// resets the defaults), so that rows written later read with the defaults they had before. They keep the file's column count too, which the first of them may not have: a
+/// empty, else an empty line in its place, as TSVZ.py writes where a file has no header (a program
+/// that takes line 1 for a header then takes no row or defaults line for it); and, in a file of
+/// more than one column, the `#_defaults_#` lines that hold a value after the last one that holds
+/// none (which resets the defaults), so that rows written later read with the defaults they had
+/// before. They keep the file's column count too, which the first of them may not have: a
 /// `#_defaults_#` line that holds no value, at that count, goes before it (it sets the count, and
 /// changes nothing else). A one-column file keeps none: its first keyed line would be a defaults
 /// line of more cells, and a key alone, a row there, would be a deletion.
@@ -587,9 +589,7 @@ impl ClearPlan {
             }
             out.extend_from_slice(line);
         };
-        if let Some(h) = &self.header {
-            put(h);
-        }
+        put(self.header.as_deref().unwrap_or(b"\n"));
         if self.pins.one || self.in_force.is_empty() {
             return out;
         }
@@ -1026,7 +1026,7 @@ mod tests {
         for (input, output) in [
             ("#h\n#_defaults_#\tP\na\t1\n", "#h\n#_defaults_#\tP\n"),
             ("\na\t1\n", "\n"),
-            ("a\t1\n#_defaults_#\tP\n", "#_defaults_#\tP\n"),
+            ("a\t1\n#_defaults_#\tP\n", "\n#_defaults_#\tP\n"),
             (
                 "#h\r\na\t1\r\n#_defaults_#\tP\r\n",
                 "#h\r\n#_defaults_#\tP\r\n",
@@ -1041,23 +1041,28 @@ mod tests {
             // a blank one of the file's.
             (
                 "a\t1\n#_defaults_#\tP\tQ\tS\n",
-                "#_defaults_#\t\n#_defaults_#\tP\tQ\tS\n",
+                "\n#_defaults_#\t\n#_defaults_#\tP\tQ\tS\n",
             ),
             (
                 "a\t1\t2\t3\n#_defaults_#\tP\tQ\n",
-                "#_defaults_#\t\t\t\n#_defaults_#\tP\tQ\n",
+                "\n#_defaults_#\t\t\t\n#_defaults_#\tP\tQ\n",
             ),
             (
                 "#h\na\t1\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n",
                 "#h\n#_defaults_#\t\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n",
             ),
             // A one-column file keeps none: a defaults line of more cells would make it two.
-            ("a\n#_defaults_#\tP\n#_defaults_#\n", ""),
+            ("a\n#_defaults_#\tP\n#_defaults_#\n", "\n"),
             ("#h\na\n#_defaults_#\tP\tQ\n", "#h\n"),
             // With a byte-order mark, line 1 is a row to TSVZ.py.
-            ("\u{feff}#_defaults_#\tP\na\t1\n", ""),
+            ("\u{feff}#_defaults_#\tP\na\t1\n", "\n"),
             // A line 1 of only NULs is empty to TSVZ.py: kept as the empty line it writes.
             ("\0\na\t1\n", "\0\n"),
+            // A line 1 that is a row (or a defaults line) goes, an empty line in its place, as
+            // TSVZ.py's clear writes one: a program that takes line 1 for a header takes that.
+            ("a\t1\nb\t2\n", "\n"),
+            ("#_defaults_#\tP\na\t1\n", "\n#_defaults_#\tP\n"),
+            ("", "\n"),
         ] {
             assert_eq!(cleared(input), output, "{input:?}");
         }

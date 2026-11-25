@@ -46,9 +46,9 @@ but for one that begins with `#_defaults_#`, or with a NUL, or is only whitespac
 writes nothing and is no failure. An append to a compressed loose file whose text does
 not end with a newline joins that last line, as TSVZ.py's does (deferred to 0.2.2,
 [docs/limitations.md](docs/limitations.md)). A rewrite writes each
-line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
-line that set the column count went, and the blank `#_defaults_#` line a `clear` may write before
-the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
+line it keeps as the file has it, but for three things: the key a one-column `delete` puts where the
+line that set the column count went, and the empty line 1 and blank `#_defaults_#` line a `clear`
+may write before the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
 place of its first, where nothing a reader reads changes), and `clear` the `#_defaults_#` lines in
 force ([docs/silent-choices.md](docs/silent-choices.md)).
 

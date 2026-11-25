@@ -1328,6 +1328,14 @@ fn a_loose_file_is_one_file_even_with_numbered_siblings() {
     assert_eq!(records(dir, &["set", "app.tsv", "c", "3"]).0, 0);
     assert_eq!(file(dir, "app.tsv"), "a\tnew\nc\t3\n");
     assert_eq!(file(dir, "app.tsv.1"), "a\told\nb\told\n");
+    // A loose file named with a number is one file to `scrub` and `clear` too (0.2.1 refused it as
+    // a part of a multi-part store, which a loose file never is).
+    fs::write(dir.join("app.tsv.2"), "#h\na\t1\nb\t2\na\t3\n").unwrap();
+    assert_eq!(records(dir, &["scrub", "app.tsv.2"]).0, 0);
+    assert_eq!(file(dir, "app.tsv.2"), "#h\na\t3\nb\t2\n");
+    assert_eq!(records(dir, &["clear", "app.tsv.1"]).0, 0);
+    assert_eq!(file(dir, "app.tsv.1"), "\n");
+    assert_eq!(file(dir, "app.tsv"), "a\tnew\nc\t3\n");
 }
 
 #[cfg(target_os = "linux")]

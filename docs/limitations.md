@@ -232,29 +232,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### A loose `clear` writes no blank line 1 before the defaults it keeps
-- Kind: deferred
-- What the operator sees: when line 1 of a loose file is neither a comment nor empty and `clear` keeps `#_defaults_#`
-  lines (it does, by the user's pick of 2026-11-14), the cleared file begins with a defaults line; TSVZ.py's `clear`
-  writes an empty line 1 (and keeps no defaults), so a TSVZ.py program that reads the file with a header takes the
-  defaults line for its header (a second opinion's reading of TSVZ.py, not run). Both tools' command lines read the
-  file alike.
-- Why: `ClearPlan` keeps line 1 only when it is a comment or empty.
-- Revisit when: 0.2.2. The plan: write the blank line 1 before the defaults it keeps (the tests in `loose.rs` that
-  encode its absence change), or record the departure in docs/silent-choices.md.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### `scrub` and `clear` refuse a loose file whose name ends in a number
-- Kind: deferred
-- What the operator sees: `tsvz scrub app.tsv.1` or `clear` of a loose file named `<x>.tsv.<number>` says it is one
-  part of a multi-part store and refuses; `delete` and `list` treat it as one file. 0.2.0 does the same.
-- Why: the name is read as a numbered part (§17.2), which a loose file has none of.
-- Revisit when: 0.2.2. The plan: a loose path's numeric suffix names a file, not a part, for `scrub` and `clear` as
-  for the rest (`name.rs`); check §17.2 and §5.2 with the TSVZ session first.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A loose delete that loses a race backs the file up again
 - Kind: deferred
 - What the operator sees: a loose `delete` that rewrites a damaged file, and whose rewrite is overtaken by another

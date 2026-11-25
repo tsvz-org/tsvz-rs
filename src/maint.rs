@@ -439,10 +439,13 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
     Ok(target)
 }
 
-/// A path naming one numbered part is not a store: rewriting that part alone would drop the
-/// tombstones and markers the rest of the store needs (TSVZ.py refuses it too).
+/// A path naming one numbered part of a strict store is not a store: rewriting that part alone
+/// would drop the tombstones and markers the rest of the store needs (TSVZ.py refuses it too). A
+/// loose file is one file whatever its name (§20.2.4), `app.tsv.1` too, as every other operation
+/// takes it.
 fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
-    if crate::name::names_a_part(path) {
+    let strict = crate::name::format_of(path).is_some_and(|f| f.strict);
+    if strict && crate::name::names_a_part(path) {
         return Err(Error::Refused(format!(
             "{}: {op} skipped: the path names one part of a multi-part store; {op} the store path instead; nothing was written",
             path.display()
@@ -1444,7 +1447,10 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
                 .append(&[])?;
-            return Ok(Outcome::Written);
+            if loose_delimiter(store, options)?.is_none() {
+                return Ok(Outcome::Written);
+            }
+            continue; // a loose file is then cleared as an empty one: an empty line 1, as TSVZ.py's
         }
         let before = if list.len() == 1 {
             Some(stamp(&list[0].path)?)
