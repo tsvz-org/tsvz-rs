@@ -688,6 +688,7 @@ fn judge<S: Source + ?Sized>(
             match decoder.feed_upto(&page[fed..n], out, room) {
                 Err(()) => return Ok(Some(Verdict::Damaged)),
                 Ok((used, true)) => {
+                    held(out);
                     return Ok(Some(Verdict::Complete(
                         at + (fed + used) as u64 - pos,
                         kept,
@@ -1291,16 +1292,17 @@ mod tests {
         for codec in codecs() {
             let data = encode_member(codec, &zeros).unwrap();
             HELD.with(|h| h.set(0));
-            let mut total = 0;
+            let (mut total, mut largest) = (0, 0);
             read_items(codec, &data[..], 1 << 20, &mut |item| {
                 if let Item::Data(out) = item {
                     total += out.len();
+                    largest = largest.max(out.len());
                 }
                 true
             })
             .unwrap();
             assert_eq!(total, zeros.len(), "{codec:?}: every byte, in pieces");
-            let held = HELD.with(|h| h.get());
+            let held = HELD.with(|h| h.get()).max(largest);
             assert!(held < 3 << 20, "{codec:?} held {held} bytes at once");
         }
     }
