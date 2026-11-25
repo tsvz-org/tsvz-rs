@@ -2108,7 +2108,10 @@ mod tests {
                 LooseDelete::Appended(1),
                 "{name}"
             );
-            let want = ["a\t1\nb\t2\n", "c\t3\n", "a\n"].map(member).concat();
+            // In a compressed file the key alone begins with a newline (an empty line), as every
+            // append to one that holds something does.
+            let alone = if name.ends_with(".gz") { "\na\n" } else { "a\n" };
+            let want = ["a\t1\nb\t2\n", "c\t3\n", alone].map(member).concat();
             assert_eq!(fs::read(&p).unwrap(), want, "{name}");
             assert_eq!(
                 rows(&p),
