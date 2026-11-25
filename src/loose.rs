@@ -101,7 +101,7 @@ pub(crate) fn sanitize(cell: &str, d: u8) -> Cow<'_, str> {
 /// whitespace at its end, then decoded). None when that is not `key` less some whitespace at its
 /// end, so that no row can have `key`: its line begins with `#` (a comment, but for a `#_defaults_#`
 /// line) or a NUL; it is only whitespace that its encoding leaves as it is (a reader trims that
-/// away; a tab or a line break encodes as `<sep>` or `<LF>`, and so is a key); it holds `</sep/>` or
+/// away; the delimiter or a line break encodes as `<sep>` or `<LF>`, and so is a key); it holds `</sep/>` or
 /// `</LF/>` (read back as `<sep>` and `<LF>`); or its encoding holds the delimiter (`-d e`: `<sep>`
 /// has an `e`). The rule for every key a loose command names, and, field by field, for what a loose
 /// write may write ([`reads_back`]).

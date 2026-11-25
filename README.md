@@ -41,9 +41,8 @@ in a tab file `$'a\n'` and `$'a\t'` name only the row whose cell holds them, `a<
 with only `a` in the file they name no row (TSVZ.py's `get` reaches `a`:
 [docs/silent-choices.md](docs/silent-choices.md)); a blank at its end goes. Writes encode cells as
 TSVZ.py's do, and refuse a line that would not read back as its cells (a key that begins with `#`,
-but for one that begins with `#_defaults_#`, or with a NUL, or is only whitespace; `</sep/>`; with
-`-d e`, a cell whose encoding holds an `e`, as `<sep>` does); a `delete` of a key no row can have
-writes nothing and is no failure. An append ends an unterminated last line first, in a
+a cell holding `</sep/>`), saying why; a `delete` of a key no row can have writes nothing and is
+no failure. An append ends an unterminated last line first, in a
 compressed file too (TSVZ.py's joins the compressed one's). A rewrite writes each
 line it keeps as the file has it, but for three things: the key a one-column `delete` puts where the
 line that set the column count went, and the empty line 1 and blank `#_defaults_#` line a `clear`
@@ -121,14 +120,13 @@ Stores need nothing; the library's documented API does not change.
   `#_defaults_#` lines fill the empty cells after them, a line whose key is only whitespace is
   no row, the last line is read even without its newline, and `get` of a missing key prints
   nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
-  (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, a cell whose encoding holds the delimiter
-  (`-d e`) and a key that no reader would read back (it begins with `#`, but for one that begins
-  with `#_defaults_#`, or with a NUL, or is only whitespace), and ends an unterminated last line of
-  a plain file with a newline before it appends (0.2.0 cut that line). A key typed with a trailing
+  (0.2.0 refused it), refuses a line that would not read back as its cells (a key that begins with
+  `#`, a cell holding `</sep/>`), and ends an unterminated last line of a plain file with a newline
+  before it appends (0.2.0 cut that line). A key typed with a trailing
   line break, or in a tab file a trailing tab, names only the row whose cell holds it: `$'b\t'` no
   longer reaches row `b` in a tab file (0.2.0's `delete` removed `b` in a file of one column;
-  TSVZ.py's `get` reaches it). `set -` fed the `#_defaults_#` line appends it, and `delete -` fed
-  it appends a defaults reset, as `delete f '#_defaults_#'` does (0.2.0 wrote nothing for either).
+  TSVZ.py's `get` reaches it). `set -` and `delete -` take the `#_defaults_#` line as `set` and
+  `delete` of it do (0.2.0 wrote nothing for either).
 - A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
   less memory.
 - Through a handler: `tsvz stop` exits 0 when another stop or a signal stopped the handler first

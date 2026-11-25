@@ -1594,7 +1594,7 @@ pub(crate) enum LooseDelete {
 }
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
-/// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
+/// from the file's column count alone: more than one column, a key alone is a
 /// deletion, appended for each key asked, live or not, as a reader names it ([`loose::name`]: a
 /// line break or a delimiter at its end stays, a blank goes; a key no row can have names none), and only
 /// while the file is as the read found it; one column, where a key alone is a row and no line can
