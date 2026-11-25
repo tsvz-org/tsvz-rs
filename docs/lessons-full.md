@@ -247,3 +247,57 @@ entries go last, in the same commit as the change:
 - Lesson: to tell whether the process behind a file is still there, ask the kernel lock it holds on that file,
   released when the process ends, not the name, pid or address it wrote; a record outlives the writer that is
   killed before it removes it.
+
+## 2026-11-25 A stop reports a lost write it had acknowledged
+- Changed: the handler keeps the first failure that lost a write it answered before it made it (a failed batch of
+  such writes, a failed sync of them); every later `stop` answers 1 with it, `tsvz stop` exits 1, and `serve` ends
+  with status 1. 0.2.1's stop flushed the queue and answered `#0` if that flush worked, and `serve` exited 0.
+- Why we had to change: a stop that answers `#0` says every acknowledged write is durable (§21.9.3); a write lost in
+  a batch that failed earlier is not, and a later batch that works does not bring it back (0.2.1's final review).
+- Original design was wrong because: the stop judged by its own last step, the flush, and the failure state it read
+  (`failing`) was cleared by the next batch that worked.
+- Lesson: a command whose success promises that earlier work is safe keeps the first failure that broke the promise
+  until it is asked, as state of its own; a later success clears an error banner, not a loss.
+
+## 2026-11-25 An append to a compressed loose file begins with a newline
+- Changed: each member tsvz-rs appends to a compressed loose file that holds something begins with `\n`, an empty
+  line both tools read as nothing, so a last line without a newline is ended instead of joined (TSVZ.py's append joins
+  it). A plain loose file is ended as before, by looking at its last byte.
+- Why we had to change: `b<TAB>1` without a final newline, then `delete b`, read `b<TAB>1b`: the record was lost and
+  the row changed (0.2.1's loose differential test).
+- Original design was wrong because: it took the end of what it appended to for a line end, which it can check in a
+  plain file and cannot in a compressed one without decoding the whole file.
+- Lesson: when an append cannot see the end of what it appends to, begin it with a separator the reader ignores
+  rather than trust that end.
+
+## 2026-11-25 setdefault prints the row a reader reads back
+- Changed: `setdefault` of a missing key in a loose file prints the row `get` reads after the append, and exits 3 with
+  no row where the line it wrote is a deletion, as TSVZ.py's does; 0.2.1 printed the cells given, padded with blanks.
+- Why we had to change: a value's trailing blank, the cells a `#_defaults_#` line fills, and a value list of blanks
+  (a deletion at more than one column) printed a row no reader reads (0.2.1's short round).
+- Original design was wrong because: the print was computed by a second copy of the reading (the strict store's
+  padding), which the loose reader's rule had outgrown.
+- Lesson: to show what a write made, read it back through the reader every other command uses; a computed copy is a
+  second rule.
+
+## 2026-11-25 A loose scrub keeps what TSVZ.py's strict reader reads
+- Changed: a loose `scrub` keeps the last line of each key that TSVZ.py's strict reader takes (it skips a line
+  narrower than the column count), and moves a key's last line into its first line's place only where that reader
+  takes the last line, or none of the key's lines.
+- Why we had to change: `x 0 0`, `K 1 2`, `K 9` read `K` as `[K, 1, 2]` to that reader and had no `K` after a scrub;
+  on 3,000 random files 0.2.1 changed that reader's reading of 78. TSVZ.py's scrub promises every reader reads the
+  file as before.
+- Original design was wrong because: the scrub's plan named the readers it kept (the command line's, and one given
+  line 1 for its header) and left out a reader of the same files that skips lines.
+- Lesson: list every reader that reads the files you rewrite, strict and lenient, and test the rewrite against each
+  on random files; a reader left off the list is the one whose reading changes.
+
+## 2026-11-25 A handler gives back a popped row whose answer it cannot write
+- Changed: when the handler cannot write the answer of a `pop` or `popitem` (the client hung up or gave up), it puts
+  the row back with `setdefault`, which keeps a row written since. 0.2.1 lost the row.
+- Why we had to change: the handler deletes the row before it answers, so the answer is the row's only copy (0.2.1's
+  final review).
+- Original design was wrong because: it treated a failed answer as the client's problem, though the write it answered
+  for had already removed the data the answer carried.
+- Lesson: when an answer is the only copy of what its request removed, undo the removal when the answer cannot be
+  delivered; only an acknowledgement closes the window after delivery.
