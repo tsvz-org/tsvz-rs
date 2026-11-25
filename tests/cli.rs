@@ -908,9 +908,8 @@ fn a_loose_key_with_a_line_break_at_its_end_names_its_own_row() {
     assert_eq!(records(dir, &["get", "f.tsv", "a\n"]).1, "a<LF>\t5\n");
 }
 
-/// A key or value with whitespace at its end is written as a reader names it, without it (TSVZ.py's
-/// command line writes it and reads it stripped); one that no row can have is refused, and its
-/// delete writes nothing.
+/// A key or value with whitespace at its end is written as a reader names it, without it; one
+/// that no row can have is refused, and its delete writes nothing.
 #[test]
 fn a_loose_write_names_its_cells_as_a_reader_does() {
     let d = tempfile::tempdir().unwrap();
@@ -932,9 +931,9 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
         2
     );
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n");
-    // Bulk input: the `#_defaults_#` line is a record, as TSVZ.py's command line has it; any
-    // other line whose first field begins with `#` is skipped, as there, though a reader reads
-    // `#_defaults_# ` and `#_defaults_#x` as defaults lines (0.2.0 skipped the exact line too).
+    // Bulk input: the `#_defaults_#` line is a record; any other line whose first field begins
+    // with `#` is skipped, though a reader reads `#_defaults_# ` as a defaults line and
+    // `#_defaults_#x` as a row (0.2.0 skipped the exact line too: docs/silent-choices.md).
     let all = ["--format", "records", "set", "f.tsv", "-"];
     assert_eq!(run_in(dir, &all, b"#_defaults_#\tD\n#c\tx\nb\t2\n").0, 0);
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n#_defaults_#\tD\nb\t2\n");

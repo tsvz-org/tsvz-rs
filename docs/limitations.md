@@ -284,9 +284,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: `setdefault KEY VALUE ...` on a loose file that lacks KEY appends the line and prints the
   cells given, padded to the file's width with blanks. A reader then reads another row: trailing blanks of a value
   are gone (`tsvz setdefault f n 'x '` prints `n<TAB>x<SP><TAB>`, the file reads `n<TAB>x`), the cells a
-  `#_defaults_#` line in force fills are not filled in the print, and a value list of blanks (`setdefault f m ''`)
-  prints a row though the line written is a deletion, which no reader reads as a row (0.2.0 the same). The key
-  itself is named as a reader names it (0.2.1).
+  `#_defaults_#` line in force fills are not filled in the print, and, at two or more columns, a value list of
+  blanks (`setdefault f m ''`) prints a row though the line written is a deletion, which no reader reads as a row
+  (0.2.0 the same). The key itself is named as a reader names it (0.2.1).
 - Why: the print is built with the strict store's padding (`Row::new`); a loose row's cells come from the
   reader's rule (`loose::parse`, the `#_defaults_#` lines, the column count), which that code does not call.
 - Revisit when: 0.2.2. The plan: print what the store's own read gives for the key after the append (the same code

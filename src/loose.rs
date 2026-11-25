@@ -1,8 +1,8 @@
 //! Loose files (§5.2, §20.2.4), read as TSVZ.py reads them: a loose file's data semantics are
 //! implementation-defined, and tsvz-rs takes TSVZ.py 5.18's (`_processLine`, with `_unsanitize` and
-//! `_fitRow`), so that the two tools read a loose file alike. TSVZ.py has no single rule for the key a
-//! command names there (its `get`, `has`, `pop` and `setdefault` strip the end of the key, its
-//! `delete` does not); tsvz-rs names a key as its reader reads the cell ([`name`]). [`parse`] gives a
+//! `_fitRow`), so that the two tools read a loose file alike. A key a command names is named as the
+//! reader reads the cell ([`name`]); TSVZ.py's commands do not share a rule, and
+//! docs/silent-choices.md says where they differ. [`parse`] gives a
 //! line's cells as TSVZ.py splits and decodes them; the replay ([`crate::replay`]) applies the
 //! column count, the deletions and the `#_defaults_#` lines; a writer encodes cells as TSVZ.py's
 //! does ([`sanitize`]).
@@ -99,10 +99,12 @@ pub(crate) fn sanitize(cell: &str, d: u8) -> Cow<'_, str> {
 /// The key a reader names `key` by, in a loose file of delimiter `d`: the one cell that
 /// [`parse`] reads from the key as [`sanitize`] writes it (the encoded cell trimmed of the
 /// whitespace at its end, then decoded). None when that is not `key` less some whitespace at its
-/// end, so that no row can have `key`: it begins with `#` (a comment, but for a `#_defaults_#` line) or a NUL, is only
-/// whitespace, holds `</sep/>` or `</LF/>` (read back as `<sep>` and `<LF>`), or its encoding
-/// holds the delimiter (`-d e`: `<sep>` has an `e`). The one rule for every key a loose command
-/// names, and, field by field, for what a loose write may write ([`reads_back`]).
+/// end, so that no row can have `key`: its line begins with `#` (a comment, but for a `#_defaults_#`
+/// line) or a NUL; it is only whitespace that its encoding leaves as it is (a reader trims that
+/// away; a tab or a line break encodes as `<sep>` or `<LF>`, and so is a key); it holds `</sep/>` or
+/// `</LF/>` (read back as `<sep>` and `<LF>`); or its encoding holds the delimiter (`-d e`: `<sep>`
+/// has an `e`). The rule for every key a loose command names, and, field by field, for what a loose
+/// write may write ([`reads_back`]).
 pub(crate) fn name(key: &str, d: u8) -> Option<String> {
     let encoded = sanitize(key, d);
     let cells = parse(&encoded, d, true)?;
@@ -113,7 +115,7 @@ pub(crate) fn name(key: &str, d: u8) -> Option<String> {
 }
 
 /// The key a loose command names for `requested` ([`name`]), or, for a key no row can have, the key
-/// itself. The one place a loose key gets its name, with or without a store.
+/// itself. A `delete` drops such a key instead ([`name`] itself), as nothing is written for it.
 pub(crate) fn lookup<'k>(requested: &'k str, d: u8) -> Cow<'k, str> {
     name(requested, d).map_or(Cow::Borrowed(requested), Cow::Owned)
 }

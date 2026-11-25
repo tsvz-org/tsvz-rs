@@ -163,9 +163,8 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
         // file of one column, or with no keyed line yet, is a row. A delete never asks for a
         // tombstone that would not ([`crate::maint::delete_loose`] names keys by that rule). A record
         // whose values are all blank is written, and a reader reads it as a deletion at more than one
-        // column (as TSVZ.py does; the approved C2 rule).
-        // Each cell is written as the reader names it, without that whitespace (TSVZ.py's library
-        // writes none either; its command line writes it, and a reader reads it stripped).
+        // column (the approved C2 rule). Each cell is written as the reader names it, without that
+        // whitespace.
         let fields: Vec<&str> = std::iter::once(key.as_str())
             .chain(values.iter().map(String::as_str))
             .collect();
