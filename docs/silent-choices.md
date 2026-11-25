@@ -71,5 +71,5 @@ TSVZ.py has no single rule for the key a command names in a loose file; tsvz-rs 
 | `set -` | Writes cells without the whitespace at their end; skips a line whose first field begins with `#`, but writes one shaped like a marker: `#_defaults_#` and `#_rotate_#` are written, `#_defaults_# `, `#_defaults_#x` and `#tag` are skipped | The same |
 | `delete -` | As `delete`: `a ` removes both `a` and `a<LF>` | Skips and writes the lines `set -` does, each key stripped: `a ` writes `a`, `#_rotate_#` writes `#_rotate_#` |
 
-tsvz-rs skips a marker-shaped line such as `#_rotate_#` in bulk input, which TSVZ.py writes: a reader reads both files alike, as a comment.
+tsvz-rs skips a marker-shaped line such as `#_rotate_#` in bulk input, which TSVZ.py's `set -` writes: a reader reads both files alike, as a comment.
 
