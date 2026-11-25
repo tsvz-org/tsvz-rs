@@ -59,7 +59,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   a mandatory SMB byte-range lock over the file, so another process's read of it fails with EACCES; the append's
   lock (whole-file on Linux in tsvz-rs, byte 1 in TSVZ.py, the layout of §18.6) is made mandatory the same way.
   Measured on Samba 4.17 with 7.0, 6.1 and 4.18 clients (2026-11-23).
-- Revisit when: 0.2.3, together with TSVZ.py (moved from 0.2.2: TSVZ 5.19 is paused at the user's ask, and tsvz-rs
+- Revisit when: 0.2.4, together with TSVZ.py (moved from 0.2.2: TSVZ 5.19 is paused at the user's ask, and tsvz-rs
   alone cannot take the new lock, below). The plan, measured on all three kernels: a handler holds a write
   lock (an open file description lock) on one byte far past the pointer file's content (offset 2^62), where no
   reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a second handler is
@@ -69,7 +69,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   and goes to the TSVZ session; with a reachable handler the command line reads through its socket and never meets
   it.
 - Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; moved to 0.2.3 on
-  2026-11-25; a deferral under the user's standing rule that deferrals are noted, not asked.
+  2026-11-25, and to 0.2.4 the same day (0.2.3 is the musl build fix alone); a deferral under the user's standing rule that deferrals are noted, not asked.
 
 ### A routed `pop` or `popitem` can lose its row when its answer does not arrive
 - Kind: deferred
@@ -82,7 +82,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   up, or gave up waiting), the handler puts the row back (0.2.2; 0.2.1 lost it), unless a row was written for its
   key since, which stays (the row taken is then printed on `serve`'s standard error).
 - Why: the pop is delete, then answer; a written answer is all the handler can see.
-- Revisit when: 0.2.3, with the TSVZ session. (3): when the engine is closed, the connection thread makes the
+- Revisit when: 0.2.4, with the TSVZ session. (3): when the engine is closed, the connection thread makes the
   `setdefault` on the files, and `serve` joins it before it returns; the stop's order stays. (1) and (2): a client
   acknowledgement for `pop` and `popitem` (§21.7, beside §21.9), which both tools' handlers and clients take up
   together, with the deletion written after the acknowledgement (a handler that dies before it then leaves the row;
@@ -102,7 +102,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   command lines read each file alike before and after. 0.2.1 does both (and changed more rows).
 - Why: the scrub's plan does not follow the strict reader's own defaults (that reader also drops a narrower
   `#_defaults_#` line when none is in force), nor the order in which it first meets a key.
-- Revisit when: 0.2.3. The plan starts with a design question, not a patch (this part has been found wrong four
+- Revisit when: 0.2.4. The plan starts with a design question, not a patch (this part has been found wrong four
   times, each time for a reader the plan approximates by flags): should the scrub run each reader's own rule over
   the lines (the command line's, and the strict branch of `_processLine` with its own defaults state) as a small
   state machine, and keep a line unless every reader's reading stays, in place of the per-line flags? And is moving
@@ -118,7 +118,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   TSVZ.py program that reads the file with a header takes the first row for it. Both command lines read the file
   alike. 0.2.1 the same.
 - Why: the writer creates a loose file empty.
-- Revisit when: 0.2.3. The plan: a loose file is created with the empty line 1 TSVZ.py writes.
+- Revisit when: 0.2.4. The plan: a loose file is created with the empty line 1 TSVZ.py writes.
 - Noted: 2026-11-25, in the 0.2.2 final review.
 
 ### While writes fail, a handler's status-2 answer carries no warning
@@ -129,7 +129,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   puts it on status-2 answers too. 0.2.1 the same.
 - Why: the warning is added where a parsed request is answered, and a request that fails to parse is answered
   before that.
-- Revisit when: 0.2.3: the handler adds the warning to a status-2 answer too, as TSVZ.py's does, and the
+- Revisit when: 0.2.4: the handler adds the warning to a status-2 answer too, as TSVZ.py's does, and the
   exception in docs/silent-choices.md goes.
 - Noted: 2026-11-25, in the re-read of 0.2.2's third fix round.
 
@@ -138,6 +138,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: `tsvz serve` ended by SIGKILL leaves `tsvz-XXXXXX/s` under `$XDG_RUNTIME_DIR` or the
   temporary directory (and its pointer file, which the next `serve` takes over). 0.2.1 the same.
 - Why: nothing runs when a process is killed.
-- Revisit when: 0.2.3. The plan: a `serve` that takes over a pointer file no process holds removes the socket that
+- Revisit when: 0.2.4. The plan: a `serve` that takes over a pointer file no process holds removes the socket that
   file names and `rmdir`s its directory.
 - Noted: 2026-11-25, in the 0.2.2 build.
