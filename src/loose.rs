@@ -131,15 +131,18 @@ pub(crate) fn cause(fields: &[&str], d: u8) -> String {
     let dq = (d as char).escape_default();
     for (i, f) in fields.iter().enumerate() {
         let what = if i == 0 { "the key" } else { "the value" };
-        if i == 0 && f.starts_with('#') {
+        // The line begins with the key as written: encoded, less the whitespace at its end.
+        let written = sanitize(f, d);
+        let written = written.trim_end_matches(py_space);
+        if i == 0 && written.starts_with('#') && !written.starts_with(DEFAULTS) {
             return format!(
                 "{what} {f:?} begins with `#`, so a reader takes the line for a comment"
             );
         }
-        if i == 0 && f.starts_with('\0') {
+        if i == 0 && written.starts_with('\0') {
             return format!("{what} {f:?} begins with a NUL, which a reader drops");
         }
-        if i == 0 && f.trim_end_matches(py_space).is_empty() {
+        if i == 0 && written.is_empty() {
             return format!("{what} {f:?} is empty or only whitespace, so a reader skips the line");
         }
         if f.contains("</sep/>") || f.contains("</LF/>") {
@@ -149,7 +152,7 @@ pub(crate) fn cause(fields: &[&str], d: u8) -> String {
         }
         if sanitize(f, d).contains(d as char) {
             return format!(
-                "{what} {f:?} written as {:?} holds the delimiter `{dq}`, so a reader splits it into two cells",
+                "{what} {f:?} written as {:?} holds the delimiter `{dq}`, so a reader splits it there",
                 sanitize(f, d)
             );
         }
@@ -748,7 +751,7 @@ mod tests {
     /// order of the writer's, the first field that does not read back first).
     #[test]
     fn a_refusal_names_its_cause() {
-        let cases: [(&[&str], u8, &str); 7] = [
+        let cases: [(&[&str], u8, &str); 12] = [
             (&["#tag", "1"], b'\t', "begins with `#`"),
             (&["\0k", "1"], b'\t', "begins with a NUL"),
             (&[" ", "1"], b'\t', "is empty or only whitespace"),
@@ -756,6 +759,25 @@ mod tests {
             (&["k", "x</LF/>"], b'\t', "holds `</sep/>` or `</LF/>`"),
             (&["k", "hello"], b'e', "holds the delimiter `e`"),
             (&["#k", "hello"], b'e', "begins with `#`"),
+            // A key that reads back, beside a value that does not: the value is named.
+            (
+                &["#_defaults_#", "x</sep/>"],
+                b'\t',
+                "the value \"x</sep/>\" holds",
+            ),
+            (&["#tag", "x</sep/>"], b'#', "the value \"x</sep/>\" holds"),
+            (&[" ", "x</sep/>"], b' ', "the value \"x</sep/>\" holds"),
+            // A key that begins with `#_defaults_#` is no comment, so its own cause is named.
+            (
+                &["#_defaults_#</sep/>", "1"],
+                b'\t',
+                "the key \"#_defaults_#</sep/>\" holds",
+            ),
+            (
+                &["#_defaults_#</LF/>", "1"],
+                b'\t',
+                "the key \"#_defaults_#</LF/>\" holds",
+            ),
         ];
         for (fields, d, cause_text) in cases {
             let line = fields

@@ -764,13 +764,25 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
             &["set", "t.tsv", "k", "</sep/>"],
             "holds `</sep/>` or `</LF/>`",
         ),
+        // A key that reads back (`#_defaults_#` is no comment) beside a value that does not: the
+        // value is named, not the key.
+        (
+            &["set", "t.tsv", "#_defaults_#", "x</sep/>"],
+            "the value \"x</sep/>\" holds",
+        ),
+        // A key that begins with `#_defaults_#` is no comment: its own cause is named.
+        (
+            &["set", "t.tsv", "#_defaults_#</sep/>", "1"],
+            "the key \"#_defaults_#</sep/>\" holds",
+        ),
     ] {
         let (code, _, err) = records(dir, args);
         assert!(code == 1 && err.contains(cause), "{args:?} {err}");
         assert_eq!(file(dir, "t.tsv"), "a\t1\n", "{args:?}");
     }
-    // A comment is no key, and a delete of one is no failure.
+    // A comment is no key, and a delete of one is no failure: it writes nothing.
     assert_eq!(records(dir, &["delete", "t.tsv", "#tag"]).0, 0);
+    assert_eq!(file(dir, "t.tsv"), "a\t1\n");
     let (code, _, err) = records(dir, &["-d", "e", "set", "e.tsv", "k", "hello"]);
     assert!(
         code == 1 && err.contains("holds the delimiter `e`"),
@@ -779,6 +791,14 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
     assert!(fs::read(dir.join("e.tsv")).is_ok_and(|f| f.is_empty()) || !dir.join("e.tsv").exists());
     assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
     assert_eq!(file(dir, "e.tsv"), "kehllo\n");
+    // `-d '#'`: the key `#tag` is written `<sep>tag`, which reads back; the value is what fails.
+    fs::write(dir.join("h.tsv"), "k#v\n").unwrap();
+    let (code, _, err) = records(dir, &["-d", "#", "set", "h.tsv", "#tag", "x</sep/>"]);
+    assert!(
+        code == 1 && err.contains("the value \"x</sep/>\" holds"),
+        "{err}"
+    );
+    assert_eq!(file(dir, "h.tsv"), "k#v\n");
 }
 
 /// A key alone (`set FILE KEY`) is refused as a key with a value is: in a file of one column, or
@@ -790,12 +810,13 @@ fn a_loose_key_alone_that_could_not_be_read_back_is_refused_and_its_delete_is_no
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     fs::write(dir.join("one.tsv"), "a\nb\n").unwrap();
-    for key in [" ", "#tag", "#_rotate_#"] {
+    for (key, cause) in [
+        (" ", "is empty or only whitespace"),
+        ("#tag", "begins with `#`"),
+        ("#_rotate_#", "begins with `#`"),
+    ] {
         let (code, _, err) = records(dir, &["set", "one.tsv", key]);
-        assert!(
-            code == 1 && (err.contains("only whitespace") || err.contains("begins with `#`")),
-            "{key:?}: {code} {err}"
-        );
+        assert!(code == 1 && err.contains(cause), "{key:?}: {code} {err}");
         assert_eq!(file(dir, "one.tsv"), "a\nb\n", "{key:?}");
         assert_eq!(records(dir, &["delete", "one.tsv", key]).0, 0, "{key:?}");
         assert_eq!(file(dir, "one.tsv"), "a\nb\n", "{key:?}");
