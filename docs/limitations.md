@@ -71,17 +71,59 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; moved to 0.2.3 on
   2026-11-25; a deferral under the user's standing rule that deferrals are noted, not asked.
 
-### A routed `pop` or `popitem` whose answer is written but never read loses its row
+### A routed `pop` or `popitem` can lose its row when its answer does not arrive
 - Kind: deferred
-- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. When that write
-  fails (the client hung up, or gave up waiting), the handler puts the row back (0.2.2; 0.2.1 lost it). An answer
-  the handler wrote that the client never read (killed after the write and before its read) is lost with its row,
-  and the command's error (`lost the handler`) names no row.
-- Why: a written answer is all the handler can see; only an acknowledgement from the client would say that the row
-  reached it.
-- Revisit when: 0.2.3, with the TSVZ session: a client acknowledgement for `pop` and `popitem` (§21.7), which both
-  tools' handlers and clients must take up together; or accept it as a known limitation (the user's OK). The
-  two-step pop of the first plan (the row hidden until its answer is written) would answer before the deletion is
-  written, and still could not tell a written answer from a read one.
+- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. Three windows
+  are left. (1) The handler's process dies (killed, out of memory) after the deletion is written and before the
+  answer is: the row is gone and the command exits 1 (`lost the handler`), naming no row. (2) The answer is
+  written and never read (the command is killed in between): the row is gone. (3) The answer cannot be written
+  while the handler stops (the client left, or does not read a large answer): the row is not put back, and is
+  printed on `serve`'s standard error. When the answer cannot be written while the handler serves (the client hung
+  up, or gave up waiting), the handler puts the row back (0.2.2; 0.2.1 lost it), unless a row was written for its
+  key since, which stays (the row taken is then printed on `serve`'s standard error).
+- Why: the pop is delete, then answer; a written answer is all the handler can see.
+- Revisit when: 0.2.3, with the TSVZ session. (3): when the engine is closed, the connection thread makes the
+  `setdefault` on the files, and `serve` joins it before it returns; the stop's order stays. (1) and (2): a client
+  acknowledgement for `pop` and `popitem` (§21.7, beside §21.9), which both tools' handlers and clients take up
+  together, with the deletion written after the acknowledgement (a handler that dies before it then leaves the row;
+  one that dies after it and before the deletion leaves a row that was delivered); or accept (1) and (2) as a
+  known limitation (the user's OK).
 - Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write); a
   deferral under the user's standing rule that deferrals are noted, not asked.
+
+### A scrub of a loose file can change a row a strict TSVZ.py reader reads, under `#_defaults_#` that hold a value
+- Kind: deferred
+- What the operator sees: TSVZ.py's strict read of the library (`readTSV(strict=True)`) drops a line narrower than
+  the column count, but takes it, padded, while a `#_defaults_#` line that holds a value is in force. A loose
+  `scrub` keeps the lines that reader takes by their width alone (0.2.2), so the lines `#h`, `x 0 0`,
+  `K 1 2`, `#_defaults_# P Q`, `K 9`, `#_defaults_#`, `K 8` (tab-separated) lose `K 9`: that reader read `K` as
+  `[K, 9, Q]` before and reads `[K, 1, 2]` after. Both tools' command lines read `K` alike before and after. 0.2.1 does the same; without
+  such a `#_defaults_#` line the strict reading stays (0.2.2).
+- Why: the scrub's plan does not follow the strict reader's own defaults (it drops a narrower `#_defaults_#` line
+  too, when none is in force).
+- Revisit when: 0.2.3. The plan starts with a design question, not a patch (this part has been found wrong three
+  times, each time for a reader the plan approximates by flags): should the scrub run each reader's own rule over
+  the lines (the command line's, and the strict branch of `_processLine` with its own defaults state) as a small
+  state machine, and keep a line unless every reader's reading stays, in place of the per-line flags? And is moving
+  a key's last line into its first line's place worth its state at all, against keeping the lines in place? The
+  strict probe's generator then draws defaults, resets and narrow rows.
+- Noted: 2026-11-23, in the 0.2.1 final review; narrowed in 0.2.2 (2026-11-25, its final review found this case).
+
+### A loose file that tsvz-rs creates has no empty line 1
+- Kind: deferred
+- What the operator sees: `set`, `append` or `setdefault` on a missing loose file writes the row as line 1, and
+  `delete` leaves the file empty; TSVZ.py writes an empty line 1 first, and so does tsvz-rs's `clear` (0.2.2). A
+  TSVZ.py program that reads the file with a header takes the first row for it. Both command lines read the file
+  alike. 0.2.1 the same.
+- Why: the writer creates a loose file empty.
+- Revisit when: 0.2.3. The plan: a loose file is created with the empty line 1 TSVZ.py writes.
+- Noted: 2026-11-25, in the 0.2.2 final review.
+
+### A handler that is killed leaves its socket directory
+- Kind: deferred
+- What the operator sees: `tsvz serve` ended by SIGKILL leaves `tsvz-XXXXXX/s` under `$XDG_RUNTIME_DIR` or the
+  temporary directory (and its pointer file, which the next `serve` takes over). 0.2.1 the same.
+- Why: nothing runs when a process is killed.
+- Revisit when: 0.2.3. The plan: a `serve` that takes over a pointer file no process holds removes the socket that
+  file names and `rmdir`s its directory.
+- Noted: 2026-11-25, in the 0.2.2 build.
