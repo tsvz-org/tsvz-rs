@@ -296,6 +296,8 @@ struct Pins {
     width_line: Option<usize>,
     after_first: Option<usize>,
     one: bool,
+    /// The column count, the cells of the first keyed line.
+    width: usize,
 }
 
 impl Pins {
@@ -308,6 +310,7 @@ impl Pins {
             if self.width_line.is_none() {
                 self.width_line = Some(i);
                 self.one = cells == 1;
+                self.width = cells;
             }
             if i > 0 && self.after_first.is_none() {
                 self.after_first = Some(i);
@@ -322,9 +325,10 @@ impl Pins {
     }
 }
 
-/// What the first read of a scrub keeps of a key: the line of a key seen once, or its lines so far.
+/// What the first read of a scrub keeps of a key: the line of a key seen once (and whether a strict
+/// reader takes it, [`ScrubPlan`]), or its lines so far.
 enum KeyLines {
-    Once(usize),
+    Once(usize, bool),
     More(Box<Run>),
 }
 
@@ -343,6 +347,8 @@ struct Run {
     pinned_after_first: bool,
     defaults_between: bool,
     last_raw: Option<Box<[u8]>>,
+    /// The last of those lines that a strict reader takes ([`ScrubPlan`]).
+    taken: Option<usize>,
 }
 
 impl Run {
@@ -351,6 +357,7 @@ impl Run {
         self.last_delete = Some((i, self.pinned));
         self.first = None;
         self.last_raw = None;
+        self.taken = None;
         self.pinned |= pinned;
     }
 }
@@ -365,7 +372,11 @@ impl Run {
 /// the same) nor a line that sets the column count (unless the two have as many cells). A reader
 /// (tsvz-rs, and TSVZ.py as its command line reads, given no header) reads the result as the file;
 /// line 1, and the first keyed line after it, stay for a TSVZ.py program that takes line 1 for its
-/// header.
+/// header. So does TSVZ.py's strict reader (`readTSV(strict=True)`, given no header), which skips
+/// a line narrower than the column count: the last line of a key that it takes stays too, and the
+/// value line moves only when it is one it takes, or it takes none of the key's lines. (Under
+/// `#_defaults_#` that hold a value it takes every line, and the lines kept for it there are more
+/// than it needs.)
 pub(crate) struct ScrubPlan {
     d: u8,
     pins: Pins,
@@ -403,7 +414,7 @@ impl ScrubPlan {
         let mut put = HashMap::new();
         for key in std::mem::take(&mut self.keys).into_values() {
             let run = match key {
-                KeyLines::Once(first) => {
+                KeyLines::Once(first, _) => {
                     keep[first] = true;
                     continue;
                 }
@@ -419,9 +430,17 @@ impl ScrubPlan {
             let (last, last_fields) = run.last;
             keep[first] = true;
             keep[last] = true;
+            // The line a strict reader reads the key from, when that is not the last.
+            let taken = run.taken.filter(|&t| t != last);
+            if let Some(t) = taken {
+                keep[t] = true;
+            }
             let Some(raw) = run.last_raw else {
                 continue; // one line
             };
+            if taken.is_some() {
+                continue; // moved, the last line would leave a strict reader no line of the key
+            }
             if raw.last() != Some(&b'\n') {
                 continue; // an unterminated last line stays last: the end of a line is read otherwise
             }
@@ -452,6 +471,8 @@ impl Planner for ScrubPlan {
         if pinned {
             self.pinned_fields.push((i, f));
         }
+        // A strict reader skips a row narrower than the column count.
+        let taken = f + 1 >= self.pins.width;
         let (k, key) = kind(cells, self.pins.one);
         self.kinds.push(k);
         match k {
@@ -459,7 +480,7 @@ impl Planner for ScrubPlan {
             Kind::Row | Kind::Delete => {
                 let Some(lines) = self.keys.get_mut(&*key) else {
                     let lines = if k == Kind::Row {
-                        KeyLines::Once(i)
+                        KeyLines::Once(i, taken)
                     } else {
                         let mut run = Box::<Run>::default();
                         run.delete(i, pinned);
@@ -468,7 +489,7 @@ impl Planner for ScrubPlan {
                     self.keys.insert(key.into(), lines);
                     return;
                 };
-                if let KeyLines::Once(first) = *lines {
+                if let KeyLines::Once(first, first_taken) = *lines {
                     // the cells of its line matter only where it is pinned
                     let fields = self.pinned_fields.iter().find(|p| p.0 == first);
                     let fields = fields.map_or(0, |p| p.1);
@@ -476,6 +497,7 @@ impl Planner for ScrubPlan {
                         pinned: self.pins.pinned(first),
                         first: Some((first, fields)),
                         last: (first, fields),
+                        taken: first_taken.then_some(first),
                         ..Run::default()
                     }));
                 }
@@ -484,7 +506,12 @@ impl Planner for ScrubPlan {
                 };
                 if k == Kind::Delete {
                     run.delete(i, pinned);
-                } else if let Some((first, _)) = run.first {
+                    return;
+                }
+                if taken {
+                    run.taken = Some(i);
+                }
+                if let Some((first, _)) = run.first {
                     run.pinned_after_first |= pinned;
                     run.defaults_between = self.last_defaults.is_some_and(|l| l > first);
                     run.last = (i, f);
@@ -954,6 +981,21 @@ mod tests {
             ("#h\na\t1\nb\t2\na\tx\0", "#h\na\t1\nb\t2\na\tx\0"),
             ("#h\na\t1\nb\t2", "#h\na\t1\nb\t2"),
             ("#h\nb\t2\na\t1\nb\t3\na\t4", "#h\nb\t3\na\t1\na\t4"),
+            // A strict reader (TSVZ.py's `readTSV(strict=True)`) skips a line narrower than the
+            // column count, three here: `K` reads `[K, 1, 2]` to it, and so it stays (0.2.1 moved
+            // `K<TAB>9` into its place, and `K` was gone to that reader); a line it takes between a
+            // key's first and last stays; a last line it takes moves, as before.
+            (
+                "#h\nx\t0\t0\ny\t5\t5\nK\t1\t2\nK\t9\n",
+                "#h\nx\t0\t0\ny\t5\t5\nK\t1\t2\nK\t9\n",
+            ),
+            (
+                "#h\nx\t0\t0\nK\t1\nK\t2\t2\nz\t0\t0\nK\t3\nK\t4\n",
+                "#h\nx\t0\t0\nK\t1\nK\t2\t2\nz\t0\t0\nK\t4\n",
+            ),
+            ("#h\nx\t0\t0\nK\t1\nK\t2\t2\n", "#h\nx\t0\t0\nK\t2\t2\n"),
+            // It takes none of `K`'s lines: the last moves.
+            ("#h\nx\t0\t0\nK\t1\nK\t3\n", "#h\nx\t0\t0\nK\t3\n"),
         ] {
             assert_eq!(scrub(input), output, "{input:?}");
         }

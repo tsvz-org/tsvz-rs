@@ -135,17 +135,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### A scrub of a loose file can change a row a strict TSVZ.py reader reads
-- Kind: deferred
-- What the operator sees: a loose `scrub` moves a key's last line into its first line's place even when it has fewer
-  cells (`K 1 2` then `K 9` becomes `K 9`): both tools' command lines read `K` alike before and after (`[K, 9, ]`),
-  but TSVZ.py's strict read of the library (`readTSV(strict=True)`, which drops a narrower line) read `K` as `[K, 1,
-  2]` before and finds no `K` after. TSVZ.py's scrub docstring promises that every reader reads the file as before.
-  0.2.0 does the same.
-- Why: the scrub keeps what a reader of the command line reads, and takes no strict reader's reading into account.
-- Revisit when: 0.2.2. The plan: decide with the TSVZ session whether a scrub must keep what a strict reader takes: if
-  so, move a key's last line into its first line's place only where it has at least as many cells; if not, record it
-  as a known limitation (the user's OK).
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
