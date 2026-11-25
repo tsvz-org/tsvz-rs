@@ -1556,7 +1556,7 @@ pub(crate) fn delete_loose(
 ) -> Result<LooseDelete, Error> {
     let d = loose_delimiter(store, options)?.expect("a loose file");
     // The names a reader names ([`loose::name`]), less the keys no row can have: one that begins
-    // with `#` (a comment) or is only whitespace, holds `</sep/>` or `</LF/>`, or whose encoding
+    // with `#` (a comment, but for `#_defaults_#`) or is only whitespace, holds `</sep/>` or `</LF/>`, or whose encoding
     // holds the delimiter (`-d e`). Nothing is written for one, as for a key that is not there; for
     // a key alone in a file of one column it would be a row.
     let names: Vec<String> = keys.iter().filter_map(|k| loose::name(k, d)).collect();

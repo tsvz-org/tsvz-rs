@@ -887,8 +887,9 @@ fn a_loose_key_with_a_line_break_at_its_end_names_its_own_row() {
     assert_eq!(records(dir, &["get", "f.tsv", "a\n"]).1, "a<LF>\t5\n");
 }
 
-/// A key or value with whitespace at its end is written as a reader names it, without it, as
-/// TSVZ.py's writer strips it; one that no row can have is refused, and its delete writes nothing.
+/// A key or value with whitespace at its end is written as a reader names it, without it (TSVZ.py's
+/// command line writes it and reads it stripped); one that no row can have is refused, and its
+/// delete writes nothing.
 #[test]
 fn a_loose_write_names_its_cells_as_a_reader_does() {
     let d = tempfile::tempdir().unwrap();
@@ -897,8 +898,7 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
     assert_eq!(records(dir, &["set", "f.tsv", "a ", "5 "]).0, 0);
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n");
     assert_eq!(records(dir, &["get", "f.tsv", "a "]).1, "a\t5\n");
-    // `</sep/>` reads back as `<sep>`: no row has it, so its delete is nothing (0.2.0 deleted
-    // `<sep>`).
+    // `</sep/>` reads back as `<sep>`: no row has it, so its delete is nothing.
     fs::write(dir.join("g.tsv"), "k\tv\n</sep/>\t1\n").unwrap();
     assert_eq!(
         records(dir, &["delete", "g.tsv", "</sep/>"]),

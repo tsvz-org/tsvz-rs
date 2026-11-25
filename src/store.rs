@@ -163,8 +163,8 @@ struct Table {
 }
 
 impl Table {
-    /// A table for `scope`; under `Scope::Keys` it keeps each requested key and, for a strict
-    /// store, the key a reader resolves it to (§20.2.7).
+    /// A table for `scope`, of a strict or a loose store; under `Scope::Keys` it keeps each requested
+    /// key and, for a strict store, the key a reader resolves it to (§20.2.7).
     fn new(scope: &Scope, format: Format) -> Table {
         let wanted = match scope {
             Scope::Keys(keys) => Some(

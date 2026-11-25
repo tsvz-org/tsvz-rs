@@ -162,8 +162,8 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
         // cell's end (`loose::reads_back`): the reader's own rule, so a key alone too, which in a
         // file of one column, or with no keyed line yet, is a row. A delete never asks for a
         // tombstone that would not ([`crate::maint::delete_loose`] names keys by that rule).
-        // Each cell is written as the reader names it, without that whitespace, as TSVZ.py's
-        // writer strips it.
+        // Each cell is written as the reader names it, without that whitespace (TSVZ.py's library
+        // writes none either; its command line writes it, and a reader reads it stripped).
         let fields: Vec<&str> = std::iter::once(key.as_str())
             .chain(values.iter().map(String::as_str))
             .collect();

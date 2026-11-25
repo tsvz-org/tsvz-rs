@@ -730,7 +730,7 @@ fn a_loose_delete_writes_what_tsvz_py_writes() {
     }
     // One column: the same keys, in whatever order (TSVZ.py may move one first), whether or
     // not the key as given has a blank at its end. (A tab there is the key's own, `b<sep>`, as a
-    // reader names it; TSVZ.py's library falls back to `b` when no `b<sep>` is live.)
+    // reader names it; TSVZ.py's `get` and `pop` strip the key's end, so they name `b`.)
     for (text, keys) in [
         ("a\nb\nc\n", &["b"][..]),
         ("#h\na\nb \nc\nb\n", &["b"]),

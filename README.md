@@ -37,9 +37,11 @@ Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line
 (`_processLine`): keys and cells without the whitespace at their end and decoded (`<sep>`, `<LF>`),
 `#_defaults_#` lines that fill the empty cells after them, the last line read also without its
 newline, and no row for a missing key. A key you name is the cell a reader reads from it as written
-(`$'a\n'` is the key of the line `a<LF>`; a blank at its end goes). Writes encode cells as TSVZ.py's
-do, and refuse a line that would not read back as its cells (a key that begins with `#` or a NUL or
-is only whitespace, `</sep/>`, or `-d e`, where `<sep>` has an `e`); a `delete` of a key no row can
+(`$'a\n'` and `$'a\t'` name only the row whose cell holds them, `a<LF>` and `a<sep>`, so with only
+`a` in the file they name no row, where TSVZ.py's `get` reaches `a`; a blank at its end goes). Writes encode cells as TSVZ.py's do, and refuse
+a line that would not read back as its cells (a key that begins with `#`, but for `#_defaults_#`,
+or with a NUL, or is only whitespace; `</sep/>`; with `-d e`, a cell whose encoding holds an `e`,
+as `<sep>` does); a `delete` of a key no row can
 have writes nothing and is no failure. An append to a compressed loose file whose text does
 not end with a newline joins that last line, as TSVZ.py's does (deferred to 0.2.2,
 [docs/limitations.md](docs/limitations.md)). A rewrite writes each
@@ -120,9 +122,12 @@ Stores need nothing; the library's documented API does not change.
   no row, the last line is read even without its newline, and `get` of a missing key prints
   nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
   (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, a cell whose encoding holds the delimiter
-  (`-d e`) and a key that no reader would read back (it begins with `#` or a NUL, or is only
-  whitespace), and ends an unterminated last line with a newline before it appends (0.2.0 cut
-  that line).
+  (`-d e`) and a key that no reader would read back (it begins with `#`, but for `#_defaults_#`,
+  or with a NUL, or is only whitespace), and ends an unterminated last line with a newline before
+  it appends (0.2.0 cut that line). A key typed with a trailing tab or line break names only the
+  row whose cell holds it: `$'b\t'` no longer reaches row `b` (0.2.0 acted on `b`; TSVZ.py's `get`
+  does). `delete -` fed a `#_defaults_#` line appends a defaults reset, as `delete f '#_defaults_#'`
+  does.
 - A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
   less memory.
 - Through a handler: `tsvz stop` exits 0 when another stop or a signal stopped the handler first
