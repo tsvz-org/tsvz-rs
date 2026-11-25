@@ -793,6 +793,7 @@ mod tests {
     fn a_pointer_that_cannot_be_trusted_still_names_its_handler() {
         // Only a pointer file that is gone, or names another handler, or that no handler holds,
         // says the handler stopped.
+        let _quiet = crate::lock::quiet(); // the file's lock is taken again once dropped
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let one = handler("unix:/x/s");
@@ -828,6 +829,7 @@ mod tests {
     fn a_pointer_no_handler_holds_names_none() {
         // A handler killed before it removed its pointer file holds its lock no longer: the file
         // still names it, but it is gone, at once.
+        let _quiet = crate::lock::quiet(); // no child holds the lock dropped below
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let one = handler("unix:/x/s");

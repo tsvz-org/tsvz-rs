@@ -2913,10 +2913,13 @@ mod tests {
         // A copy-on-write file system (btrfs, ZFS, APFS) needs new blocks even to overwrite:
         // there a full disk can leave a rewrite half done, so the copy is not skipped.
         let dir = tempfile::tempdir().unwrap();
-        let tmpfs = std::process::Command::new("stat")
-            .args(["-f", "-c", "%T"])
-            .arg(dir.path())
-            .output();
+        let tmpfs = {
+            let _alone = lock::forking();
+            std::process::Command::new("stat")
+                .args(["-f", "-c", "%T"])
+                .arg(dir.path())
+                .output()
+        };
         let kind = tmpfs.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         if let Ok(kind) = kind {
             let expected = matches!(kind.as_str(), "tmpfs" | "ext2/ext3" | "xfs" | "f2fs");

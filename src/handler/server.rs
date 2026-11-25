@@ -945,6 +945,7 @@ mod tests {
         // Killed after it answered and before it removed its pointer file: the file still names
         // it, but no process holds its lock, so the handler is gone (0.2.1 waited 30 s, then
         // failed); and a pointer file that no handler holds is no handler to stop.
+        let _quiet = crate::lock::quiet(); // no child holds the lock dropped below
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("s.tsvz");
         let (listener, held) = stand_in(dir.path(), &store);
@@ -1061,6 +1062,13 @@ mod tests {
                     std::fs::read_to_string(comm).is_ok_and(|c| c.trim() == name)
                 })
             };
+            // A thread that was joined can stay listed for a moment: the kernel wakes its joiner
+            // before it takes the thread's entry away. Gone within milliseconds; 5 s is for a host
+            // busy enough to starve it.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while named("tsvz-signals") && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             assert!(!named("tsvz-signals"), "the signal thread is left");
         }
     }
