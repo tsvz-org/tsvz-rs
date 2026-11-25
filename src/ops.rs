@@ -326,7 +326,13 @@ pub fn parse_records(
         let text = String::from_utf8_lossy(line.text());
         if !format.strict {
             // A loose line is read as a reader reads it (`loose::parse`): a comment, an empty line
-            // or an empty key is nothing, a `#_defaults_#` line is a record.
+            // or an empty key is nothing, a `#_defaults_#` line is a record. A first field that
+            // begins with `#` and is not exactly `#_defaults_#` is skipped, as TSVZ.py's command
+            // line skips it (`_parseRecordLines`), even where a reader reads the line as defaults.
+            let first = text.split(d as char).next().unwrap_or("");
+            if first.starts_with('#') && first != crate::loose::DEFAULTS {
+                return true;
+            }
             let Some(cells) = crate::loose::parse(&text, d, true) else {
                 return true;
             };
@@ -726,6 +732,31 @@ mod tests {
                 Record::Marker {
                     key: "#_defaults_#".into(),
                     values: vec![]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn loose_bulk_input_skips_the_hash_lines_tsvz_py_skips() {
+        // TSVZ.py's command line keeps only the exact `#_defaults_#` of the `#` lines; a reader
+        // would read `#_defaults_# ` and `#_defaults_#x` as defaults lines, bulk input does not.
+        let tsv = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        let input = b"#_defaults_# \tP\n#_defaults_#x\t1\n#c\t1\n#_defaults_#\tP\na\tx\n";
+        let got = parse_records(input, tsv, false, Path::new("-"), None);
+        assert_eq!(
+            got,
+            [
+                Record::Data {
+                    key: "#_defaults_#".into(),
+                    values: strings(&["P"])
+                },
+                Record::Data {
+                    key: "a".into(),
+                    values: strings(&["x"])
                 },
             ]
         );
