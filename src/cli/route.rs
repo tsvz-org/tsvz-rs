@@ -7,7 +7,7 @@ use crate::cli::output::{Printer, stdout_error};
 use crate::cli::write::{self, bulk};
 use crate::cli::{Ctx, NoSigpipe};
 use crate::handler::engine::STOPPING;
-use crate::handler::protocol::{Response, decode, decode_fields, field};
+use crate::handler::protocol::{Response, decode, decode_fields, field, setdefault_line};
 use crate::handler::server::STOP_WAIT;
 use crate::handler::{Client, pointer};
 use crate::ops::{Out, protocol_record, record_line};
@@ -161,11 +161,7 @@ fn deliver(
         return printed;
     };
     let fields = decode_fields(&response.lines[0]);
-    let mut line = String::from("setdefault");
-    for (i, f) in fields.iter().enumerate() {
-        line.push('\t');
-        line.push_str(&field(f, i == 0)); // the key stays a data key (§21.4.3)
-    }
+    let line = setdefault_line(&fields);
     // As `read --format records` prints it: given to `set STORE -`, it is the same row again.
     let row = &response.lines[0];
     let store = ctx.store.display().to_string();

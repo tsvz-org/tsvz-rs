@@ -426,7 +426,8 @@ pub struct Engine {
 
 impl Engine {
     /// Serve the strict store at `path`, creating it when it is missing (§21.13.1). `log` gets
-    /// every warning, `errors` every failed batch and fsync, for `serve`'s standard error.
+    /// every warning, `errors` every failed batch and fsync and every row a `pop` took that was
+    /// not put back (the server's), for `serve`'s standard error.
     pub fn open(path: &Path, log: Option<WarnFn>, errors: Option<WarnFn>) -> Result<Engine, Error> {
         let format = name::format_of(path).ok_or_else(|| Error::BadPath(path.to_path_buf()))?;
         if !format.strict {
@@ -491,6 +492,17 @@ impl Engine {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Report `message` as an error of this store, which `serve`'s `-q` does not hide.
+    pub(crate) fn error(&self, message: String) {
+        if let Some(errors) = &self.batcher.errors {
+            errors(&Warning {
+                part: self.path.clone(),
+                offset: None,
+                message,
+            });
+        }
     }
 
     /// Run `f` on the state under the mutex; also return the warnings raised meanwhile.

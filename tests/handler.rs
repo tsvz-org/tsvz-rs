@@ -627,6 +627,40 @@ fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
 }
 
 #[test]
+fn a_pop_whose_client_went_away_after_its_key_was_written_prints_the_row_taken_even_with_q() {
+    // The put-back keeps a row written for the key since, so nothing is put back: the handler
+    // says so, and prints the row taken (in no file and in no log else), as an error, which `-q`
+    // does not hide; it does not say that the row "was put back".
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let served = Served::start(&s, &["-q"]);
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let mut conn = connect(&s).unwrap();
+    conn.write_all(b"pop\ta\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    let writer = {
+        let s = s.clone();
+        std::thread::spawn(move || ask(&s, "set\ta\t9"))
+    };
+    std::thread::sleep(Duration::from_millis(200)); // queued behind the pop's tombstone
+    drop(conn);
+    drop(held);
+    assert_eq!(writer.join().unwrap().status, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !served.stderr().contains("the row taken was") {
+        assert!(Instant::now() < deadline, "{}", served.stderr());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let said = served.stderr();
+    assert!(said.contains("its key reads a\t9"), "{said}");
+    assert!(said.contains("the row taken was: a\t1"), "{said}");
+    assert!(!said.contains("it was put back"), "{said}");
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\na\t9\n");
+    assert_eq!(ask(&s, "get\ta").lines, ["a\t9"]);
+}
+
+#[test]
 fn a_pop_that_finds_a_handler_stopping_never_takes_the_row_its_pop_took() {
     // While a stopping handler has a pop's tombstone still to write, a pop on the files would
     // read that row as live and take it too: a command in that window finds the handler gone

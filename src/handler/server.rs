@@ -684,26 +684,31 @@ fn answer(
 /// Put back the row a `pop` or `popitem` took, when its answer, the row's only copy, could not be
 /// written (its client hung up, or gave up waiting): `setdefault` of the row, which keeps a row
 /// written for its key since, as the command line puts back a row it could not print. Said on
-/// `serve`'s standard error either way.
+/// `serve`'s standard error: that it was put back as a notice (`-q` hides it), and the row taken
+/// as an error when it is not in its place (a row written since stays, the handler is stopping),
+/// which `-q` shows: else the row is in no file and in no log.
 fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
     let Some(row) = response.lines.first() else {
         return;
     };
-    let mut line = String::from("setdefault");
-    for (i, f) in protocol::decode_fields(row).iter().enumerate() {
-        line.push('\t');
-        line.push_str(&protocol::field(f, i == 0)); // the key stays a data key (§21.4.3)
-    }
+    let line = protocol::setdefault_line(&protocol::decode_fields(row));
     let back = protocol::parse(&line).map(|request| engine.handle(&request, None));
-    let outcome = match back {
-        Ok(r) if r.status == 0 => "it was put back".to_string(),
-        Ok(r) => format!("it could not be put back ({}): {row}", r.message),
-        Err(e) => format!("it could not be put back ({e}): {row}"),
-    };
-    info(&format!(
-        "{}: the answer to a pop could not be written (its client went away); {outcome}",
-        engine.path().display()
-    ));
+    let said = "the answer to a pop could not be written (its client went away)";
+    match back {
+        Ok(r) if r.status == 0 && r.lines.first() == Some(row) => {
+            info(&format!("{}: {said}; it was put back", engine.path().display()));
+        }
+        // setdefault wrote nothing: the key reads another row.
+        Ok(r) if r.status == 0 => engine.error(format!(
+            "{said}; it was not put back, its key reads {} (written since, or stripped as the store now strips); the row taken was: {row}",
+            r.lines.first().map_or("", String::as_str)
+        )),
+        Ok(r) => engine.error(format!(
+            "{said}; it could not be put back ({}): {row}",
+            r.message
+        )),
+        Err(e) => engine.error(format!("{said}; it could not be put back ({e}): {row}")),
+    }
 }
 
 /// How long `tsvz stop` waits, from its request, for the handler to be gone. Once it has
@@ -1015,6 +1020,65 @@ mod tests {
             };
             assert!(!named("tsvz-signals"), "the signal thread is left");
         }
+    }
+
+    #[test]
+    fn a_pop_s_row_is_put_back_or_printed_by_what_became_of_it() {
+        // The row taken is said to have been put back only when its key reads it again; else it
+        // is printed as an error (which `-q` does not hide), with the row its key reads: a row
+        // written since stays, and a handler that is stopping puts back nothing.
+        use crate::Warning;
+        let dir = tempfile::tempdir().unwrap();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let (n, e) = (notices.clone(), errors.clone());
+        let info: InfoFn = Arc::new(move |m: &str| lock(&n).push(m.to_string()));
+        let on_error: crate::WarnFn = Arc::new(move |w: &Warning| lock(&e).push(w.message.clone()));
+        let path = dir.path().join("s.tsvz");
+        std::fs::write(&path, "a\t1\nb\t2\nc\t3\n").unwrap();
+        let engine = Engine::open(&path, None, Some(on_error)).unwrap();
+        let ask = |line: &str| engine.handle(&protocol::parse(line).unwrap(), None);
+        let taken = |key: &str| {
+            let popped = ask(&format!("pop\t{key}"));
+            assert_eq!((popped.status, popped.lines.len()), (0, 1), "{popped:?}");
+            popped
+        };
+        // Nothing written since: put back, as a notice only.
+        give_back(&engine, &taken("a"), &info);
+        assert_eq!(ask("get\ta").lines, ["a\t1"]);
+        assert!(
+            lock(&notices)[0].ends_with("; it was put back"),
+            "{:?}",
+            lock(&notices)
+        );
+        assert!(lock(&errors).is_empty(), "{:?}", lock(&errors));
+        // A row written since stays: the row taken is printed, and not said to be put back.
+        let second = taken("b");
+        assert_eq!(ask("set\tb\t9").status, 0);
+        give_back(&engine, &second, &info);
+        assert_eq!(ask("get\tb").lines, ["b\t9"]);
+        assert_eq!(
+            lock(&notices).len(),
+            1,
+            "no second notice: {:?}",
+            lock(&notices)
+        );
+        let said = lock(&errors).clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("it was not put back, its key reads b\t9"),
+            "{said:?}"
+        );
+        assert!(said[0].ends_with("the row taken was: b\t2"), "{said:?}");
+        // A handler that is stopping puts nothing back: the row is printed.
+        let third = taken("c");
+        engine.close();
+        give_back(&engine, &third, &info);
+        let said = lock(&errors).clone();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[1].contains("it could not be put back ("), "{said:?}");
+        assert!(said[1].ends_with("): c\t3"), "{said:?}");
+        assert_eq!(lock(&notices).len(), 1);
     }
 
     #[test]
