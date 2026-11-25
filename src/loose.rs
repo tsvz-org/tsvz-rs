@@ -123,6 +123,36 @@ fn read_as(field: &str, cell: &str) -> bool {
         .is_some_and(|rest| rest.chars().all(py_space))
 }
 
+/// Why a reader cannot read `fields` back from the line a loose write makes of them ([`reads_back`]
+/// fails): the first field that does not read back, and what in it a reader reads otherwise.
+pub(crate) fn cause(fields: &[&str], d: u8) -> String {
+    let dq = (d as char).escape_default();
+    for (i, f) in fields.iter().enumerate() {
+        let what = if i == 0 { "the key" } else { "the value" };
+        if i == 0 && f.starts_with('#') {
+            return format!("{what} {f:?} begins with `#`, so a reader takes the line for a comment");
+        }
+        if i == 0 && f.starts_with('\0') {
+            return format!("{what} {f:?} begins with a NUL, which a reader drops");
+        }
+        if i == 0 && f.trim_end_matches(py_space).is_empty() {
+            return format!("{what} {f:?} is empty or only whitespace, so a reader skips the line");
+        }
+        if f.contains("</sep/>") || f.contains("</LF/>") {
+            return format!(
+                "{what} {f:?} holds `</sep/>` or `</LF/>`, which a reader reads as `<sep>` and `<LF>`"
+            );
+        }
+        if sanitize(f, d).contains(d as char) {
+            return format!(
+                "{what} {f:?} written as {:?} holds the delimiter `{dq}`, so a reader splits it into two cells",
+                sanitize(f, d)
+            );
+        }
+    }
+    "a reader reads the line as other cells".to_string()
+}
+
 /// Whether the line `line`, written from `fields`, reads back as them ([`parse`]): as many cells
 /// as fields, each its field less some whitespace at its end ([`name`]'s rule, for a line).
 /// Else what it reads back as: None for a line read as nothing.
@@ -709,6 +739,30 @@ impl Planner for WithoutPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each cause a loose write is refused for names itself (the checks of `cause` are in the
+    /// order of the writer's, the first field that does not read back first).
+    #[test]
+    fn a_refusal_names_its_cause() {
+        let cases: [(&[&str], u8, &str); 7] = [
+            (&["#tag", "1"], b'\t', "begins with `#`"),
+            (&["\0k", "1"], b'\t', "begins with a NUL"),
+            (&[" ", "1"], b'\t', "is empty or only whitespace"),
+            (&["k", "a</sep/>"], b'\t', "holds `</sep/>` or `</LF/>`"),
+            (&["k", "x</LF/>"], b'\t', "holds `</sep/>` or `</LF/>`"),
+            (&["k", "hello"], b'e', "holds the delimiter `e`"),
+            (&["#k", "hello"], b'e', "begins with `#`"),
+        ];
+        for (fields, d, cause_text) in cases {
+            let line = fields
+                .iter()
+                .map(|f| sanitize(f, d).trim_end_matches(py_space).to_string())
+                .collect::<Vec<_>>()
+                .join(&(d as char).to_string());
+            assert!(reads_back(&line, d, fields).is_err(), "{fields:?}");
+            assert!(cause(fields, d).contains(cause_text), "{fields:?}");
+        }
+    }
 
     /// The lines of `text` as a read gives them to a planner, each with its `\n`.
     fn lines(text: &str) -> Vec<Vec<u8>> {

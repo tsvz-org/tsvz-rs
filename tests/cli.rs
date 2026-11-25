@@ -403,7 +403,7 @@ fn loose_files_as_tsvz_py_reads_and_writes_them() {
     assert_eq!(records(dir, &["set", "s.csv", "dave", "a,b"]).0, 0);
     assert_eq!(records(dir, &["get", "s.csv", "dave"]).1, "dave,a<sep>b\n");
     let (code, _, err) = records(dir, &["set", "s.csv", "eve", "x</sep/>"]);
-    assert!(code == 1 && err.contains("never be read back"), "{err}");
+    assert!(code == 1 && err.contains("holds `</sep/>` or `</LF/>`"), "{err}");
     assert_eq!(records(dir, &["set", "s.csv", "dave", "41"]).0, 0);
     assert_eq!(
         records(dir, &["verify", "s.csv"]),
@@ -748,22 +748,22 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     fs::write(dir.join("t.tsv"), "a\t1\n").unwrap();
-    for args in [
-        &["set", "t.tsv", "#tag", "1"][..],
-        &["set", "t.tsv", " ", "1"],
-        &["set", "t.tsv", "#_rotate_#", "1"],
+    // Each refusal names its cause.
+    for (args, cause) in [
+        (&["set", "t.tsv", "#tag", "1"][..], "begins with `#`"),
+        (&["set", "t.tsv", " ", "1"], "is empty or only whitespace"),
+        (&["set", "t.tsv", "#_rotate_#", "1"], "begins with `#`"),
+        (&["set", "t.tsv", "k</LF/>", "1"], "holds `</sep/>` or `</LF/>`"),
+        (&["set", "t.tsv", "k", "</sep/>"], "holds `</sep/>` or `</LF/>`"),
     ] {
         let (code, _, err) = records(dir, args);
-        assert!(
-            code == 1 && err.contains("never be read back"),
-            "{args:?} {err}"
-        );
+        assert!(code == 1 && err.contains(cause), "{args:?} {err}");
         assert_eq!(file(dir, "t.tsv"), "a\t1\n", "{args:?}");
     }
     // A comment is no key, and a delete of one is no failure.
     assert_eq!(records(dir, &["delete", "t.tsv", "#tag"]).0, 0);
     let (code, _, err) = records(dir, &["-d", "e", "set", "e.tsv", "k", "hello"]);
-    assert!(code == 1 && err.contains("never be read back"), "{err}");
+    assert!(code == 1 && err.contains("holds the delimiter `e`"), "{err}");
     assert!(fs::read(dir.join("e.tsv")).is_ok_and(|f| f.is_empty()) || !dir.join("e.tsv").exists());
     assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
     assert_eq!(file(dir, "e.tsv"), "kehllo\n");
@@ -781,7 +781,7 @@ fn a_loose_key_alone_that_could_not_be_read_back_is_refused_and_its_delete_is_no
     for key in [" ", "#tag", "#_rotate_#"] {
         let (code, _, err) = records(dir, &["set", "one.tsv", key]);
         assert!(
-            code == 1 && err.contains("never be read back"),
+            code == 1 && (err.contains("only whitespace") || err.contains("begins with `#`")),
             "{key:?}: {code} {err}"
         );
         assert_eq!(file(dir, "one.tsv"), "a\nb\n", "{key:?}");

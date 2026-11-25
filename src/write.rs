@@ -176,12 +176,13 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
         }
         if let Err(cells) = crate::loose::reads_back(&out[start..], d, &fields) {
             let read = match cells {
-                None => "nothing (a comment, or an empty key)".to_string(),
+                None => "nothing".to_string(),
                 Some(cells) => format!("{cells:?}"),
             };
             out.truncate(start);
             return Err(Error::Refused(format!(
-                "{fields:?} would read back from a loose file as {read}, so it could never be read back as it was written; nothing was written"
+                "{fields:?} would be read from a loose file as {read}: {}; nothing was written",
+                crate::loose::cause(&fields, d)
             )));
         }
         out.push('\n');
