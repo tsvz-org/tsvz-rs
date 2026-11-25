@@ -1448,6 +1448,50 @@ mod loose_round_trip {
         }
     }
 
+    /// A fixed table that shares nothing with `parse`: the line each record must write in a loose
+    /// file, or None for the refusal. Each row was read by TSVZ.py 5.18 (`readTSV`, whose
+    /// `_processLine` splits, strips and decodes a line): a written line gives back its cells; a
+    /// refused one is read as a comment (`#tag`), skipped (`" "`), as `<sep>` (`</sep/>`), or as
+    /// three cells (`-d e`, `hello`).
+    #[test]
+    fn a_loose_write_is_what_tsvz_py_reads_back() {
+        #[rustfmt::skip]
+        let table: &[(u8, &[&str], Option<&str>)] = &[
+            (b'\t', &["a", "1"], Some("a\t1\n")),
+            (b'\t', &["a ", "5 "], Some("a\t5\n")),
+            (b'\t', &["a\n", "1"], Some("a<LF>\t1\n")),
+            (b'\t', &["a<sep>", "1"], Some("a</sep/>\t1\n")),
+            (b'\t', &["a", "b\tc"], Some("a\tb<sep>c\n")),
+            (b'\t', &["#_defaults_#", "P"], Some("#_defaults_#\tP\n")),
+            (b'\t', &["k"], Some("k\n")),
+            (b'\t', &["k", "x", "a"], Some("k\tx\ta\n")),
+            (b'e', &["k", "hllo"], Some("kehllo\n")),
+            (b'#', &["#tag"], Some("<sep>tag\n")),
+            (b' ', &[" "], Some("<sep>\n")),
+            (b'\t', &["#tag", "1"], None),
+            (b'\t', &[" ", "1"], None),
+            (b'\t', &["k", "</sep/>"], None),
+            (b'e', &["k", "hello"], None),
+        ];
+        for &(d, fields, line) in table {
+            let rec = match fields {
+                [key] => Record::Tombstone { key: key.to_string() },
+                [key, values @ ..] => Record::Data {
+                    key: key.to_string(),
+                    values: values.iter().map(|v| v.to_string()).collect(),
+                },
+                [] => unreachable!(),
+            };
+            let format = Format { delimiter: d, strict: false };
+            let mut out = String::new();
+            let written = encode_record(&rec, format, &mut out);
+            match line {
+                Some(line) => assert!(written.is_ok() && out == line, "{fields:?}: {out:?}"),
+                None => assert!(written.is_err() && out.is_empty(), "{fields:?}: {out:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_loose_write_is_refused_exactly_when_it_would_not_read_back() {
         let mut bad = Vec::new();
