@@ -713,6 +713,33 @@ fn a_loose_rewrite_keeps_the_bytes_after_the_last_newline() {
 }
 
 #[test]
+fn a_write_of_no_row_to_a_compressed_loose_file_leaves_its_bytes() {
+    // `set f.tsv.gz -` or `append f.tsv.gz -` with empty input, or comments only, writes no row,
+    // so no member: a job that pipes in a possibly empty list does not grow the file (0.2.1 wrote
+    // nothing; 0.2.2's first build appended a member of a newline each time).
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = tsvz::codec::encode_member(tsvz::name::Codec::Gzip, b"a\t1\nb\t2").unwrap();
+    fs::write(dir.join("f.tsv.gz"), &gz).unwrap();
+    for (op, input) in [
+        ("set", ""),
+        ("set", "#c\n"),
+        ("append", ""),
+        ("append", "#c\n"),
+    ] {
+        let (code, _, err) = run_in(dir, &[op, "f.tsv.gz", "-"], input.as_bytes());
+        assert_eq!(code, 0, "{op} {input:?}: {err}");
+        assert_eq!(
+            fs::read(dir.join("f.tsv.gz")).unwrap(),
+            gz,
+            "{op} {input:?}"
+        );
+    }
+    assert_eq!(run_in(dir, &["set", "f.tsv.gz", "c", "3"], b"").0, 0);
+    assert_eq!(records(dir, &["keys", "f.tsv.gz"]).1, "a\nb\nc\n");
+}
+
+#[test]
 fn a_loose_rewrite_keeps_the_lines_it_keeps_as_they_are() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();

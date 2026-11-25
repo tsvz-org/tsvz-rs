@@ -451,9 +451,13 @@ impl Writer {
             let io = |e: io::Error| Error::io(path, e);
             // A compressed loose file that holds something gets a newline first: its decoded text
             // may not end with one (TSVZ.py reads such a last line as a row), and an empty line is
-            // read as nothing. Encoded for the length seen now, and again under the lock in the
-            // rare case that it was empty and is no longer, or the other way round.
-            let leads = |held: bool| held && !self.format.strict && part.codec.is_some();
+            // read as nothing; an append of nothing writes nothing (0.2.1 did not, 0.2.2's first
+            // build added a member of a newline to each). Encoded for the length seen now, and
+            // again under the lock in the rare case that it was empty and is no longer, or the
+            // other way round.
+            let leads = |held: bool| {
+                held && !payload.is_empty() && !self.format.strict && part.codec.is_some()
+            };
             let held = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
             let encode = |lead: bool| -> Result<Cow<[u8]>, Error> {
                 let Some(codec) = part.codec else {
@@ -1421,6 +1425,29 @@ mod tests {
         assert_eq!(text(&q), "c\t3\n");
         Writer::open(&q).unwrap().append(&[row("d", "4")]).unwrap();
         assert_eq!(text(&q), "c\t3\n\nd\t4\n");
+    }
+
+    #[test]
+    fn an_append_of_nothing_to_a_compressed_loose_file_writes_nothing() {
+        // `set f.tsv.gz -` with empty input, or comments only, appends no record: no member, so a
+        // job that pipes in a possibly empty list does not grow the file (0.2.1 wrote nothing;
+        // 0.2.2's first build wrote a member of a newline each time).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv.gz");
+        let held = crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\nb\t2").unwrap();
+        fs::write(&p, &held).unwrap();
+        Writer::open(&p).unwrap().append(&[]).unwrap();
+        Writer::open(&p).unwrap().append(&[]).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), held);
+        // and the next record still begins with its newline
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("c", &["3".into()])])
+            .unwrap();
+        assert_eq!(
+            read(&p),
+            [("a", "1"), ("b", "2"), ("c", "3")].map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+        );
     }
 
     #[test]
