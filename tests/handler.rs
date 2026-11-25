@@ -948,6 +948,25 @@ fn one_connection_carries_many_requests_including_bad_ones() {
 }
 
 #[test]
+fn a_stop_after_an_acknowledged_write_was_lost_fails_and_so_does_serve() {
+    // A write answered before it was made (no `--x-written`), whose batch then fails: the stop
+    // cannot make it durable, so it answers 1 and says why, and `serve` ends with status 1 (0.2.1
+    // answered #0 and ended with 0).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let mut served = Served::start(&s, &[]);
+    // A directory where the part was: every append fails, even as root.
+    fs::remove_file(&s).unwrap();
+    fs::create_dir(&s).unwrap();
+    assert_eq!(ask(&s, "set\tc\t3").status, 0, "answered before it is made");
+    let (code, _, err) = cli(dir.path(), &["stop", "s.tsvz"], b"");
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("were lost"), "{err}");
+    assert_eq!(served.wait(), 1, "{}", served.stderr());
+    assert!(served.stderr().contains("were lost"), "{}", served.stderr());
+}
+
+#[test]
 fn a_stale_pointer_is_taken_over() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "k\tv\n");

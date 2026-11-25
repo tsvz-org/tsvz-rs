@@ -92,24 +92,75 @@ impl Shared {
     }
 }
 
-/// Block SIGINT, SIGTERM and SIGHUP in this thread and every thread it starts, so that one
-/// thread receives them with `sigwait`; a signal ignored when `serve` starts (`nohup`) stays
-/// ignored. The blocked set; empty when all three are ignored.
-fn block_signals() -> libc::sigset_t {
-    // SAFETY: the set is initialized by sigemptyset before use; sigaction with a null new
-    // action only reads the current one; pthread_sigmask changes this thread's mask.
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(signal, std::ptr::null(), &mut old);
-            if old.sa_sigaction != libc::SIG_IGN {
-                libc::sigaddset(&mut set, signal);
+/// SIGINT, SIGTERM and SIGHUP blocked in the thread that serves and in every thread it starts, so
+/// that one thread of their own receives them with `sigwait` ([`Signals::wait`]); a signal ignored
+/// when `serve` starts (`nohup`) stays ignored. Dropped as `serve` returns, it ends that thread and
+/// gives the serving thread its signal mask back: a program that embeds `serve` and goes on after
+/// it gets those signals again.
+struct Signals {
+    set: libc::sigset_t,
+    old: libc::sigset_t,
+    waiter: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Signals {
+    fn block() -> Signals {
+        // SAFETY: the sets are initialized by sigemptyset and pthread_sigmask before use;
+        // sigaction with a null new action only reads the current one; pthread_sigmask changes
+        // this thread's mask.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(signal, std::ptr::null(), &mut old);
+                if old.sa_sigaction != libc::SIG_IGN {
+                    libc::sigaddset(&mut set, signal);
+                }
+            }
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+            Signals {
+                set,
+                old,
+                waiter: None,
             }
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
+    }
+
+    /// The first of the signals blocked; None when all three are ignored.
+    fn first(&self) -> Option<i32> {
+        [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            // SAFETY: sigismember only reads the set.
+            .find(|&s| unsafe { libc::sigismember(&self.set, s) } == 1)
+    }
+
+    /// Start the thread that waits for the signals and stops the handler when one comes.
+    fn wait(&mut self, shared: Arc<Shared>) -> std::io::Result<()> {
+        if self.first().is_some() {
+            let set = self.set;
+            let waiter = std::thread::Builder::new()
+                .name("tsvz-signals".into())
+                .spawn(move || wait_for_signal(set, shared))?;
+            self.waiter = Some(waiter);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        if let (Some(waiter), Some(signal)) = (self.waiter.take(), self.first()) {
+            use std::os::unix::thread::JoinHandleExt;
+            // Sent to the waiter alone, which takes it in `sigwait` (or has ended, and it is
+            // dropped): it blocks it, as every thread of the handler does.
+            // SAFETY: a thread not yet joined keeps its pthread_t valid.
+            unsafe { libc::pthread_kill(waiter.as_pthread_t(), signal) };
+            let _ = waiter.join();
+        }
+        // SAFETY: pthread_sigmask sets this thread's mask to the one `block` saved.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
     }
 }
 
@@ -208,7 +259,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    let signals = block_signals();
+    let mut signals = Signals::block();
     let engine = match Engine::open(store, config.log.clone(), config.errors.clone()) {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
@@ -262,20 +313,11 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         open: Mutex::new(HashMap::new()),
         next: AtomicU64::new(0),
     });
-    // SAFETY: sigismember only reads the set.
-    let any = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
-        .iter()
-        .any(|&s| unsafe { libc::sigismember(&signals, s) } == 1);
-    let mut helpers = Ok(());
-    if any {
-        let shared = shared.clone();
-        helpers = std::thread::Builder::new()
-            .name("tsvz-signals".into())
-            .spawn(move || wait_for_signal(signals, shared))
-            .map(drop);
-    }
+    let mut helpers = signals.wait(shared.clone());
     if let (Some(idle), Ok(())) = (config.idle, &helpers) {
         let shared = shared.clone();
+        // Let go of at once (detached): it sleeps at least 10 ms before it can end, and a thread
+        // that ends while it is detached is the case `start_connection` keeps clear of.
         helpers = std::thread::Builder::new()
             .name("tsvz-idle".into())
             .spawn(move || watch_idle(idle, shared))
@@ -300,6 +342,8 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     // every queued write: a command that found the listener closed would work on the files, where
     // a `pop` could take a row whose tombstone is still queued here.
     let mut finishing = false;
+    let mut finisher = None;
+    let mut threads = Vec::new();
     loop {
         let ready = wait_for(&listener, &wakened);
         drain(&wakened);
@@ -309,16 +353,17 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
             if let Some(why) = why {
                 (config.info)(&why);
             }
-            let finisher = {
+            let started = {
                 let (shared, engine) = (shared.clone(), engine.clone());
                 std::thread::Builder::new()
                     .name("tsvz-stop".into())
                     .spawn(move || finish(&shared, &engine))
             };
-            if finisher.is_err() {
+            match started {
+                Ok(thread) => finisher = Some(thread),
                 // No thread to spare: finished here, with the connections that come meanwhile
                 // left in the listener's queue.
-                finish(&shared, &engine);
+                Err(_) => finish(&shared, &engine),
             }
         }
         if shared.finished.load(Ordering::SeqCst) {
@@ -339,7 +384,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
         if stream.set_nonblocking(false).is_err() {
             continue;
         }
-        start_connection(
+        let thread = start_connection(
             std::thread::Builder::new().name("tsvz-connection".into()),
             stream,
             engine.clone(),
@@ -347,14 +392,43 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
             config.info.clone(),
             config.verbose,
         );
+        threads.extend(thread);
+        reap(&mut threads);
     }
     // Every queued write is written: the pointer file goes first, so that a command that finds the
     // listener closed finds no handler (`tsvz stop` waits for this).
     held.release();
     drop(listener); // the clients still in its queue find their connection closed
     let _ = std::fs::remove_dir_all(&dir);
+    // The stop cut every connection off: their threads end.
+    for thread in threads.into_iter().chain(finisher) {
+        let _ = thread.join();
+    }
     (config.info)(&format!("stopped serving {}", store.display()));
-    Ok(())
+    // A write it acknowledged before it was made, and lost: the stop said so, and so does serve.
+    match engine.lost() {
+        Some(lost) => Err(Error::Refused(format!(
+            "{}: stopped serving, but {lost}",
+            store.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Join the connection threads that have ended. A connection's thread is joined, never let go
+/// of (detached) when it is started: glibc 2.41's `pthread_detach` reads the thread's descriptor
+/// once more after it has made the thread detached, and a thread that ends in that moment frees
+/// its stack, which holds that descriptor (a SIGSEGV in `pthread_detach`, seen under a flood of
+/// connections that close at once; docs/limitations.md). A joined thread never frees its own.
+fn reap(threads: &mut Vec<std::thread::JoinHandle<()>>) {
+    let mut i = 0;
+    while i < threads.len() {
+        if threads[i].is_finished() {
+            let _ = threads.swap_remove(i).join();
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Empty the stop pair `wakened` (non-blocking), so that the next wait waits.
@@ -461,7 +535,7 @@ fn watch_idle(idle: Duration, shared: Arc<Shared>) {
 /// registered (no descriptor for its handle), is closed unread, as a client finds a handler
 /// gone. When no thread can be made (a task limit, no memory), the connection is closed, the
 /// fact is reported, and the handler keeps serving: `std::thread::spawn` would panic, and the
-/// release build aborts on panic.
+/// release build aborts on panic. The thread, for the caller to join ([`reap`]).
 fn start_connection(
     builder: std::thread::Builder,
     stream: UnixStream,
@@ -469,11 +543,11 @@ fn start_connection(
     shared: Arc<Shared>,
     info: InfoFn,
     verbose: bool,
-) -> bool {
+) -> Option<std::thread::JoinHandle<()>> {
     {
         let mut activity = lock(&shared.activity);
         if shared.stopping.load(Ordering::SeqCst) {
-            return false;
+            return None;
         }
         activity.0 += 1;
     }
@@ -488,19 +562,19 @@ fn start_connection(
         }
         Err(_) => {
             end_connection(&shared, id);
-            return false;
+            return None;
         }
     }
     let report = info.clone();
     let mine = shared.clone();
     match builder.spawn(move || serve_connection(id, stream, &engine, &shared, &info, verbose)) {
-        Ok(_) => true,
+        Ok(thread) => Some(thread),
         Err(e) => {
             end_connection(&mine, id);
             report(&format!(
                 "cannot start a thread for a connection ({e}); closed it"
             ));
-            false
+            None
         }
     }
 }
@@ -851,6 +925,50 @@ mod tests {
         drop(handler.join());
     }
 
+    /// Whether SIGTERM is blocked in this thread.
+    fn blocks_sigterm() -> bool {
+        // SAFETY: pthread_sigmask with no new set only reads this thread's mask into `mask`, and
+        // sigismember only reads it.
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
+            libc::sigismember(&mask, libc::SIGTERM) == 1
+        }
+    }
+
+    #[test]
+    fn serve_gives_its_thread_the_signal_mask_back_and_ends_its_signal_thread() {
+        // A program that embeds `serve` gets SIGINT, SIGTERM and SIGHUP again once it returns, and
+        // keeps no thread waiting for them (0.2.1 left them blocked and the thread in `sigwait`).
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.tsvz");
+        let serving = std::thread::spawn(move || {
+            let before = blocks_sigterm();
+            let config = Config {
+                idle: Some(Duration::from_millis(200)),
+                group: None,
+                mode: None,
+                log: None,
+                errors: None,
+                info: Arc::new(|_: &str| {}),
+                verbose: false,
+            };
+            serve(&store, config).unwrap();
+            (before, blocks_sigterm())
+        });
+        assert_eq!(serving.join().unwrap(), (false, false));
+        #[cfg(target_os = "linux")]
+        {
+            let named = |name: &str| {
+                std::fs::read_dir("/proc/self/task").unwrap().any(|t| {
+                    let comm = t.unwrap().path().join("comm");
+                    std::fs::read_to_string(comm).is_ok_and(|c| c.trim() == name)
+                })
+            };
+            assert!(!named("tsvz-signals"), "the signal thread is left");
+        }
+    }
+
     #[test]
     fn a_connection_is_counted_when_it_is_accepted_not_when_its_thread_runs() {
         // Else the idle timeout can stop the handler under a client it has just accepted.
@@ -879,7 +997,7 @@ mod tests {
         }
         assert_eq!(lock(&shared.activity).0, 1, "counted before anything else");
         drop(held);
-        assert!(started.join().unwrap());
+        assert!(started.join().unwrap().is_some());
         assert_eq!(
             lock(&shared.open).len(),
             1,
@@ -899,14 +1017,15 @@ mod tests {
         let info: InfoFn = Arc::new(|_: &str| {});
         let (mut client, end) = UnixStream::pair().unwrap();
         client.write_all(b"set\tk\tv\n").unwrap();
-        assert!(!start_connection(
+        assert!(start_connection(
             std::thread::Builder::new(),
             end,
             engine.clone(),
             shared.clone(),
             info,
             false
-        ));
+        )
+        .is_none());
         let mut answer = Vec::new();
         let _ = client.read_to_end(&mut answer); // the end of the connection, or a reset
         assert!(answer.is_empty(), "answered {answer:?}");
@@ -940,14 +1059,15 @@ mod tests {
         // No system can map a stack this large: the thread cannot be made.
         let impossible = std::thread::Builder::new().stack_size(usize::MAX / 2);
         let (mut client, end) = UnixStream::pair().unwrap();
-        assert!(!start_connection(
+        assert!(start_connection(
             impossible,
             end,
             engine.clone(),
             shared.clone(),
             info.clone(),
             false
-        ));
+        )
+        .is_none());
         let mut byte = [0u8; 1];
         assert_eq!(
             client.read(&mut byte).unwrap(),
@@ -958,14 +1078,15 @@ mod tests {
         assert_eq!(lock(&shared.activity).0, 0, "no longer counted");
         assert!(lock(&shared.open).is_empty(), "nor registered");
         let (mut client, end) = UnixStream::pair().unwrap();
-        assert!(start_connection(
+        let thread = start_connection(
             std::thread::Builder::new(),
             end,
             engine,
             shared,
             info,
-            false
-        ));
+            false,
+        );
+        assert!(thread.is_some());
         client.write_all(b"len\n").unwrap();
         let mut answer = String::new();
         client.take(5).read_to_string(&mut answer).unwrap();

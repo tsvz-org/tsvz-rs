@@ -165,30 +165,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### A stop that cannot write or sync its queue still ends cleanly
-- Kind: deferred
-- What the operator sees: a second opinion's reading of the code, not reproduced: `stop` flushes the queue and replies
-  `#0` though a batch of plain (not `--x-written`) writes failed, so a write the handler had acknowledged is lost; a
-  failed flush replies `#1` and the handler stops anyway; a failed sync at exit is only logged and the handler ends
-  with status 0; the close has a narrow window between its last sync and the pointer file's removal. The command
-  line's own writes are answered once written, so only a raw client sees the first.
-- Why: the stop path does not carry a failure of the writer's last batch into its answer, the handler's exit status or
-  its log.
-- Revisit when: 0.2.2. The plan: the writer remembers the first failed write or sync; a stop answers `#1` with it,
-  `serve` ends with status 1 and logs it as an error, and the sync at close is made before the pointer file goes.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### `serve` leaves SIGINT, SIGTERM and SIGHUP blocked once it has returned
-- Kind: deferred
-- What the operator sees: a program that embeds `handler::server::serve` (a hidden function) and goes on after a stop
-  has the three signals blocked in its calling thread, and a signal thread waiting in `sigwait` for the life of the
-  process. `tsvz serve` itself exits.
-- Why: `serve` blocks the signals for the thread it started in and never restores the mask.
-- Revisit when: 0.2.2. The plan: restore the mask and end the signal thread when `serve` returns.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A scrub of a loose file can change a row a strict TSVZ.py reader reads
 - Kind: deferred
 - What the operator sees: a loose `scrub` moves a key's last line into its first line's place even when it has fewer

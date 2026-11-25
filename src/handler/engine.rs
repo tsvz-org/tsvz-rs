@@ -66,6 +66,10 @@ struct Queue {
     unsynced: Vec<(PathBuf, u64, File)>,
     /// A sync of a part left behind that failed, until a flush reports it.
     sync_error: Option<String>,
+    /// The first failure that lost a write acknowledged before it was made: a failed batch of
+    /// such writes, or a failed sync of them. Kept for good: every flush (a stop) and the end of
+    /// `serve` report it.
+    lost: Option<String>,
     /// Syncs of parts left behind under way, which a flush waits for.
     syncing: usize,
     closing: bool,
@@ -142,19 +146,32 @@ impl Batcher {
         }
     }
 
-    /// Wait until everything queued is written, then fsync what was not (§21.9.3).
+    /// Wait until everything queued is written, then fsync what was not (§21.9.3); an error when a
+    /// write acknowledged before it was made has been lost, now or before ([`Queue::lost`]).
     fn flush(&self) -> Result<(), String> {
         self.barrier();
         let mut q = lock(&self.queue);
         while q.syncing > 0 {
             q = self.changed.wait(q).unwrap_or_else(|e| e.into_inner());
         }
-        if let Some(e) = q.sync_error.take() {
-            return Err(e);
+        let synced = match q.sync_error.take() {
+            Some(e) => Err(e),
+            None => sync(&q.unsynced).map_err(|e| format!("fsync failed: {e}")),
+        };
+        if let Err(e) = &synced {
+            q.lost.get_or_insert_with(|| e.clone());
+        } else {
+            q.unsynced.clear();
         }
-        sync(&q.unsynced).map_err(|e| e.to_string())?;
-        q.unsynced.clear();
-        Ok(())
+        match &q.lost {
+            Some(lost) => Err(lost.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// The first failure that lost an acknowledged write ([`Queue::lost`]).
+    fn lost(&self) -> Option<String> {
+        lock(&self.queue).lost.clone()
     }
 
     /// The parts awaiting an fsync.
@@ -242,6 +259,13 @@ impl Batcher {
                             message: format!("a batch of {} writes failed: {message}", batch.len()),
                         });
                     }
+                    // A write answered before it was made is lost with its batch; one that waited
+                    // for its outcome was answered with this error.
+                    if batch.iter().any(|e| !e.waited) {
+                        q.lost.get_or_insert_with(|| {
+                            format!("writes answered before they were made were lost, in a batch that failed: {message}")
+                        });
+                    }
                     q.failing = Some(message);
                 }
             }
@@ -260,7 +284,9 @@ impl Batcher {
                 let mut q = lock(&self.queue);
                 q.syncing -= 1;
                 if let Err(e) = synced {
-                    q.sync_error.get_or_insert_with(|| e.to_string());
+                    let message = format!("fsync failed: {e}");
+                    q.lost.get_or_insert_with(|| message.clone());
+                    q.sync_error.get_or_insert(message);
                     if let Some(errors) = &self.errors {
                         errors(&Warning {
                             part: self.store.clone(),
@@ -274,13 +300,15 @@ impl Batcher {
         }
         let unsynced = std::mem::take(&mut lock(&self.queue).unsynced);
         if let Err(e) = sync(&unsynced) {
+            let message = format!("fsync failed: {e}");
             if let Some(errors) = &self.errors {
                 errors(&Warning {
                     part: self.store.clone(),
                     offset: None,
-                    message: format!("fsync failed: {e}"),
+                    message: message.clone(),
                 });
             }
+            lock(&self.queue).lost.get_or_insert(message);
         }
     }
 }
@@ -816,9 +844,16 @@ impl Engine {
         Engine::answer(result, said)
     }
 
-    /// Make every acknowledged write durable (`stop`, §21.9.3).
+    /// Make every acknowledged write durable (`stop`, §21.9.3): an error when one was lost, now or
+    /// before (a failed batch of writes answered before they were made, a failed sync).
     pub fn flush(&self) -> Result<(), Error> {
         self.batcher.flush().map_err(Error::Refused)
+    }
+
+    /// The first failure that lost a write acknowledged before it was made, a failed sync at
+    /// close included: what `serve` reports as it ends.
+    pub fn lost(&self) -> Option<String> {
+        self.batcher.lost()
     }
 
     /// Answer no more requests; write and fsync everything queued, and end the writer thread.
@@ -1470,6 +1505,31 @@ mod tests {
         assert_eq!(ask(&e, "--x-written\tset\td\t4").status, 0);
         let r = ask(&e, "len");
         assert!(r.diagnostics.is_empty(), "writes work again: {r:?}");
+    }
+
+    #[test]
+    fn a_flush_after_an_acknowledged_write_was_lost_fails_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        // A directory where the part was: every append fails, even as root.
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        // A write that waits for its outcome is answered with the failure: nothing answered is
+        // lost, and a stop's flush succeeds.
+        assert_eq!(ask(&e, "--x-written\tset\tb\t2").status, 1);
+        assert!(e.flush().is_ok() && e.lost().is_none());
+        // One answered before it is made is lost with its batch: every flush says so from then on,
+        // also once writes work again (0.2.1's stop answered #0).
+        assert_eq!(ask(&e, "set\tc\t3").status, 0);
+        let lost = e.flush().unwrap_err().to_string();
+        assert!(lost.contains("were lost"), "{lost}");
+        fs::remove_dir(&p).unwrap();
+        fs::write(&p, "a\t1\n").unwrap();
+        assert_eq!(ask(&e, "--x-written\tset\td\t4").status, 0);
+        assert!(e.flush().is_err(), "kept for good");
+        assert_eq!(e.lost(), Some(lost));
     }
 
     #[test]
