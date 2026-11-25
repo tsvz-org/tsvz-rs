@@ -72,7 +72,7 @@ Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
 (SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
 file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
-handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.2,
+handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.3,
 [docs/limitations.md](docs/limitations.md)).
 
 ## Library

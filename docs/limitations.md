@@ -59,7 +59,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   a mandatory SMB byte-range lock over the file, so another process's read of it fails with EACCES; the append's
   lock (whole-file on Linux in tsvz-rs, byte 1 in TSVZ.py, the layout of §18.6) is made mandatory the same way.
   Measured on Samba 4.17 with 7.0, 6.1 and 4.18 clients (2026-11-23).
-- Revisit when: 0.2.2, together with TSVZ.py. The plan, measured on all three kernels: a handler holds a write
+- Revisit when: 0.2.3, together with TSVZ.py (moved from 0.2.2: TSVZ 5.19 is paused at the user's ask, and tsvz-rs
+  alone cannot take the new lock, below). The plan, measured on all three kernels: a handler holds a write
   lock (an open file description lock) on one byte far past the pointer file's content (offset 2^62), where no
   reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a second handler is
   refused. Both tools must change together: on a local file system `flock` and such a lock do not exclude each
@@ -67,40 +68,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `flock`. TSVZ.py's lookup must also catch an error of the read. The append lock's range is a spec matter (§18.6)
   and goes to the TSVZ session; with a reachable handler the command line reads through its socket and never meets
   it.
-- Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; a deferral under the
-  user's standing rule that deferrals are noted, not asked.
+- Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; moved to 0.2.3 on
+  2026-11-25; a deferral under the user's standing rule that deferrals are noted, not asked.
 
-### The handler can end with SIGSEGV under a flood of connections on a loaded host
+### A routed `pop` or `popitem` whose answer is written but never read loses its row
 - Kind: deferred
-- What the operator sees: `tsvz serve` ends by SIGSEGV (exit 139, a core where core dumps are on)
-  while a client makes and closes connections in a tight loop on a heavily loaded host: its clients
-  then find it gone (a write exits 1, a read uses the files), and writes it had acknowledged but not
-  yet written are lost. Seen in 5 of 4,000 runs of the handler test binary, eight copies at once
-  (`a_child_spawned_while_a_client_connects_never_inherits_its_connection`; debug builds, Rust
-  1.100, glibc 2.41, Linux 7.0); a flood alone (16 processes, up to 990,000 connections in 10 s, 16
-  rounds, with and without a 120-task limit) did not reproduce it. 0.2.0 is the same.
-- Why: not diagnosed. The four cores kept (of five crashes) all stop in `pthread_detach`, called by
-  the drop of the `JoinHandle` that `std::thread::Builder::spawn` had just returned in
-  `server::start_connection`; the one read that far faults at `pthread_detach+28`, reading the new
-  thread's descriptor, whose memory is no longer mapped: the thread's stack was freed before its
-  handle was detached. Whether glibc, std or the handler is at fault is not known.
-- Revisit when: 0.2.2. The plan: reproduce with the test loop (eight lanes of the handler test
-  binary) on a release build and on Rust 1.85; read the cores with glibc's debug symbols; if it is
-  glibc's or std's, draft an upstream report and work around it in one place (a connection thread
-  that is joined rather than detached, say); else fix it.
-- Noted: 2026-11-23, in the 0.2.1 build (h021); a deferral under the user's standing rule that
-  deferrals are noted, not asked.
-
-### A routed `pop` or `popitem` whose answer is lost in transit loses its row
-- Kind: deferred
-- What the operator sees: the handler deletes the row before its answer is written to the client: a client that times
-  out or hangs up in between (a killed command, a broken connection) has neither printed the row nor put it back, and
-  the error (`lost the handler`) names no row. 0.2.0 does the same; 0.2.1 puts back a row the command could not print,
-  not one it never received (a second opinion's finding, by reading).
-- Why: the pop is one step in the handler: take the row, queue its deletion, answer.
-- Revisit when: 0.2.2. The plan: a pop in two steps: the handler holds the row hidden from other requests until its
-  answer is written, then deletes it, and gives it back when the write fails; or accept it as a known limitation, with
-  the user's OK.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
+- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. When that write
+  fails (the client hung up, or gave up waiting), the handler puts the row back (0.2.2; 0.2.1 lost it). An answer
+  the handler wrote that the client never read (killed after the write and before its read) is lost with its row,
+  and the command's error (`lost the handler`) names no row.
+- Why: a written answer is all the handler can see; only an acknowledgement from the client would say that the row
+  reached it.
+- Revisit when: 0.2.3, with the TSVZ session: a client acknowledgement for `pop` and `popitem` (§21.7), which both
+  tools' handlers and clients must take up together; or accept it as a known limitation (the user's OK). The
+  two-step pop of the first plan (the row hidden until its answer is written) would answer before the deletion is
+  written, and still could not tell a written answer from a read one.
+- Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write); a
+  deferral under the user's standing rule that deferrals are noted, not asked.

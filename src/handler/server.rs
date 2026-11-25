@@ -661,9 +661,37 @@ fn answer(
             ));
         }
         if writer.write_all(&response.encode()).is_err() {
+            if owes && response.status == 0 {
+                give_back(engine, &response, info);
+            }
             return;
         }
     }
+}
+
+/// Put back the row a `pop` or `popitem` took, when its answer, the row's only copy, could not be
+/// written (its client hung up, or gave up waiting): `setdefault` of the row, which keeps a row
+/// written for its key since, as the command line puts back a row it could not print. Said on
+/// `serve`'s standard error either way.
+fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
+    let Some(row) = response.lines.first() else {
+        return;
+    };
+    let mut line = String::from("setdefault");
+    for (i, f) in protocol::decode_fields(row).iter().enumerate() {
+        line.push('\t');
+        line.push_str(&protocol::field(f, i == 0)); // the key stays a data key (§21.4.3)
+    }
+    let back = protocol::parse(&line).map(|request| engine.handle(&request, None));
+    let outcome = match back {
+        Ok(r) if r.status == 0 => "it was put back".to_string(),
+        Ok(r) => format!("it could not be put back ({}): {row}", r.message),
+        Err(e) => format!("it could not be put back ({e}): {row}"),
+    };
+    info(&format!(
+        "{}: the answer to a pop could not be written (its client went away); {outcome}",
+        engine.path().display()
+    ));
 }
 
 /// How long `tsvz stop` waits, from its request, for the handler to be gone. Once it has

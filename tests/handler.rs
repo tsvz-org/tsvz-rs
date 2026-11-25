@@ -562,6 +562,32 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
 }
 
 #[test]
+fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
+    // The handler deletes the row before it answers: a client that hangs up meanwhile (killed, or
+    // given up waiting) never gets the answer, the row's only copy, so the handler puts the row
+    // back (0.2.1 lost it).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let served = Served::start(&s, &[]);
+    // The part's write lock, held here, stalls the pop's tombstone until the client is gone.
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let mut conn = connect(&s).unwrap();
+    conn.write_all(b"pop\ta\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    drop(conn);
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !served.stderr().contains("could not be written") {
+        assert!(Instant::now() < deadline, "{}", served.stderr());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(served.stderr().contains("it was put back"), "{}", served.stderr());
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\na\t1\n");
+    assert_eq!(ask(&s, "get\ta").lines, ["a\t1"]);
+}
+
+#[test]
 fn a_pop_that_finds_a_handler_stopping_never_takes_the_row_its_pop_took() {
     // While a stopping handler has a pop's tombstone still to write, a pop on the files would
     // read that row as live and take it too: a command in that window finds the handler gone
