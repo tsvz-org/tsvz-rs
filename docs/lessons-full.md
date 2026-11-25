@@ -286,7 +286,8 @@ entries go last, in the same commit as the change:
 - Changed: a loose `scrub` keeps the last line of each key that TSVZ.py's strict reader takes (it skips a line
   narrower than the column count), and moves a key's last line into its first line's place only where that reader
   takes the last line, or none of the key's lines, where no `#_defaults_#` line holds a value (that case stays in
-  docs/limitations.md: such a line makes the reader take a narrower line, which the plan does not follow).
+  docs/limitations.md: such a line makes the reader take a narrower line, which the plan does not follow; the order
+  in which that reader meets the keys can still change, also there).
 - Why we had to change: `x 0 0`, `K 1 2`, `K 9` read `K` as `[K, 1, 2]` to that reader and had no `K` after a scrub;
   on 3,000 random files 0.2.1 changed that reader's reading of 78. TSVZ.py's scrub promises every reader reads the
   file as before.
@@ -328,5 +329,5 @@ entries go last, in the same commit as the change:
 - Original design was wrong because: durability was a fact about the state before the request, and a request can
   change that state before its own writes are made.
 - Lesson: when a request can change the rule that applies to the writes around it, take the stricter reading where
-  the spec is silent (§21.9.2 leaves it to TSVZ.py): a sync costs time, a write lost after its answer costs the
-  promise.
+  the spec is silent (§21.9.2 is silent; TSVZ.py decides from the markers it last read, and tsvz-rs departs from it
+  here): a sync costs time, a write lost after its answer costs the promise.

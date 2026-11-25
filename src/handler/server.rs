@@ -722,8 +722,8 @@ pub const STOP_WAIT: Duration = Duration::from_secs(2 * FINISH.as_secs() + 20);
 /// Ask the handler of `store` to stop and wait until it has (§21.13.2): Ok once its pointer file
 /// no longer names it, which it removes once every acknowledged write is written, or no handler
 /// holds it (its process ended); also when another stop, a signal or its idle timeout stopped it
-/// first. An error when there is no handler, when it does not answer, or when it is still there
-/// after [`STOP_WAIT`].
+/// first. An error when there is no handler, when it does not answer, when it is still there
+/// after [`STOP_WAIT`], or, once it is gone, when it answered other than `#0`.
 pub fn stop(store: &Path) -> Result<(), Error> {
     stop_within(store, STOP_WAIT)
 }

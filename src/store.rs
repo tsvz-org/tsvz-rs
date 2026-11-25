@@ -56,9 +56,9 @@ pub struct Options {
     pub(crate) every_part: bool,
     /// Read a loose file only as far as its first keyed line, which sets its column count
     /// ([`Store::one_column`]), and no further than its first `head` bytes as stored: a decision
-    /// made from that line then rests on bytes a writer's check of the file covers
-    /// ([`crate::write::Seen`]). A compressed file's member is still decoded to its check before
-    /// its lines are used (§16.6), holding a few MiB of it at most.
+    /// made from that line then never rests on a line appended since ([`crate::write::Seen`]). A
+    /// compressed file's member is still decoded to its check before its lines are used (§16.6), a
+    /// few MiB at a time when it passes the check.
     pub(crate) head: Option<u64>,
 }
 

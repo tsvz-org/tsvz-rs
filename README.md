@@ -47,7 +47,8 @@ compressed file too (TSVZ.py's joins the compressed one's). A rewrite writes eac
 line it keeps as the file has it, but for three things: the key a one-column `delete` puts where the
 line that set the column count went, and the empty line 1 and blank `#_defaults_#` line a `clear`
 may write before the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
-place of its first, where nothing a reader reads changes), and `clear` the `#_defaults_#` lines in
+place of its first, where the command lines' reading stays; [docs/limitations.md](docs/limitations.md) has where
+TSVZ.py's strict reader's does not), and `clear` the `#_defaults_#` lines in
 force ([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
@@ -115,12 +116,12 @@ Stores need nothing; the library's documented API does not change.
   last line is never joined (TSVZ.py's append joins it); `setdefault` of a missing key prints the
   row `get` then reads (none, exit 3, where the line it wrote is a deletion); `clear` writes an
   empty line 1 where line 1 was no comment, as TSVZ.py's does (TSVZ.py's also replaces a comment
-  line 1, which tsvz-rs keeps); `scrub` keeps what TSVZ.py's strict reader reads too, where no
-  `#_defaults_#` line holds a value ([docs/limitations.md](docs/limitations.md)); `scrub` and
+  line 1, which tsvz-rs keeps); `scrub` keeps the rows TSVZ.py's strict reader reads too (not always
+  their order), where no `#_defaults_#` line holds a value ([docs/limitations.md](docs/limitations.md)); `scrub` and
   `clear` take a file named `app.tsv.1` as one file. Reads that
   want few rows (`get`, `len`, `keys`) take less CPU, and a row holds only its own cells.
-- Through a handler: `tsvz stop` of a handler that died, or that closed one connection for want of
-  a thread, ends at once (it waited 30 s); a stop that finds an acknowledged write lost answers 1
+- Through a handler: `tsvz stop` of a handler killed after it answered, or that closed one connection
+  for want of a thread, ends at once (it waited 30 s); a stop that finds an acknowledged write lost answers 1
   (`tsvz stop` waits for the handler to go, then exits 1), and `serve` ends with status 1; a
   request that sets `#_write_ack_#` is answered once its own writes are synced; a `pop` whose
   client went away before its answer gets its row put back, while the handler serves.
