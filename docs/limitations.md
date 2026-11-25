@@ -141,3 +141,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 0.2.4. The plan: a `serve` that takes over a pointer file no process holds removes the socket that
   file names and `rmdir`s its directory.
 - Noted: 2026-11-25, in the 0.2.2 build.
+
+### Two handler tests can fail on a loaded machine
+- Kind: deferred
+- What the operator sees: nothing; it is the tests. `a_pop_whose_client_went_away_before_its_answer_puts_its_row_back`
+  and `a_pop_whose_client_went_away_after_its_key_was_written_prints_the_row_taken_even_with_q` (tests/handler.rs)
+  wait 10 s for `serve` to say that a pop's answer could not be written, and fail when it does not. On a host at a
+  load average of about 200 (32 test threads) 8 of 20 runs of `cargo test --test handler` failed in 0.2.3, and 9 of
+  30 runs at 0.2.2's commit; with one test thread, or with one test alone, none did.
+- Why: the test closes its client socket with `drop`, while a child that another test thread is starting (between
+  its fork and its exec) holds a copy of the descriptor: the socket stays open, the handler's write of the answer
+  succeeds, and nothing is put back. The handler does what it should.
+- Revisit when: 0.2.4. The plan: the two tests call `shutdown(Both)` on the connection before they drop it (none of
+  20 runs failed with that change, under the same load).
+- Noted: 2026-11-25, in 0.2.3's first run on the minimum Rust version.
