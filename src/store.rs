@@ -414,7 +414,9 @@ fn first_lines(codec: Codec, reader: &mut impl Read, on_line: &mut dyn FnMut(&Li
             _ => return,
         };
         let mut input = &page[..n];
-        while !input.is_empty() {
+        // The last step filled its room: the decoder may have output still to give.
+        let mut pending = false;
+        while !input.is_empty() || pending {
             if between {
                 if codec == Codec::Gzip {
                     let zeros = input.iter().take_while(|&&b| b == 0).count();
@@ -427,17 +429,25 @@ fn first_lines(codec: Codec, reader: &mut impl Read, on_line: &mut dyn FnMut(&Li
                 between = false;
             }
             out.clear();
-            let Ok((used, ended)) = decoder.feed(input, &mut out) else {
+            // No more output at a time than a member of the default size, however well a page
+            // compresses.
+            let room = DEFAULT_MEMBER_SIZE as usize;
+            let Ok((used, ended)) = decoder.feed_upto(input, &mut out, room) else {
                 return;
             };
             if !framer.push(&out, on_line) {
                 return;
             }
-            if !ended {
+            pending = !ended && out.len() >= room;
+            if ended {
+                between = true;
+                // as `codec::read_items` steps past a member
+                input = &input[used.max(1).min(input.len())..];
+            } else if pending {
+                input = &input[used..]; // on with the rest of the page, or what it still gives
+            } else {
                 break;
             }
-            between = true;
-            input = &input[used.max(1)..]; // as `codec::read_items` steps past a member
         }
     }
 }
