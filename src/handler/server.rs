@@ -170,8 +170,7 @@ impl Drop for Signals {
             self.done.store(true, Ordering::SeqCst);
             // SAFETY: a thread not yet joined keeps its pthread_t valid. std hands it over as an
             // integer; libc's `pthread_t` is an integer on glibc and macOS and a pointer on musl,
-            // so `as _` is the one spelling that builds on all of them (a named type would trip
-            // clippy's `unnecessary_cast` on whichever target it equals).
+            // so `as _` takes whichever type libc wants on each target.
             unsafe { libc::pthread_kill(waiter.as_pthread_t() as _, signal) };
             let _ = waiter.join();
         }
