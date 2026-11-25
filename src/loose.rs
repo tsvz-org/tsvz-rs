@@ -110,6 +110,12 @@ pub(crate) fn name(key: &str, d: u8) -> Option<String> {
     read_as(key, cell).then(|| cell.to_string())
 }
 
+/// The key a loose command names for `requested` ([`name`]), or, for a key no row can have, the key
+/// itself. The one place a loose key gets its name, with or without a store.
+pub(crate) fn lookup<'k>(requested: &'k str, d: u8) -> Cow<'k, str> {
+    name(requested, d).map_or(Cow::Borrowed(requested), Cow::Owned)
+}
+
 /// Whether a field written as `field` reads back as `cell`: `field` less whitespace at its end.
 fn read_as(field: &str, cell: &str) -> bool {
     field

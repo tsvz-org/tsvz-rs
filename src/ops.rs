@@ -236,6 +236,7 @@ pub fn setdefault(
     };
     let key = match store {
         Some(s) => s.lookup_key(requested).into_owned(),
+        None if !format.strict => crate::loose::lookup(requested, format.delimiter).into_owned(),
         None => name_key(requested, format.delimiter, strip, |_| false).into_owned(),
     };
     if let Some(row) = store.and_then(|s| s.get(&key)) {

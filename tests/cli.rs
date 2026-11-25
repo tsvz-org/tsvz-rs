@@ -849,7 +849,8 @@ fn a_loose_key_with_a_line_break_at_its_end_names_its_own_row() {
         // `a` itself is still `a`.
         fs::write(dir.join("f.tsv"), init).unwrap();
         assert_eq!(records(dir, &["delete", "f.tsv", "a"]).0, 0);
-        assert!(!keys("f.tsv").starts_with("a\n") && keys("f.tsv").contains("a<LF>\n"));
+        let after_a = if init == m { "k\na<LF>\nb\n" } else { "a<LF>\nb\n" };
+        assert_eq!(keys("f.tsv"), after_a);
     }
     // A file with only `a`: `$'a\n'` names no row of it.
     fs::write(dir.join("f.tsv"), "k\tv\na\t0\n").unwrap();
@@ -894,10 +895,26 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
         2
     );
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n");
-    // Bulk input: a `#_defaults_#` line is a record, as a reader reads it.
+    // Bulk input: the `#_defaults_#` line is a record, as TSVZ.py's command line has it; any
+    // other line whose first field begins with `#` is skipped, as there, though a reader reads
+    // `#_defaults_# ` and `#_defaults_#x` as defaults lines (0.2.0 skipped the exact line too).
     let all = ["--format", "records", "set", "f.tsv", "-"];
     assert_eq!(run_in(dir, &all, b"#_defaults_#\tD\n#c\tx\nb\t2\n").0, 0);
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n#_defaults_#\tD\nb\t2\n");
+    let before = file(dir, "f.tsv");
+    let del = ["--format", "records", "delete", "f.tsv", "-"];
+    assert_eq!(run_in(dir, &del, b"#_defaults_# \tP\n#_defaults_#x\t1\n").0, 0);
+    assert_eq!(file(dir, "f.tsv"), before);
+    assert_eq!(run_in(dir, &all, b"#_defaults_#x\t1\n#_defaults_# \tP\n").0, 0);
+    assert_eq!(file(dir, "f.tsv"), before);
+    // setdefault on a file that is not there names the key as a reader does, as every loose key
+    // is (0.2.0 and the build before this named `a ` as given).
+    assert_eq!(
+        records(dir, &["setdefault", "n.tsv", "a ", "5"]),
+        (0, "a\t5\n".into(), "".into())
+    );
+    assert_eq!(file(dir, "n.tsv"), "a\t5\n");
+    assert_eq!(records(dir, &["keys", "n.tsv"]).1, "a\n");
 }
 
 /// Bulk input to a loose file loses the NULs at a line's start, as a reader does (0.2.0 and the

@@ -927,8 +927,7 @@ impl Store {
     /// delimiter at its end stays, a blank goes), or, for a key no row can have, the key itself.
     pub fn lookup_key<'k>(&self, requested: &'k str) -> Cow<'k, str> {
         if !self.format.strict {
-            return crate::loose::name(requested, self.format.delimiter)
-                .map_or(Cow::Borrowed(requested), Cow::Owned);
+            return crate::loose::lookup(requested, self.format.delimiter);
         }
         let strip = self.format.strict && self.replay.markers.strip;
         crate::write::name_key(requested, self.format.delimiter, strip, |k| {
