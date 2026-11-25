@@ -93,13 +93,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A scrub of a loose file can change what a strict TSVZ.py reader reads: a row under `#_defaults_#` that hold a value, or the order of its keys
 - Kind: deferred
-- What the operator sees: TSVZ.py's strict read of the library (`readTSV(strict=True)`) drops a line narrower than
-  the column count, but takes it, padded, while a `#_defaults_#` line that holds a value is in force. A loose
-  `scrub` keeps the lines that reader takes by their width alone (0.2.2), so the lines `#h`, `x 0 0`, `K 1 2`,
-  `#_defaults_# P Q`, `K 9`, `#_defaults_#`, `K 8` (tab-separated) lose `K 9`: that reader read `K` as `[K, 9, Q]`
-  before and reads `[K, 1, 2]` after. Without such a line its rows stay, but not always their order: `x 0 0`,
-  `L`, `L 2`, `M 9 9 1`, `L 8 1` gives keys x, M, L before and x, L, M after. Both tools' command lines read
-  each file alike before and after. 0.2.1 does both (and changed more rows).
+- What the operator sees: TSVZ.py's strict read of the library (`readTSV(strict=True)`) drops a line that holds a
+  value but is narrower than the column count; while a `#_defaults_#` line that holds a value is in force, it takes
+  such a line, padded. A loose `scrub` keeps the lines that reader takes by their width alone (0.2.2), so the lines
+  `#h`, `x 0 0`, `K 1 2`, `#_defaults_# P Q`, `K 9`, `#_defaults_#`, `K 8` (tab-separated) lose `K 9`: that reader
+  read `K` as `[K, 9, Q]` before and reads `[K, 1, 2]` after. Without such a line its rows stay, but not always
+  their order: `x 0 0`, `L`, `L 2`, `M 9 9 1`, `L 8 1` gives keys x, M, L before and x, L, M after. Both tools'
+  command lines read each file alike before and after. 0.2.1 does both (and changed more rows).
 - Why: the scrub's plan does not follow the strict reader's own defaults (that reader also drops a narrower
   `#_defaults_#` line when none is in force), nor the order in which it first meets a key.
 - Revisit when: 0.2.3. The plan starts with a design question, not a patch (this part has been found wrong four

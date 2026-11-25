@@ -831,7 +831,7 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
         }
     } else {
         // A stop whose flush took most of the wait can be answered with a lost write late, and the
-        // handler need longer than what is left: what it answered is said too (0.2.1 failed with
+        // handler needs longer than what is left: what it answered is said too (0.2.1 failed with
         // it at once).
         let said = answered.map_or_else(String::new, |why| format!("; {why}"));
         Err(refused(format!(

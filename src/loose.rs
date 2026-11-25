@@ -423,10 +423,10 @@ impl Run {
 /// (tsvz-rs, and TSVZ.py as its command line reads, given no header) reads the result as the file;
 /// line 1, and the first keyed line after it, stay for a TSVZ.py program that takes line 1 for its
 /// header. So does TSVZ.py's strict reader (`readTSV(strict=True)`, given no header), which skips
-/// a line narrower than the column count: the last line of a key that it takes stays too, and the
-/// value line moves only when it is one it takes, or it takes none of the key's lines. (Not where
-/// a `#_defaults_#` line that holds a value is in force, and not always in the order of the keys
-/// it reads: docs/limitations.md.)
+/// a line that holds a value but is narrower than the column count: the last line of a key that it
+/// takes stays too, and the value line moves only when it is one it takes, or it takes none of the
+/// key's lines. (Not where a `#_defaults_#` line that holds a value is in force, and not always in
+/// the order of the keys it reads: docs/limitations.md.)
 pub(crate) struct ScrubPlan {
     d: u8,
     pins: Pins,

@@ -105,8 +105,8 @@ tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conforman
 every codec, every digest, multi-part scrub and the snapshot skip claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
-tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
-choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+tsvz-rs does what TSVZ.py does, except where [docs/silent-choices.md](docs/silent-choices.md), which
+lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
 ## Upgrading to 0.2.2 from 0.2.1
 
