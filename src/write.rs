@@ -1320,10 +1320,15 @@ mod tests {
         // rewritten in place at the same length
         fs::write(&p, "a\t1\nb\t3\n").unwrap();
         assert!(!w.append_if_grown(&gone, &seen).unwrap());
-        // replaced by another file with the same bytes
-        fs::remove_file(&p).unwrap();
-        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        // replaced by another file with the same bytes: renamed over it while the old one is held
+        // open, so that the new one cannot take its inode (ext4 gives a freed inode to the next
+        // file made, and a file with the same bytes and inode is the file the delete read)
+        let held = fs::File::open(&p).unwrap();
+        let other = dir.path().join("s.tsv.new");
+        fs::write(&other, "a\t1\nb\t2\n").unwrap();
+        fs::rename(&other, &p).unwrap();
         assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        drop(held);
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n", "nothing written");
         let now = Seen::of(&p).unwrap().unwrap();
         assert!(w.append_if_grown(&gone, &now).unwrap());
