@@ -118,7 +118,7 @@ pub fn decode_fields(line: &str) -> Vec<String> {
 /// The request that puts back a row that a `pop` or `popitem` took, given its decoded fields:
 /// `setdefault` of the row, which keeps a row written for its key since; the key stays a data key
 /// (§21.4.3).
-pub fn setdefault_line(fields: &[String]) -> String {
+pub(crate) fn setdefault_line(fields: &[String]) -> String {
     let mut line = String::from("setdefault");
     for (i, f) in fields.iter().enumerate() {
         line.push('\t');
