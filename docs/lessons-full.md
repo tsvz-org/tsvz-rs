@@ -289,8 +289,8 @@ entries go last, in the same commit as the change:
   a value (that case stays in docs/limitations.md: such a line makes the reader take a narrower line, which the
   plan does not follow; the order in which that reader meets the keys can still change, also there).
 - Why we had to change: `#h`, `x 0 0`, `K 1 2`, `K 9` read `K` as `[K, 1, 2]` to that reader and had no `K` after a
-  scrub; on 3,000 random files 0.2.1 changed that reader's reading of 78. TSVZ.py's scrub promises every reader
-  reads the file as before.
+  scrub; on 3,000 random files 0.2.1 changed that reader's reading of 78. TSVZ.py's scrub promises that every
+  reader given the scrub's header, defaults and column count reads the file as before.
 - Original design was wrong because: the scrub's plan named the readers it kept (the command line's, and one given
   line 1 for its header) and left out a reader of the same files that skips lines.
 - Lesson: list every reader that reads the files you rewrite, strict and lenient, and test the rewrite against each

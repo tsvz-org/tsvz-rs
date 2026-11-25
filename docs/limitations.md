@@ -121,6 +121,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 0.2.3. The plan: a loose file is created with the empty line 1 TSVZ.py writes.
 - Noted: 2026-11-25, in the 0.2.2 final review.
 
+### While writes fail, a handler's status-2 answer carries no warning
+- Kind: deferred
+- What the operator sees: while a handler's writes are failing, an answer with status 2 (a request it cannot
+  parse: an unknown option or operation, the wrong number of arguments, `setdefault` of a marker key) carries no
+  `#!` warning that acknowledged writes may be lost. Every other answer but `stop`'s does, and TSVZ.py's handler
+  puts it on status-2 answers too. 0.2.1 the same.
+- Why: the warning is added where a parsed request is answered, and a request that fails to parse is answered
+  before that.
+- Revisit when: 0.2.3: the handler adds the warning to a status-2 answer too, as TSVZ.py's does, and the
+  exception in docs/silent-choices.md goes.
+- Noted: 2026-11-25, in the re-read of 0.2.2's third fix round.
+
 ### A handler that is killed leaves its socket directory
 - Kind: deferred
 - What the operator sees: `tsvz serve` ended by SIGKILL leaves `tsvz-XXXXXX/s` under `$XDG_RUNTIME_DIR` or the

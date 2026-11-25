@@ -252,9 +252,9 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     run(store, config, true)
 }
 
-/// [`serve`] for the command line: the three signals stay blocked once it returns, to the exit,
-/// where a pending one is dropped (0.2.1 never gave the mask back). They are blocked after the
-/// pointer file is taken, so that a signal ends a start whose first access to it hangs.
+/// [`serve`] for the command line, which gives no signal mask back: the three signals,
+/// blocked once the pointer file is taken (so that a signal still ends a start whose first
+/// access to it hangs), stay blocked to the exit, where a pending one is dropped, as in 0.2.1.
 #[cfg(any(feature = "cli", test))] // the command line's, and a lib test's
 pub(crate) fn serve_to_exit(store: &Path, config: Config) -> Result<(), Error> {
     run(store, config, false)
