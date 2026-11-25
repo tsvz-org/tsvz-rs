@@ -358,8 +358,19 @@ pub(crate) fn fine_times(store: &Path) -> bool {
     fine
 }
 
+/// What tsvz relies on of the file system a statfs describes: whether it sets a directory's
+/// change time at every name made, renamed or removed in it ([`DirTrust`]), and whether it
+/// overwrites a file's blocks in place, so that the space a rewrite reserves first is really there
+/// (not a copy-on-write one, which needs new blocks to overwrite). One table, for both: a local
+/// kernel file system it knows; nothing of any other (FUSE, network, overlay, HFS+).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Fs {
+    pub(crate) dir_times: bool,
+    pub(crate) in_place: bool,
+}
+
 #[cfg(target_os = "linux")]
-fn kept(fs: &libc::statfs) -> bool {
+fn fs_of(fs: &libc::statfs) -> Fs {
     const EXT: u32 = 0xEF53;
     const XFS: u32 = 0x5846_5342;
     const BTRFS: u32 = 0x9123_683E;
@@ -367,19 +378,50 @@ fn kept(fs: &libc::statfs) -> bool {
     const F2FS: u32 = 0xF2F5_2010;
     const TMPFS: u32 = 0x0102_1994;
     // As 32 bits: the field is narrower, and signed, on some 32-bit systems.
-    matches!(fs.f_type as u32, EXT | XFS | BTRFS | ZFS | F2FS | TMPFS)
+    match fs.f_type as u32 {
+        EXT | XFS | F2FS | TMPFS => Fs {
+            dir_times: true,
+            in_place: true,
+        },
+        BTRFS | ZFS => Fs {
+            dir_times: true,
+            in_place: false,
+        },
+        _ => Fs::default(),
+    }
 }
 
 #[cfg(target_vendor = "apple")]
-fn kept(fs: &libc::statfs) -> bool {
+fn fs_of(fs: &libc::statfs) -> Fs {
     // SAFETY: f_fstypename is a NUL-terminated name within its array.
     let name = unsafe { std::ffi::CStr::from_ptr(fs.f_fstypename.as_ptr()) };
-    name.to_bytes() == b"apfs"
+    Fs {
+        dir_times: name.to_bytes() == b"apfs",
+        in_place: false, // APFS copies on write
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-fn kept(_fs: &libc::statfs) -> bool {
-    false
+fn fs_of(_fs: &libc::statfs) -> Fs {
+    Fs::default()
+}
+
+fn kept(fs: &libc::statfs) -> bool {
+    fs_of(fs).dir_times
+}
+
+/// The file system holding `path` ([`Fs`]); nothing known when it cannot be asked.
+pub(crate) fn fs_at(path: &Path) -> Fs {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Fs::default();
+    };
+    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return Fs::default();
+    }
+    fs_of(&fs)
 }
 
 /// How many times this thread listed a store's parts: for tests.
@@ -862,6 +904,24 @@ mod tests {
         let now = 1_000 * 1_000_000_000;
         assert_eq!(trust.judge(at(4_600, 1), now), None);
         assert_eq!(trust.racy_until, now + RACY_NS);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_table_says_what_each_file_system_keeps() {
+        let of = |f_type: u32| {
+            // SAFETY: an all-zero statfs is valid.
+            let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+            fs.f_type = f_type as _;
+            let fs = fs_of(&fs);
+            (fs.dir_times, fs.in_place)
+        };
+        assert_eq!(of(0xEF53), (true, true), "ext4");
+        assert_eq!(of(0x0102_1994), (true, true), "tmpfs");
+        assert_eq!(of(0x9123_683E), (true, false), "btrfs copies on write");
+        assert_eq!(of(0x2FC1_2FC1), (true, false), "ZFS copies on write");
+        assert_eq!(of(0x6573_5546), (false, false), "FUSE");
+        assert_eq!(of(0xFE53_4D42), (false, false), "SMB2");
     }
 
     #[test]

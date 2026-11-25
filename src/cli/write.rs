@@ -154,6 +154,33 @@ fn carry_out(ctx: &mut Ctx, plan: Plan) -> Result<i32, Error> {
     }
 }
 
+/// Put back on the files a row that a routed `pop` or `popitem` took and could not print, as
+/// `setdefault` does there (`fields`: its key, then its cells): the row the store then holds for
+/// that key, or None when the store could not be read whole.
+pub(crate) fn put_back(
+    ctx: &Ctx,
+    fields: &[String],
+) -> Result<Option<(String, Vec<String>)>, Error> {
+    let store = match ctx.open(Scope::Keys(vec![fields[0].clone()]), false) {
+        Ok(store) => Some(store),
+        Err(Error::Missing(_)) => None,
+        Err(e) => return Err(e),
+    };
+    match ops::setdefault(store.as_ref(), ctx.format, &fields[0], &fields[1..]) {
+        Plan::Show { key, cells } => Ok(Some((key, cells))),
+        Plan::Put {
+            key,
+            cells,
+            record,
+            member_size,
+        } => {
+            writer(ctx, Some(member_size))?.append(std::slice::from_ref(&record))?;
+            Ok(Some((key, cells)))
+        }
+        Plan::Exit(_) | Plan::Take { .. } => Ok(None),
+    }
+}
+
 /// `pop` (§20.2): print KEY's row and append its tombstone; 3 when it is missing.
 pub(crate) fn pop(ctx: &mut Ctx) -> Result<i32, Error> {
     let requested = ctx.args.args[0].clone();
@@ -173,7 +200,13 @@ pub(crate) fn popitem(ctx: &mut Ctx) -> Result<i32, Error> {
 pub(crate) fn setdefault(ctx: &mut Ctx) -> Result<i32, Error> {
     let requested = ctx.args.args[0].clone();
     let values = ctx.args.args[1..].to_vec();
-    if is_marker_key(&requested) {
+    // A loose key is checked as a reader names it (`#_defaults_# ` is `#_defaults_#`).
+    let named = if ctx.format.strict {
+        std::borrow::Cow::Borrowed(requested.as_str())
+    } else {
+        crate::loose::lookup(&requested, ctx.format.delimiter)
+    };
+    if is_marker_key(&named) {
         diag!("tsvz: setdefault: {requested} is a marker key (§21.7.3)");
         return Ok(2);
     }

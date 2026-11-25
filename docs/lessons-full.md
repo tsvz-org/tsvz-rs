@@ -106,3 +106,127 @@ entries go last, in the same commit as the change:
   so it had to answer for every store a caller might pass, not only the ones `scrub` passes.
 - Lesson: make a function public only when a caller outside needs it; a public helper must answer for
   inputs its own callers never give it, and that answer is code and a promise to keep.
+
+## 2026-11-23 A loose file is read by TSVZ.py's line rule whole
+- Changed: tsvz-rs reads a loose file as TSVZ.py's `_processLine` does: keys and cells without the
+  whitespace at their end and decoded (`<sep>`, `<LF>`), `#_defaults_#` lines that fill the empty
+  cells after them, a key of only whitespace skipped, a row wider than the column count cut of its
+  empty end cells, the unterminated last line read; a requested key is taken without its end
+  whitespace, a missing key has no row, records print cells encoded as TSVZ.py prints them, and
+  writes encode cells so (a delimiter or newline is no longer refused). A rewrite plans from the same
+  parse, so its guard for lines "the two may read differently" went.
+- Why we had to change: 0.1.4 took TSVZ.py's column count and deletions but kept its own cell and key
+  rule, and the reviews of 0.1.4 and 0.2.0 found difference after difference between the two: six
+  ways a read differed, three edges where tsvz-rs named a key otherwise in its read, its rewrite and
+  its follow state, a delete beside a clear, and every rewrite of a file with a trailing space, a `<`
+  or a CR left uncompacted by a cautious guard.
+- Original design was wrong because: it ported the part of the other program's rule each finding
+  touched, so two half-rules met at every edge, and each edge needed state of its own (an odd-line
+  kind, a stand-in key spelling, a blank-key special case in delete) that the next review found wrong
+  in another case.
+- Lesson: when you read files another program owns and its rule is a single function, port that
+  function whole, with the other program as the test oracle, rather than the part a bug touched: the
+  edges between two rules are where the findings keep coming from.
+
+## 2026-11-23 A read begins at the last snapshot part, and a look only chooses where
+- Changed: a read of a multi-part store begins at its last snapshot part (§19.10.3); `verify` and a
+  rewrite's read replay every part. The part to begin at is chosen by a first look at each part's
+  first lines, newest first, and confirmed by the read of that part, from the lines it decodes.
+- Why we had to change: reading every part cost about 11 times as much on 20 parts of history, and
+  0.1.4's attempt, a look inside the read, decoded each part's start twice and left bzip2 out, so the
+  answer depended on the codec.
+- Original design was wrong because: the look decided where the read began, and the read trusted it;
+  making that look exact meant a second decoder held to the read's rules.
+- Lesson: when a cheap look guides an expensive read, let the look only choose and have the read
+  confirm from what it decodes anyway, falling back when it does not: the look then needs no rules of
+  its own, and cannot make the result depend on how it looked.
+
+## 2026-11-23 A stopping handler keeps its listener until its queue is written
+- Changed: a handler that stops goes on accepting connections, and closes each unread, until every
+  queued write is written; it then removes its pointer file, and only then closes its listener. A
+  `pop` or `popitem` still in flight when the stop's 5 s end is no longer cut off: the stop writes
+  its tombstone, as before, and its answer is given 5 s more to be written; the other connections
+  are cut off then, and a connection cut off begins no other request. Before, the listener closed
+  first and every connection was cut off at 5 s.
+- Why we had to change: a command that found the listener closed ran on the files, where a `pop` read
+  a row as live that a `pop` in the handler had taken and whose tombstone was still queued, so two
+  clients got one row; and a pop cut off at 5 s lost its row, whose tombstone the stop went on to
+  write (deferrals of the 0.2.0 final review, built in 0.2.1).
+- Original design was wrong because: it closed the handler's front door before the work it still
+  held was written, so the clients' fallback ran against files that did not yet show that work; and
+  it cut connections off by time alone, though the stop makes their requests' writes anyway, so for
+  a pop the cut lost the only copy of the row.
+- Lesson: a server that stops keeps telling new clients it is gone (closing them unread) until the
+  work they could race with is written, and announces it is gone only then; it never cuts off an
+  answer that is the only copy of what its own write removed, since the stop makes that write anyway.
+
+## 2026-11-23 A stop exits by whether the handler is gone
+- Changed: `tsvz stop` (and `handler::server::stop`) exits 0 once the handler's pointer file no longer
+  names it, also when another stop, a signal or the idle timeout stopped it first: a connection the
+  handler closes unread means it is stopping, and the stop waits for it as the first stop does. It
+  exits 1 when the handler is still there 30 s after the request, the wait for its answer included.
+  Before, a stop that lost the race exited 1 with "does not answer" or "went away", and every stop
+  waited at most 10 s for the handler to go and then exited 0 whether it had or not; the wait for the
+  answer had no limit.
+- Why we had to change: two stops that overlap both mean "stop it", and the handler stops; one of them
+  failed (48 of 150 overlapping pairs on 0.2.0, under 24 clients). And a stop that exits 0 is read as
+  "it is gone", which the 10 s wait did not check (0.2.0 re-review deferrals, built in 0.2.1).
+- Original design was wrong because: it reported which request had reached the handler, not the
+  outcome the operator asked for, and it ended its wait with success when its time ran out (TSVZ.py's
+  `_cliStop` does the same).
+- Lesson: a command that asks for an outcome waits for that outcome, whoever brought it about, and
+  reports a wait that runs out as not reached, never as success.
+
+## 2026-11-23 A writer checks that what it writes reads back
+- Changed: a loose `set` (and every loose write through `Writer`) refuses a cell whose encoding still holds the
+  delimiter (`-d e` and `set k hello`: `<sep>` has an `e`, so the line read back as `h<s` and `p>llo`), and a key that
+  could never be read back: one that begins with `#` (a comment), begins with a NUL (a reader drops it) or is only
+  whitespace (no key). A key alone is refused too, since in a file of one column (or with no keyed line yet) it is a
+  row; `delete` drops the names no row can have, so a delete of one writes nothing and is no failure. Before, 0.2.1's
+  build wrote all of them with exit 0.
+- Why we had to change: 0.2.0 refused any delimiter in a cell, which made a cell holding a delimiter unwritable;
+  0.2.1 encoded it as TSVZ.py does (`<sep>`) and so dropped the refusal, but the encoding itself holds the letters
+  `s e p L F < > /`, which a delimiter can be, and the keys a reader skips were written as before (0.2.0 wrote
+  them too; the whitespace key was a 0.2.1 regression, since 0.2.0 read such a key). Found by the second opinions of the
+  0.2.1 final review (R07a-1, R08-1 to R08-3), built in the fix round.
+- Original design was wrong because: the encoder was tested on the cells it was meant to carry, not on the
+  inputs the refusal it replaced had covered, and nothing asked the reader's own rule whether the line it was about to
+  write gave the key and cells back. The first fix round then exempted a key alone ("a tombstone deletes
+  nothing"), true of the file it had in mind (more than one column) and false of a file of one column, which the
+  re-review found; the exemption was a second encoding of the same promise, tried on one file shape.
+- Lesson: when a port replaces a refusal with an encoding, run the reader's own rule over the output for every input the
+  refusal covered; an encoding is a promise only as wide as the cases it was tried on.
+
+## 2026-11-23 One rule names a loose key: the reader's
+- Changed: every key a loose command names (`get`, `has`, `pop`, `setdefault`, `delete`, bulk input, a keyed
+  read) is named by `loose::name`: the cell the reader reads from the key as it is written (encoded, trimmed of the
+  whitespace at its end, decoded). `$'a\n'` names the line `a<LF>`, a blank at a key's end still goes, and a key no
+  row can have (`#x`, `</sep/>`, `-d e` and `hello`) names none. A loose write reads its own line back with
+  `loose::parse` and refuses it when the cells are not the record less that trim; that replaced three hand-written
+  lists (`unwritable`, `delimiter_in_encoding`, `unreadable_key`). Bulk input of a loose format is read with
+  `loose::parse`, setdefault's marker check names its key first, and the header drops the NULs a reader drops.
+- Why we had to change: 0.2.1's fix rounds named a key by trimming its decoded form, where the reader trims the
+  encoded cell before decoding. On a file holding rows `a` and `a<LF>`, `delete $'a\n'` deleted `a`, and `get`,
+  `has` and `pop` acted on `a` (0.2.0 refused or exited 3); `popitem` took the same row forever. The step back of
+  the second fix round's re-review found every finding of all rounds (R07a-1, R16-1, R08-1 to 3, A, B, R07a-3,
+  R10-3, F4, F5) in a copy of the reader's line rule outside the reader.
+- Original design was wrong because: each command that named a key wrote its own short form of the reader's rule
+  (a trim, a list of refusals, a comment test), each right on the cases it was tried on, and each drifted from the
+  reader on the ones it was not: a line break is whitespace once decoded but not as written.
+- Lesson: when several places must agree with a reader about what a name or a line means, give them the reader's
+  own function (encode, read back, compare) instead of a description of it; a copy of a rule is a second rule.
+
+## 2026-11-23 An optimistic check guards the property, not the stamp
+- Changed: a loose `delete` at more than one column appends its key alone to the file it read, or to that file with
+  more appended since by another writer: the writer checks the file's inode, that it is no shorter, and its last
+  4 KiB, instead of the part's stamp (inode, size, mtime). Before, any change refused the delete (three tries, then
+  `delete skipped`), and a `pop` had already printed its row.
+- Why we had to change: the stamp was added so that a `clear` between the read and the append cannot turn the key
+  alone into a one-column row; it also refused every other writer's append, which changes size and mtime, though the
+  decision (the file's column count, set by its first keyed line) is the same after an append. 0.2.0 appended
+  whatever happened; the check made a busy file harder to delete from than that.
+- Original design was wrong because: the check was written for the case that found the bug (a clear) as an equality on
+  everything the file has, not on the property the decision rested on.
+- Lesson: when a write is made only while the file is as it was read, check what the decision depended on (here: the same
+  file, no shorter, its end as it was), not a stamp of everything; a stamp refuses every change, the harmless ones
+  too, and so fails under the load it was meant to tolerate.

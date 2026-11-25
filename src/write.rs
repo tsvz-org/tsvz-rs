@@ -133,8 +133,9 @@ fn snapshot_refused(key: &str) -> Error {
     ))
 }
 
-/// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file has no
-/// escaping, so a field holding its delimiter, `\n` or `\r` is refused.
+/// Append `record` and its `\n` to `out`, encoded for `format` (§13.3). A loose file's fields are
+/// encoded as TSVZ.py writes them ([`crate::loose::sanitize`]); a record whose line would not read
+/// back as it (`loose::reads_back`) is refused.
 pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Result<(), Error> {
     let d = format.delimiter;
     let (key, values, marker) = match record {
@@ -157,17 +158,33 @@ pub fn encode_record(record: &Record, format: Format, out: &mut String) -> Resul
                 "the delimiter {d:#04x} is not one ASCII character other than a line break; nothing was written"
             )));
         }
-        for field in std::iter::once(key).chain(values) {
-            if field.bytes().any(|b| b == d || b == b'\n' || b == b'\r') {
-                return Err(Error::Refused(format!(
-                    "{field:?} holds the delimiter or a line break, which a loose file cannot hold; nothing was written"
-                )));
+        // What is written must read back as the record, less the whitespace a reader trims at a
+        // cell's end (`loose::reads_back`): the reader's own rule, so a key alone too, which in a
+        // file of one column, or with no keyed line yet, is a row. A delete never asks for a
+        // tombstone that would not ([`crate::maint::delete_loose`] names keys by that rule). A record
+        // whose values are all blank is written, and a reader reads it as a deletion at more than one
+        // column (the approved C2 rule). Each cell is written as the reader names it, without that
+        // whitespace.
+        let fields: Vec<&str> = std::iter::once(key.as_str())
+            .chain(values.iter().map(String::as_str))
+            .collect();
+        let start = out.len();
+        for (i, f) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(d as char);
             }
+            out.push_str(crate::loose::sanitize(f, d).trim_end_matches(crate::loose::py_space));
         }
-        out.push_str(key);
-        for v in values {
-            out.push(d as char);
-            out.push_str(v);
+        if let Err(cells) = crate::loose::reads_back(&out[start..], d, &fields) {
+            let read = match cells {
+                None => "nothing".to_string(),
+                Some(cells) => format!("{cells:?}"),
+            };
+            out.truncate(start);
+            return Err(Error::Refused(format!(
+                "{fields:?} would be read from a loose file as {read}: {}; nothing was written",
+                crate::loose::cause(&fields, d)
+            )));
         }
         out.push('\n');
         return Ok(());
@@ -217,7 +234,7 @@ pub struct Appended {
 }
 
 /// Whether `path` still names the file `file` is open on.
-fn names(path: &Path, file: &File) -> bool {
+pub(crate) fn names(path: &Path, file: &File) -> bool {
     use std::os::unix::fs::MetadataExt;
     let (Ok(open), Ok(named)) = (file.metadata(), std::fs::metadata(path)) else {
         return false;
@@ -227,6 +244,59 @@ fn names(path: &Path, file: &File) -> bool {
 
 fn stamp(file: &File) -> io::Result<parts::Stamp> {
     file.metadata().map(|m| parts::Stamp::of(&m))
+}
+
+/// A part as a read of it found it, for a writer that appends only while the part has only grown
+/// since: the file (its inode), how long it was, and its last bytes, as `Store::refresh` tells an
+/// append from a rewrite in place ([`crate::store::CHECK_BYTES`]). A clear, which leaves the file
+/// shorter, and a rewrite, which changes those bytes or the file, show; an append by another
+/// writer does not.
+#[derive(Debug)]
+pub(crate) struct Seen {
+    ino: u64,
+    size: u64,
+    tail: Vec<u8>,
+}
+
+impl Seen {
+    /// How `path` is now; None when it was truncated between its length and its last bytes being
+    /// read (the caller reads it again).
+    #[cfg(feature = "cli")]
+    pub(crate) fn of(path: &Path) -> io::Result<Option<Seen>> {
+        use std::os::unix::fs::MetadataExt;
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        let want = meta.len().min(crate::store::CHECK_BYTES);
+        Ok(
+            bytes_at(&file, meta.len() - want, want as usize)?.map(|tail| Seen {
+                ino: meta.ino(),
+                size: meta.len(),
+                tail,
+            }),
+        )
+    }
+
+    /// Whether `file` is the file seen, no shorter, with the bytes it ended in.
+    fn grew(&self, file: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        if meta.ino() != self.ino || meta.len() < self.size {
+            return Ok(false);
+        }
+        let at = self.size - self.tail.len() as u64;
+        Ok(bytes_at(file, at, self.tail.len())?.is_some_and(|tail| tail == self.tail))
+    }
+}
+
+/// The `len` bytes of `file` at `at`; None when it ends before them: a file that another process
+/// truncated since its length was taken is a file that changed, not an I/O error.
+fn bytes_at(file: &File, at: u64, len: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = vec![0u8; len];
+    match file.read_exact_at(&mut bytes, at) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Appends batches of records to a store's active part (§17.7).
@@ -329,6 +399,33 @@ impl Writer {
     /// before and after it: what the handler needs to tell its own appends from other writers'.
     #[doc(hidden)]
     pub fn append_at(&mut self, payload: &[u8], member_size: u64) -> Result<Appended, Error> {
+        let appended = self.append_unless_changed(payload, member_size, None)?;
+        Ok(appended.expect("appended: nothing was expected of the part"))
+    }
+
+    /// Append `records` only while the part is the file `seen` took, which has only grown since:
+    /// false, with nothing written, when it was cleared, rewritten or replaced (a loose delete
+    /// decides from the head of the file it read, which other writers' appends leave as it was).
+    #[cfg(feature = "cli")]
+    pub(crate) fn append_if_grown(
+        &mut self,
+        records: &[Record],
+        seen: &Seen,
+    ) -> Result<bool, Error> {
+        let payload = encode(records, self.format)?;
+        let appended =
+            self.append_unless_changed(payload.as_bytes(), self.member_size as u64, Some(seen))?;
+        Ok(appended.is_some())
+    }
+
+    /// [`Writer::append_at`], which writes nothing and answers None when the part under the lock is
+    /// not the file `expect` saw, grown.
+    fn append_unless_changed(
+        &mut self,
+        payload: &[u8],
+        member_size: u64,
+        expect: Option<&Seen>,
+    ) -> Result<Option<Appended>, Error> {
         // The part is locked as it was opened; when by then it is no longer the store's active
         // part (a part was started meanwhile, §17.7), or its name is another file's (it was
         // rotated away), the active part is looked up again. Only a store with no part yet is
@@ -362,7 +459,7 @@ impl Writer {
             options
                 .append(true)
                 .create(create)
-                .read(part.codec.is_none());
+                .read(part.codec.is_none() || expect.is_some());
             let file = match options.open(path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !create => {
@@ -391,27 +488,43 @@ impl Writer {
             let mut cut = None;
             let locked = (|| {
                 let before = stamp(&file).map_err(io)?;
+                if let Some(seen) = expect {
+                    if !seen.grew(&file).map_err(io)? {
+                        return Ok(None);
+                    }
+                }
+                let mut bytes = Cow::Borrowed(&bytes[..]);
                 let start = match part.codec {
                     Some(_) => before.size,
-                    None => {
+                    None if self.format.strict => {
                         cut = self.cut_torn_tail(&file, path).map_err(io)?;
                         file.metadata().map_err(io)?.len()
                     }
+                    None => {
+                        // TSVZ.py ends a loose file's unterminated last line, which it reads as a
+                        // row, before it appends.
+                        if !ends_a_line(&file, before.size).map_err(io)? {
+                            bytes = Cow::Owned([&b"\n"[..], &bytes].concat());
+                        }
+                        before.size
+                    }
                 };
                 self.write_batch(&file, path, &bytes, start)?;
-                Ok::<_, Error>((before, stamp(&file).map_err(io)?))
+                Ok::<_, Error>(Some((before, stamp(&file).map_err(io)?)))
             })();
             drop(guard);
             if let (Some(w), Some(warning)) = (&self.warn, &cut) {
                 w(warning);
             }
-            let (before, after) = locked?;
-            return Ok(Appended {
+            let Some((before, after)) = locked? else {
+                return Ok(None);
+            };
+            return Ok(Some(Appended {
                 part: part.path.clone(),
                 before,
                 after,
                 file,
-            });
+            }));
         }
         if let Some(e) = missing {
             return Err(e);
@@ -450,9 +563,8 @@ impl Writer {
         ))
     }
 
-    /// An uncommitted tail would join the first appended record, so it is cut first: TSVZ.py
-    /// does that in a store, but in a loose file it ends the last line instead, and the cut here
-    /// loses that row (docs/limitations.md). Says what was cut, as the warning to send.
+    /// An uncommitted tail would join the first appended record, so it is cut first, as TSVZ.py
+    /// does in a store (§4.3). Says what was cut, as the warning to send.
     fn cut_torn_tail(&self, file: &File, path: &Path) -> io::Result<Option<Warning>> {
         let size = file.metadata()?.len();
         if size == 0 {
@@ -474,6 +586,16 @@ impl Writer {
             ),
         }))
     }
+}
+
+/// Whether `file`, `size` bytes long, is empty or ends with a newline.
+fn ends_a_line(file: &File, size: u64) -> io::Result<bool> {
+    if size == 0 {
+        return Ok(true);
+    }
+    let mut last = [0u8; 1];
+    file.read_exact_at(&mut last, size - 1)?;
+    Ok(last[0] == b'\n')
 }
 
 fn last_newline_end(file: &File, size: u64) -> io::Result<u64> {
@@ -593,22 +715,19 @@ mod tests {
             .append_payload(b"b,2\n")
             .unwrap();
         assert_eq!(std::fs::read_to_string(&csv).unwrap(), "a,1\nb,2\n");
-        // A loose file carries no marker semantics (§19.10.2): there the line is a comment, as
-        // TSVZ.py writes it.
+        // A loose file carries no marker semantics (§19.10.2): there the line is a comment, which a
+        // payload may hold; a record is refused, since no reader would read it.
         let loose = dir.path().join("l.tsv");
         let marker = Record::Marker {
             key: "#_snapshot_#".into(),
             values: Vec::new(),
         };
-        Writer::open(&loose).unwrap().append(&[marker]).unwrap();
+        assert!(Writer::open(&loose).unwrap().append(&[marker]).is_err());
         Writer::open(&loose)
             .unwrap()
             .append_payload(b"#_snapshot_#\n")
             .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&loose).unwrap(),
-            "#_snapshot_#\n#_snapshot_#\n"
-        );
+        assert_eq!(std::fs::read_to_string(&loose).unwrap(), "#_snapshot_#\n");
     }
 
     #[test]
@@ -691,15 +810,76 @@ mod tests {
             delimiter: b',',
             strict: false,
         };
+        // A loose file's cells as TSVZ.py writes them (`_sanitize`), without the whitespace a
+        // reader trims at a cell's end: what reads back as another token is refused.
         assert_eq!(enc(d("k", &["a<b", "#c"]), loose).unwrap(), "k,a<b,#c\n");
+        assert_eq!(enc(d("k", &["a,b"]), loose).unwrap(), "k,a<sep>b\n");
+        assert_eq!(
+            enc(d("k\nl", &["a\nb<sep>", "x<LF>\r"]), loose).unwrap(),
+            "k<LF>l,a<LF>b</sep/>,x</LF/>\n"
+        );
         assert!(matches!(
-            enc(d("k", &["a,b"]), loose),
+            enc(d("k", &["a</sep/>b"]), loose),
             Err(Error::Refused(_))
         ));
-        assert!(matches!(
-            enc(d("k", &["a\nb"]), loose),
-            Err(Error::Refused(_))
-        ));
+    }
+
+    /// A loose file takes no field whose encoding holds the delimiter (`-d e`: `<sep>` has an
+    /// `e`), nor a key it could not read back.
+    #[test]
+    fn a_loose_record_that_could_not_be_read_back_is_refused() {
+        let loose = |d: u8| Format {
+            delimiter: d,
+            strict: false,
+        };
+        let data = |k: &str, v: &[&str]| Record::Data {
+            key: k.into(),
+            values: v.iter().map(|v| v.to_string()).collect(),
+        };
+        let refused = |r: Record, f: Format| matches!(enc(r, f), Err(Error::Refused(_)));
+        // The delimiter is a character of the tokens: `h` + the delimiter, or the newline `<LF>`
+        // and the token `<sep>`, which a `/` or an `L` delimiter meets in their encodings.
+        for (d, field) in [
+            (b'<', "h<"),
+            (b'>', "h>"),
+            (b's', "hs"),
+            (b'e', "he"),
+            (b'p', "hp"),
+            (b'L', "h\nh"),
+            (b'F', "h\nh"),
+            (b'/', "h<sep>"),
+        ] {
+            assert!(refused(data("k", &[field]), loose(d)), "{d} {field:?}");
+            assert!(refused(data(field, &["1"]), loose(d)), "{d} {field:?}");
+        }
+        // Any other delimiter is encoded away (`<sep>`), and a field without it is no concern.
+        assert_eq!(
+            enc(data("k", &["h,llo"]), loose(b',')).unwrap(),
+            "k,h<sep>llo\n"
+        );
+        assert_eq!(enc(data("k", &["hllo"]), loose(b'e')).unwrap(), "kehllo\n");
+        for key in ["#tag", " ", " \r", "", "\0a"] {
+            assert!(refused(data(key, &["1"]), loose(b'\t')), "{key:?}");
+            assert!(refused(data(key, &[]), loose(b'\t')), "{key:?}");
+        }
+        // `#_defaults_#` is a marker a loose file reads; any other marker is a comment there.
+        let marker = |key: &str| Record::Marker {
+            key: key.into(),
+            values: vec!["a".into()],
+        };
+        assert_eq!(
+            enc(marker("#_defaults_#"), loose(b'\t')).unwrap(),
+            "#_defaults_#\ta\n"
+        );
+        assert!(refused(marker("#_rotate_#"), loose(b'\t')));
+        // A key alone is refused as a key with a value is: in a file of one column, or with no
+        // keyed line yet, it is a row. (`maint::delete_loose` asks for no tombstone of such a key.)
+        let tomb = |key: &str| Record::Tombstone { key: key.into() };
+        for key in ["#tag", " ", "\0a"] {
+            assert!(refused(tomb(key), loose(b'\t')), "{key:?}");
+        }
+        assert!(refused(tomb("hello"), loose(b'e')));
+        assert_eq!(enc(tomb("k"), loose(b'\t')).unwrap(), "k\n");
     }
 
     #[test]
@@ -1112,6 +1292,71 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cli")]
+    #[test]
+    fn an_append_made_on_what_was_read_is_made_to_a_file_that_only_grew() {
+        // A loose delete appends its key alone only to the file it read, or that file with more
+        // appended: cleared meanwhile, with no keyed line left, the key alone would be a row.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        let seen = Seen::of(&p).unwrap().unwrap();
+        let gone = [Record::from_args("a", &[])];
+        let mut w = Writer::open(&p).unwrap();
+        // another writer appended meanwhile: the head is as it was
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"c\t3\n")
+            .unwrap();
+        assert!(w.append_if_grown(&gone, &seen).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\nc\t3\na\n");
+        // cleared, then rows of other columns written until it is as long again: not that file
+        fs::write(&p, "").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        fs::write(&p, "x\ny\nzzzzzzzzzzzzzzzzzzzz\n").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        // rewritten in place at the same length
+        fs::write(&p, "a\t1\nb\t3\n").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        // replaced by another file with the same bytes
+        fs::remove_file(&p).unwrap();
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n", "nothing written");
+        let now = Seen::of(&p).unwrap().unwrap();
+        assert!(w.append_if_grown(&gone, &now).unwrap());
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\na\n");
+    }
+
+    #[test]
+    fn bytes_beyond_the_end_of_a_file_truncated_meanwhile_are_none_not_an_error() {
+        // `Seen::of` and `grew` take a length, then read the bytes before it: another process
+        // may truncate the file between the two.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        let file = File::open(&p).unwrap();
+        assert_eq!(bytes_at(&file, 4, 4).unwrap().unwrap(), b"b\t2\n");
+        fs::write(&p, "a\t1\n").unwrap(); // the same inode, shorter
+        assert_eq!(bytes_at(&file, 4, 4).unwrap(), None);
+        assert_eq!(bytes_at(&file, 0, 0).unwrap().unwrap(), b"");
+    }
+
+    #[test]
+    fn a_loose_files_unterminated_last_line_is_ended_before_an_append() {
+        // TSVZ.py reads it as a row, and ends it before it appends; a store's is cut (§4.3).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2").unwrap();
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("c", &["3".into()])])
+            .unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\nc\t3\n");
+    }
+
     #[test]
     fn loose_writer_with_a_delimiter() {
         let dir = tempfile::tempdir().unwrap();
@@ -1120,11 +1365,9 @@ mod tests {
         w.append(&[Record::from_args("k", &["a\tb".into()])])
             .unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
-        assert!(
-            w.append(&[Record::from_args("k", &["x;y".into()])])
-                .is_err()
-        );
-        assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
+        w.append(&[Record::from_args("k", &["x;y".into()])])
+            .unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\nk;x<sep>y\n");
     }
 
     #[test]
@@ -1151,5 +1394,152 @@ mod tests {
             "stripping is off"
         );
         assert_eq!(name_key("k\t", b'\t', true, live), "k\t");
+    }
+}
+
+/// The loose writer's rule against the reader's, over many records (the 0.2.1 re-review's
+/// property check, rr021b): a record is written exactly when its line, encoded as TSVZ.py
+/// encodes it, reads back ([`crate::loose::parse`]) as its fields less the whitespace at their
+/// ends; and what is written reads back so.
+#[cfg(test)]
+mod loose_round_trip {
+    use super::*;
+    use crate::loose::{parse, py_space, sanitize};
+
+    #[rustfmt::skip]
+    const ATOMS: &[&str] = &[
+        "a", "e", "s", "p", "L", "F", "<", ">", "/", "#", "_", "\0", " ", "\t", "\n", "\r",
+        "<sep>", "<LF>", "</sep/>", "</LF/>", "#_defaults_#", "\u{1c}", "\u{a0}", ",", "x",
+    ];
+    const DS: &[u8] = b"\t,e</#>L \0s_x";
+
+    /// The cells `line` reads back as equal `fields` less some whitespace at their ends.
+    fn same(line: &str, d: u8, fields: &[String]) -> bool {
+        parse(line, d, true).is_some_and(|cells| {
+            cells.len() == fields.len()
+                && cells.iter().zip(fields).all(|(c, f)| {
+                    f.strip_prefix(&**c)
+                        .is_some_and(|r| r.chars().all(py_space))
+                })
+        })
+    }
+
+    fn check(fields: &[String], d: u8, bad: &mut Vec<String>) {
+        let rec = if fields.len() == 1 {
+            Record::Tombstone {
+                key: fields[0].clone(),
+            }
+        } else {
+            Record::Data {
+                key: fields[0].clone(),
+                values: fields[1..].to_vec(),
+            }
+        };
+        let raw: Vec<String> = fields.iter().map(|f| sanitize(f, d).into_owned()).collect();
+        let readable = same(&raw.join(&(d as char).to_string()), d, fields);
+        let mut out = String::new();
+        let format = Format {
+            delimiter: d,
+            strict: false,
+        };
+        let written = encode_record(&rec, format, &mut out).is_ok();
+        let reads = written && same(out.strip_suffix('\n').unwrap_or(&out), d, fields);
+        if written != readable || written != reads || (!written && !out.is_empty()) {
+            bad.push(format!("{:?} {fields:?} written={written}", d as char));
+        }
+    }
+
+    /// A fixed table that shares nothing with `parse`: the line each record must write in a loose
+    /// file, or None for the refusal. Each row was read by TSVZ.py 5.18 (`readTSV`, whose
+    /// `_processLine` splits, strips and decodes a line): a written line gives back its cells; a
+    /// refused one is read as a comment (`#tag`), skipped (`" "`), as `<sep>` (`</sep/>`), or as
+    /// three cells (`-d e`, `hello`).
+    #[test]
+    fn a_loose_write_is_what_tsvz_py_reads_back() {
+        #[rustfmt::skip]
+        let table: &[(u8, &[&str], Option<&str>)] = &[
+            (b'\t', &["a", "1"], Some("a\t1\n")),
+            (b'\t', &["a ", "5 "], Some("a\t5\n")),
+            (b'\t', &["a\n", "1"], Some("a<LF>\t1\n")),
+            (b'\t', &["a<sep>", "1"], Some("a</sep/>\t1\n")),
+            (b'\t', &["a", "b\tc"], Some("a\tb<sep>c\n")),
+            (b'\t', &["#_defaults_#", "P"], Some("#_defaults_#\tP\n")),
+            (b'\t', &["k"], Some("k\n")),
+            (b'\t', &["k", "x", "a"], Some("k\tx\ta\n")),
+            (b'e', &["k", "hllo"], Some("kehllo\n")),
+            (b'#', &["#tag"], Some("<sep>tag\n")),
+            (b' ', &[" "], Some("<sep>\n")),
+            (b'\t', &["#tag", "1"], None),
+            (b'\t', &[" ", "1"], None),
+            (b'\t', &["k", "</sep/>"], None),
+            (b'e', &["k", "hello"], None),
+        ];
+        for &(d, fields, line) in table {
+            let rec = match fields {
+                [key] => Record::Tombstone {
+                    key: key.to_string(),
+                },
+                [key, values @ ..] => Record::Data {
+                    key: key.to_string(),
+                    values: values.iter().map(|v| v.to_string()).collect(),
+                },
+                [] => unreachable!(),
+            };
+            let format = Format {
+                delimiter: d,
+                strict: false,
+            };
+            let mut out = String::new();
+            let written = encode_record(&rec, format, &mut out);
+            match line {
+                Some(line) => assert!(written.is_ok() && out == line, "{fields:?}: {out:?}"),
+                None => assert!(written.is_err() && out.is_empty(), "{fields:?}: {out:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_loose_write_is_refused_exactly_when_it_would_not_read_back() {
+        let mut bad = Vec::new();
+        let mut keys = vec![String::new()];
+        for _ in 0..3 {
+            let next: Vec<String> = keys
+                .iter()
+                .flat_map(|k| ATOMS.iter().map(move |a| format!("{k}{a}")))
+                .collect();
+            keys.extend(next);
+            keys.sort();
+            keys.dedup();
+        }
+        for &d in DS {
+            for k in &keys {
+                check(std::slice::from_ref(k), d, &mut bad);
+            }
+        }
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..300_000 {
+            let d = DS[(next() % DS.len() as u64) as usize];
+            let n = 1 + (next() % 4) as usize;
+            let fields: Vec<String> = (0..n)
+                .map(|_| {
+                    (0..next() % 5)
+                        .map(|_| ATOMS[(next() % ATOMS.len() as u64) as usize])
+                        .collect()
+                })
+                .collect();
+            check(&fields, d, &mut bad);
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(20)]
+        );
     }
 }

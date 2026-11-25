@@ -143,6 +143,12 @@ impl Framer {
         &self.pending
     }
 
+    /// Whether the uncommitted bytes are line 1 of a part that began with a byte-order mark, which
+    /// the framer removed.
+    pub fn tail_after_bom(&self) -> bool {
+        self.bom && self.number == 0
+    }
+
     /// The offset just after the last committed line.
     pub fn committed(&self) -> u64 {
         self.committed

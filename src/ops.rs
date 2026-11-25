@@ -5,6 +5,7 @@
 //! `setdefault` only decide: they return a [`Plan`] their caller carries out, the command line
 //! with a `Writer`, the handler through its writer thread.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::escape::{self, is_marker_key};
@@ -235,6 +236,7 @@ pub fn setdefault(
     };
     let key = match store {
         Some(s) => s.lookup_key(requested).into_owned(),
+        None if !format.strict => crate::loose::lookup(requested, format.delimiter).into_owned(),
         None => name_key(requested, format.delimiter, strip, |_| false).into_owned(),
     };
     if let Some(row) = store.and_then(|s| s.get(&key)) {
@@ -307,8 +309,9 @@ pub fn delete_records(
 
 /// Records read from bulk input in `format` (§20.3.1, §21.7.2): a line is a record; a marker
 /// key is a marker line; a comment, an empty line or an empty key is skipped; a key alone is a
-/// tombstone. With `keys_only` (`delete -`) only the first field counts. An unterminated last
-/// line is ignored with a warning naming `source`.
+/// tombstone. A loose line is read as a reader reads it ([`crate::loose::parse`]). With
+/// `keys_only` (`delete -`) only the first field counts. An unterminated last line is ignored
+/// with a warning naming `source`.
 pub fn parse_records(
     input: &[u8],
     format: Format,
@@ -317,23 +320,43 @@ pub fn parse_records(
     warn: Option<&WarnFn>,
 ) -> Vec<Record> {
     let d = format.delimiter;
-    let decode = |f: &str| {
-        if format.strict {
-            escape::decode(f, d).into_owned()
-        } else {
-            f.to_string()
-        }
-    };
+    let decode = |f: &str| escape::decode(f, d).into_owned();
     let mut records = Vec::new();
     let mut framer = Framer::new();
     framer.push(input, &mut |line| {
         let text = String::from_utf8_lossy(line.text());
+        if !format.strict {
+            // A loose line is read as a reader reads it (`loose::parse`): a comment, an empty line
+            // or an empty key is nothing, a `#_defaults_#` line is a record. A first field that
+            // begins with `#` and is not exactly `#_defaults_#` is skipped, even where a reader
+            // reads the line as defaults (docs/silent-choices.md).
+            let first = text.split(d as char).next().unwrap_or("");
+            if first.starts_with('#') && first != crate::loose::DEFAULTS {
+                return true;
+            }
+            let Some(cells) = crate::loose::parse(&text, d, true) else {
+                return true;
+            };
+            let mut cells = cells.into_iter().map(Cow::into_owned);
+            let key = cells.next().unwrap_or_default();
+            let values: Vec<String> = if keys_only {
+                Vec::new()
+            } else {
+                cells.collect()
+            };
+            records.push(if values.is_empty() {
+                Record::Tombstone { key }
+            } else {
+                Record::Data { key, values }
+            });
+            return true;
+        }
         if text.is_empty() {
             return true;
         }
         let mut fields = text.split(d as char);
         let first = fields.next().unwrap_or("");
-        let marker = format.strict && is_marker_key(first);
+        let marker = is_marker_key(first);
         if first.starts_with('#') && !marker {
             return true; // a comment
         }
@@ -393,8 +416,8 @@ pub fn protocol_record(record: &Record) -> Result<String, Error> {
 }
 
 /// Append one row as a record line to `buf`: the key (`<#>` for a leading `#`), then its cells,
-/// joined by `delimiter` and ended by `\n`. Strict variants are §13-encoded; a loose file's
-/// cells are written as they are (§20.4.4).
+/// joined by `delimiter` and ended by `\n`. Strict variants are §13-encoded; a loose file's are
+/// encoded as TSVZ.py's command line prints them (`_sanitize`, §20.4.4).
 pub fn record_line<'a>(
     buf: &mut String,
     key: &str,
@@ -405,14 +428,14 @@ pub fn record_line<'a>(
     if strict {
         escape::encode_into(buf, key, delimiter, true);
     } else {
-        buf.push_str(key);
+        buf.push_str(&crate::loose::sanitize(key, delimiter));
     }
     for cell in cells {
         buf.push(delimiter as char);
         if strict {
             escape::encode_into(buf, cell, delimiter, false);
         } else {
-            buf.push_str(cell);
+            buf.push_str(&crate::loose::sanitize(cell, delimiter));
         }
     }
     buf.push('\n');
@@ -710,6 +733,32 @@ mod tests {
                 Record::Marker {
                     key: "#_defaults_#".into(),
                     values: vec![]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn loose_bulk_input_skips_the_hash_lines_tsvz_py_skips() {
+        // Bulk input keeps only the exact `#_defaults_#` of the `#` lines: a reader would read
+        // `#_defaults_# ` as a defaults line and `#_defaults_#x` as a row, and bulk input writes
+        // neither (docs/silent-choices.md).
+        let tsv = Format {
+            delimiter: b'\t',
+            strict: false,
+        };
+        let input = b"#_defaults_# \tP\n#_defaults_#x\t1\n#c\t1\n#_defaults_#\tP\na\tx\n";
+        let got = parse_records(input, tsv, false, Path::new("-"), None);
+        assert_eq!(
+            got,
+            [
+                Record::Data {
+                    key: "#_defaults_#".into(),
+                    values: strings(&["P"])
+                },
+                Record::Data {
+                    key: "a".into(),
+                    values: strings(&["x"])
                 },
             ]
         );

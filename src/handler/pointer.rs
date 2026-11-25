@@ -78,16 +78,20 @@ fn read(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{} is not a regular file ({e})", path.display())),
     };
-    let meta = file
+    let kind = file
         .metadata()
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    if !meta.is_file() {
+    if !kind.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
     let mut data = Vec::new();
     Read::by_ref(&mut file)
         .take(SIZE_LIMIT + 1)
         .read_to_end(&mut data)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // Taken after the read, so that a pointer removed while it was read has no name left in it.
+    let meta = file
+        .metadata()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if data.len() as u64 > SIZE_LIMIT {
         return Err(format!(
@@ -126,8 +130,9 @@ fn store_owner(store: &Path) -> Option<u32> {
 }
 
 /// The pointer file of `store`, checked as §21.2.4 says: Ok(None) when there is no usable
-/// pointer file and nothing to report (none, not of this protocol, or incomplete); Err with why
-/// one that exists is not trusted (a client warns, §20.8.2).
+/// pointer file and nothing to report (none, not of this protocol, incomplete, or removed as it
+/// was read: its handler stopped); Err with why one that exists is not trusted (a client warns,
+/// §20.8.2).
 pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
     let path = path_of(store);
     let mut found = None;
@@ -149,6 +154,46 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
     let Some((fields, meta)) = found else {
         return Ok(None);
     };
+    trust(store, &path, fields, &meta)
+}
+
+/// Whether `store`'s pointer file still names the handler with process id `pid`. One that cannot
+/// be read or is not trusted says nothing of the handler, so it counts as still naming it.
+pub fn names_handler(store: &Path, pid: &str) -> bool {
+    match lookup(store) {
+        Ok(None) => false,
+        Ok(Some(now)) => now.pid == pid,
+        Err(_) => true,
+    }
+}
+
+/// Wait until the pointer file of `store` no longer names the handler with process id `pid`,
+/// which a handler removes once every write it acknowledged is written; false when `deadline`
+/// comes first.
+pub fn wait_gone(store: &Path, pid: &str, deadline: Instant) -> bool {
+    while names_handler(store, pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// Whether the pointer file at `path`, read as `fields` with `meta` (its open file's), may be used
+/// (§21.2.4): its handler's [`Info`], Ok(None) when it names no handler, or why it is not trusted.
+fn trust(
+    store: &Path,
+    path: &Path,
+    fields: HashMap<String, String>,
+    meta: &std::fs::Metadata,
+) -> Result<Option<Info>, String> {
+    if meta.nlink() == 0 {
+        // Removed before `meta` was taken, after the file was read: its handler has stopped, as if
+        // there were none. A removal after that is not seen: the socket it names is gone or
+        // refuses, which a client reports as a handler that does not answer.
+        return Ok(None);
+    }
     // SAFETY: geteuid only reads the process's user id.
     let me = unsafe { libc::geteuid() };
     if meta.uid() != me && Some(meta.uid()) != store_owner(store) {
@@ -164,7 +209,7 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
             path.display()
         ));
     }
-    if meta.nlink() != 1 {
+    if meta.nlink() > 1 {
         // Its owner wrote it, but not necessarily here: anyone may link a file they can see.
         return Err(format!(
             "{} has another name (a hard link), so its owner may not have put it there",
@@ -690,6 +735,46 @@ mod tests {
         assert!(lookup(&s).unwrap_err().contains("hard link"));
         fs::remove_file(&other).unwrap();
         assert!(lookup(&s).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pointer_removed_after_it_was_opened_names_no_handler() {
+        // A stopping handler removes its pointer file: a client that read it just before finds it
+        // with no name left, which is no handler, not a second name (a hard link). `trust` is given
+        // the open file's metadata as `read` takes it, after the read.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        plant(&s, &text("unix:/x/s", &hostname()), 0o644);
+        let file = open_pointer(&path_of(&s)).unwrap();
+        fs::remove_file(path_of(&s)).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.nlink(), 0);
+        let fields = [("address", "unix:/x/s"), ("host", hostname().as_str())]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(trust(&s, &path_of(&s), fields, &meta), Ok(None));
+    }
+
+    #[test]
+    fn a_pointer_that_cannot_be_trusted_still_names_its_handler() {
+        // Only a pointer file that is gone, or names another process, says the handler stopped.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        plant(&s, &text("unix:/x/s", &hostname()), 0o644);
+        assert!(names_handler(&s, "1"));
+        assert!(!names_handler(&s, "2"));
+        plant(&s, &text("unix:/x/s", &hostname()), 0o620);
+        assert!(lookup(&s).is_err());
+        assert!(names_handler(&s, "1"), "a pointer not trusted is no sign");
+        let soon = Instant::now() + Duration::from_millis(120);
+        assert!(
+            !wait_gone(&s, "1", soon),
+            "it still names it at the deadline"
+        );
+        fs::remove_file(path_of(&s)).unwrap();
+        assert!(!names_handler(&s, "1"));
+        assert!(wait_gone(&s, "1", soon));
     }
 
     #[test]

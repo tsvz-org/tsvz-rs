@@ -1,6 +1,7 @@
 //! Compressed parts (§16): decoding members, the damaged-member rules of §16.6, and (Task 6) encoding.
 
 use std::borrow::Cow;
+use std::io;
 
 use crate::name::Codec;
 
@@ -17,13 +18,15 @@ pub enum Alone {
 /// from a buffer it reuses; `items` collects owned copies.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Item<'a> {
-    /// A complete member's output.
+    /// The output of a member that passed its check: all of it, or a page of it from a part
+    /// reader that keeps less than the member's output ([`read_items`]).
     Data(Cow<'a, [u8]>),
     /// A member cut short: its output is used, with a warning.
     CutShort { offset: usize, out: Cow<'a, [u8]> },
     /// A corrupt member: the policy in force decides what happens to `out` (§4.10).
     Corrupt { offset: usize, out: Cow<'a, [u8]> },
-    /// A damaged member ended here: the unfinished line before this point is dropped.
+    /// A damaged member ended here, with another member after it or at the part's end: the
+    /// unfinished line before this point is dropped.
     Break,
 }
 
@@ -324,6 +327,7 @@ impl GzipDecoder {
     }
 }
 
+#[cfg(test)]
 enum Judged {
     Complete(usize),
     Short,
@@ -331,6 +335,7 @@ enum Judged {
 }
 
 /// Decode the member at the start of `data` into `out`, which is cleared first.
+#[cfg(test)]
 fn member_into(codec: Codec, data: &[u8], out: &mut Vec<u8>) -> Judged {
     out.clear();
     match Decoder::new(codec).feed(data, out) {
@@ -455,98 +460,252 @@ pub fn gzip_keep(region: &[u8]) -> usize {
     }
 }
 
-/// A compressed part's bytes as items for the framer (§16.6), one at a time: `each` gets every
-/// item as it is found and returns false to stop. Mirrors `decompress_items` in the runner, but
-/// holds one member's output at a time, in a buffer reused from member to member, so a part of
-/// many small members costs its largest member, not their sum.
-pub fn for_each_item(codec: Codec, data: &[u8], each: &mut dyn FnMut(Item<'_>) -> bool) {
-    let magic = codec.magic();
-    let mut buf = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        if codec == Codec::Gzip && data[pos] == 0 {
-            pos += data[pos..].iter().take_while(|&&b| b == 0).count(); // padding before a member
-            continue;
-        }
-        if let Judged::Complete(end) = member_into(codec, &data[pos..], &mut buf) {
-            if !each(Item::Data(Cow::Borrowed(&buf))) {
-                return;
+/// Where a compressed part's bytes are read from: at an offset, so that a member can be read
+/// again from its start (a file, or bytes in memory).
+pub(crate) trait Source {
+    /// Read into `buf` from `offset`: how many bytes were read, 0 at the end.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+impl Source for [u8] {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let rest = self.get(offset as usize..).unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        Ok(n)
+    }
+}
+
+impl Source for std::fs::File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        loop {
+            match std::os::unix::fs::FileExt::read_at(self, buf, offset) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => return other,
             }
-            pos += end.max(1);
+        }
+    }
+}
+
+/// How many compressed bytes are read at a time: what `decode_alone` feeds a decoder in one call.
+const PAGE: usize = 1 << 16;
+
+/// How the member at a position ended, judged by decoding it.
+enum Verdict {
+    /// It passed its check: this many bytes long, and whether its output was all kept.
+    Complete(u64, bool),
+    /// It is damaged: cut short, or not valid (§16.6 rule 2).
+    Damaged,
+}
+
+/// The items of the compressed part read from `src` (§16.6), one at a time: `each` gets every item
+/// as it is found and returns false to stop. Mirrors `decompress_items` in the runner, but reads
+/// the part a page at a time and holds one member's output at a time, in a buffer reused from
+/// member to member, so a part costs its largest member's output, not the part. A member whose
+/// output passes `keep` bytes is judged without keeping it, and once it has passed its check it is
+/// decoded again and given a page at a time (several `Item::Data`): a read that stops early, at a
+/// part's first lines, then costs the time of decoding the member to its check and holds about
+/// `keep` whatever the member's size, plus what one input page decodes to before the next check
+/// (a decoder takes the whole page): by the formats' best ratios up to 64 MiB for deflate (1032 to
+/// one) and 2 GiB for zstd (a 128 KiB run-length block in 4 bytes), which only crafted input
+/// reaches (docs/limitations.md). Only a damaged member's bytes, which run to the next member
+/// start (rule 2), are held whole.
+pub(crate) fn read_items<S: Source + ?Sized>(
+    codec: Codec,
+    src: &S,
+    keep: usize,
+    each: &mut dyn FnMut(Item<'_>) -> bool,
+) -> io::Result<()> {
+    let mut page = vec![0u8; PAGE];
+    let mut buf = Vec::new();
+    let mut pos = 0u64;
+    loop {
+        if codec == Codec::Gzip {
+            pos = past_zeros(src, pos, &mut page)?; // padding before a member
+        }
+        let verdict = match judge(codec, src, pos, keep, &mut page, &mut buf)? {
+            None => return Ok(()), // the part ends here
+            Some(v) => v,
+        };
+        if let Verdict::Complete(len, kept) = verdict {
+            if kept {
+                if !each(Item::Data(Cow::Borrowed(&buf))) {
+                    return Ok(());
+                }
+            } else {
+                match redecode(codec, src, pos, len, &mut page, &mut buf, each)? {
+                    Redone::Whole => {}
+                    Redone::Stopped => return Ok(()),
+                    // The bytes ended sooner than they did a moment ago (a failed batch cut back
+                    // from the active part, which a reader holds no lock against): what was given
+                    // is what is left of the member, and its unfinished line goes.
+                    Redone::Cut => {
+                        let cut = Item::CutShort {
+                            offset: pos as usize,
+                            out: Cow::Borrowed(&[]),
+                        };
+                        if !each(cut) || !each(Item::Break) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            pos += len.max(1);
             continue;
         }
         // A damaged member's bytes run to the next member start, complete or not (rule 2).
-        let following = memchr::memmem::find(&data[pos + 1..], magic).map(|i| pos + 1 + i);
-        let mut region = &data[pos..following.unwrap_or(data.len())];
-        if codec == Codec::Gzip {
-            region = &region[..gzip_keep(region)];
+        let following = find_magic(src, pos + 1, codec.magic(), &mut page)?;
+        let mut region = Vec::new();
+        let end = following.unwrap_or(u64::MAX);
+        let mut at = pos;
+        while at < end {
+            let want = PAGE.min((end - at).try_into().unwrap_or(PAGE));
+            let n = src.read_at(&mut page[..want], at)?;
+            if n == 0 {
+                break;
+            }
+            region.extend_from_slice(&page[..n]);
+            at += n as u64;
         }
-        let item = match decode_alone(codec, region) {
+        if codec == Codec::Gzip {
+            region.truncate(gzip_keep(&region));
+        }
+        let offset = pos as usize;
+        let item = match decode_alone(codec, &region) {
             Alone::Short(out) => Item::CutShort {
-                offset: pos,
+                offset,
                 out: Cow::Owned(out),
             },
             Alone::Corrupt(out) => Item::Corrupt {
-                offset: pos,
+                offset,
                 out: Cow::Owned(out),
             },
         };
         if !each(item) {
-            return;
+            return Ok(());
+        }
+        // The member's unfinished last line goes with it (a break after it, where another member
+        // follows or not).
+        if !each(Item::Break) {
+            return Ok(());
         }
         match following {
-            Some(next) => {
-                if !each(Item::Break) {
-                    return;
-                }
-                pos = next;
-            }
-            None => break,
+            Some(next) => pos = next,
+            None => return Ok(()),
         }
     }
 }
 
-/// How [`for_each_complete_member`] ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Walk {
-    /// `each` stopped it, or the bytes ran out at the end of a member.
-    Done,
-    /// A member runs past the bytes: with the rest of the part it may complete.
-    Short,
-    /// A member is not valid: no bytes after those given can change that.
-    Bad,
+/// The first position from `pos` that holds no zero byte.
+fn past_zeros<S: Source + ?Sized>(src: &S, mut pos: u64, page: &mut [u8]) -> io::Result<u64> {
+    loop {
+        let n = src.read_at(page, pos)?;
+        let zeros = page[..n].iter().take_while(|&&b| b == 0).count();
+        pos += zeros as u64;
+        if zeros < n || n == 0 {
+            return Ok(pos);
+        }
+    }
 }
 
-/// The members at the start of `data` that complete (§16.6 rule 1), each as the bytes it decodes
-/// to, until `each` returns false or a member does not complete. For a look at the start of a
-/// part, where `data` is only a prefix of it: unlike `for_each_item` it never splits a member that
-/// does not complete at a codec magic found inside it (§16.6 rule 2), since that member may
-/// complete in the rest of the part and the magic be bytes of its own. It says which kind of end
-/// the member that did not complete has: only `Bad` is settled.
-pub(crate) fn for_each_complete_member(
+/// Decode the member at `pos` to judge it, its output in `out` while it is no longer than `keep`
+/// bytes; None when the part ends at `pos`.
+fn judge<S: Source + ?Sized>(
     codec: Codec,
-    data: &[u8],
-    each: &mut dyn FnMut(&[u8]) -> bool,
-) -> Walk {
-    let mut buf = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        if codec == Codec::Gzip && data[pos] == 0 {
-            pos += data[pos..].iter().take_while(|&&b| b == 0).count(); // padding before a member
-            continue;
+    src: &S,
+    pos: u64,
+    keep: usize,
+    page: &mut [u8],
+    out: &mut Vec<u8>,
+) -> io::Result<Option<Verdict>> {
+    let mut decoder = Decoder::new(codec);
+    out.clear();
+    let mut kept = true;
+    let mut at = pos;
+    loop {
+        let n = src.read_at(page, at)?;
+        if n == 0 {
+            return Ok((at > pos).then_some(Verdict::Damaged)); // cut short, or the end
         }
-        match member_into(codec, &data[pos..], &mut buf) {
-            Judged::Complete(end) => {
-                if !each(&buf) {
-                    return Walk::Done;
-                }
-                pos += end.max(1);
-            }
-            Judged::Short => return Walk::Short,
-            Judged::Bad => return Walk::Bad,
+        match decoder.feed(&page[..n], out) {
+            Err(()) => return Ok(Some(Verdict::Damaged)),
+            Ok((used, true)) => return Ok(Some(Verdict::Complete(at + used as u64 - pos, kept))),
+            // A decoder that takes less than it was given and has not ended takes no more.
+            Ok((used, false)) if used < n => return Ok(Some(Verdict::Damaged)),
+            Ok(_) => at += n as u64,
+        }
+        if out.len() > keep {
+            kept = false;
+            out.clear();
         }
     }
-    Walk::Done
+}
+
+/// How [`redecode`] ended.
+enum Redone {
+    /// The member decoded to its end again.
+    Whole,
+    /// `each` stopped.
+    Stopped,
+    /// The bytes no longer decode as they did: the part was rewritten meanwhile.
+    Cut,
+}
+
+/// Decode again the member at `pos`, `len` bytes that passed their check, giving its output to
+/// `each` a page at a time.
+fn redecode<S: Source + ?Sized>(
+    codec: Codec,
+    src: &S,
+    pos: u64,
+    len: u64,
+    page: &mut [u8],
+    out: &mut Vec<u8>,
+    each: &mut dyn FnMut(Item<'_>) -> bool,
+) -> io::Result<Redone> {
+    let mut decoder = Decoder::new(codec);
+    let mut at = pos;
+    while at < pos + len {
+        let want = (pos + len - at).min(page.len() as u64) as usize;
+        let n = src.read_at(&mut page[..want], at)?;
+        out.clear();
+        let fed = decoder.feed(&page[..n], out);
+        if !out.is_empty() && !each(Item::Data(Cow::Borrowed(out))) {
+            return Ok(Redone::Stopped);
+        }
+        match fed {
+            Ok((used, false)) if n > 0 && used == n => at += n as u64,
+            Ok((_, true)) => return Ok(Redone::Whole),
+            _ => return Ok(Redone::Cut),
+        }
+    }
+    Ok(if len == 0 { Redone::Whole } else { Redone::Cut })
+}
+
+/// Where `magic` next begins at or after `from`, read a page at a time.
+fn find_magic<S: Source + ?Sized>(
+    src: &S,
+    from: u64,
+    magic: &[u8],
+    page: &mut [u8],
+) -> io::Result<Option<u64>> {
+    let overlap = magic.len() - 1;
+    let mut at = from;
+    loop {
+        let n = src.read_at(page, at)?;
+        if let Some(i) = memchr::memmem::find(&page[..n], magic) {
+            return Ok(Some(at + i as u64));
+        }
+        if n <= overlap {
+            return Ok(None);
+        }
+        at += (n - overlap) as u64;
+    }
+}
+
+/// A compressed part's bytes as items for the framer (§16.6), one at a time: `each` gets every
+/// item as it is found and returns false to stop. Every member's output is one `Item::Data`.
+pub fn for_each_item(codec: Codec, data: &[u8], each: &mut dyn FnMut(Item<'_>) -> bool) {
+    read_items(codec, data, usize::MAX, each).expect("bytes in memory read without error");
 }
 
 /// All the items of a compressed part, owned (`for_each_item` streams them instead).
@@ -796,67 +955,6 @@ mod tests {
     }
 
     #[test]
-    fn the_complete_members_at_the_start_and_how_the_walk_ends() {
-        for codec in codecs() {
-            let (a, b) = (fixture(codec, b"a\tx\n"), fixture(codec, b"b\ty\n"));
-            let walk = |data: &[u8], stop_after: usize| {
-                let mut seen = Vec::new();
-                let end = for_each_complete_member(codec, data, &mut |out| {
-                    seen.push(out.to_vec());
-                    seen.len() < stop_after
-                });
-                (seen, end)
-            };
-            let two = [a.clone(), b.clone()].concat();
-            let one = |s: &[u8]| vec![s.to_vec()];
-            assert_eq!(walk(&[], 9), (vec![], Walk::Done), "{codec:?}");
-            assert_eq!(walk(&a, 9), (one(b"a\tx\n"), Walk::Done), "{codec:?}");
-            assert_eq!(
-                walk(&two, 9),
-                (vec![b"a\tx\n".to_vec(), b"b\ty\n".to_vec()], Walk::Done),
-                "{codec:?}"
-            );
-            assert_eq!(
-                walk(&two, 1),
-                (one(b"a\tx\n"), Walk::Done),
-                "stopped {codec:?}"
-            );
-            // A member that does not complete ends the walk, whatever follows it: cut short, with
-            // a magic after it (which `for_each_item` would take for the next member's start) or
-            // none, or not valid.
-            let mut cut = a[..a.len() - 3].to_vec();
-            assert_eq!(walk(&cut, 9), (vec![], Walk::Short), "{codec:?}");
-            cut.extend(&b);
-            assert_ne!(walk(&cut, 9).1, Walk::Done, "{codec:?}");
-            let mut early = b.clone();
-            early.extend(&a[..a.len() - 3]);
-            early.extend(&b);
-            let (seen, end) = walk(&early, 9);
-            assert_eq!(
-                (seen, end != Walk::Done),
-                (one(b"b\ty\n"), true),
-                "{codec:?}"
-            );
-            let mut bad = a.clone();
-            bad[0] ^= 1;
-            assert_eq!(walk(&bad, 9), (vec![], Walk::Bad), "{codec:?}");
-            let mut after = a.clone();
-            after.extend(&bad);
-            assert_eq!(walk(&after, 9), (one(b"a\tx\n"), Walk::Bad), "{codec:?}");
-        }
-        // gzip's zero padding between members is skipped
-        let mut padded = vec![0u8; 5];
-        padded.extend(fixture(Codec::Gzip, b"a\tx\n"));
-        padded.extend([0u8; 9]);
-        let mut seen = Vec::new();
-        let walk = for_each_complete_member(Codec::Gzip, &padded, &mut |out| {
-            seen.push(out.to_vec());
-            true
-        });
-        assert_eq!((seen, walk), (vec![b"a\tx\n".to_vec()], Walk::Done));
-    }
-
-    #[test]
     fn a_cut_short_member_before_another() {
         for codec in codecs() {
             let first = fixture(codec, &b"k\tvalue\n".repeat(200));
@@ -870,6 +968,233 @@ mod tests {
             );
             assert_eq!(got[1], Item::Break);
             assert_eq!(got[2], Item::Data(b"z\t1\n".to_vec().into()));
+        }
+    }
+
+    /// Bytes in memory read through a part reader, counting how far it read.
+    struct Counting<'a> {
+        data: &'a [u8],
+        reached: std::cell::Cell<u64>,
+    }
+
+    impl Source for Counting<'_> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            let n = self.data.read_at(buf, offset)?;
+            self.reached.set(self.reached.get().max(offset + n as u64));
+            Ok(n)
+        }
+    }
+
+    /// A part that shrinks once its first member has passed its check: from the `shrink_at`th read
+    /// from its start on, that member has only its first `cut` bytes (a failed batch cut back from
+    /// the active part while a reader holds no lock).
+    struct Shrinking<'a> {
+        data: &'a [u8],
+        first: usize,
+        cut: usize,
+        shrink_at: usize,
+        starts: std::cell::Cell<usize>,
+    }
+
+    impl Source for Shrinking<'_> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            if offset == 0 {
+                self.starts.set(self.starts.get() + 1);
+            }
+            let shrunk = self.starts.get() >= self.shrink_at && (offset as usize) < self.first;
+            self.data[..if shrunk { self.cut } else { self.data.len() }].read_at(buf, offset)
+        }
+    }
+
+    #[test]
+    fn a_damaged_member_ends_with_a_break_also_when_it_is_the_last() {
+        // Its unfinished last line goes: nothing follows to join it to, and a reader must not
+        // take it for a line of its own.
+        for codec in codecs() {
+            let whole = fixture(codec, &b"k\tvalue\n".repeat(200));
+            let got = items(codec, &whole[..whole.len() / 2]);
+            assert_eq!(got.len(), 2, "{codec:?}: {got:?}");
+            assert!(
+                matches!(&got[0], Item::CutShort { offset: 0, .. }),
+                "{codec:?}"
+            );
+            assert_eq!(got[1], Item::Break, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn a_member_that_shrinks_between_its_two_passes_is_cut_short_and_ends_with_a_break() {
+        // Judged complete, then given again a page at a time: bytes that end sooner are reported,
+        // and the member's unfinished line goes, as for any damaged member; the next member is
+        // read as it was.
+        for codec in codecs() {
+            // longer than a page of compressed bytes and than a bzip2 block, so that it is judged as it is read
+            let first = fixture(codec, &noise(50_000));
+            assert!(first.len() > PAGE, "{codec:?}");
+            let part = [first.clone(), fixture(codec, b"z\t1\n")].concat();
+            let src = Shrinking {
+                data: &part,
+                first: first.len(),
+                cut: first.len() / 2,
+                // the reads from the start: gzip looks for padding, the judging, the second pass
+                shrink_at: if codec == Codec::Gzip { 3 } else { 2 },
+                starts: 0.into(),
+            };
+            let mut got = Vec::new();
+            read_items(codec, &src, 100, &mut |item| {
+                got.push(item.into_owned());
+                true
+            })
+            .unwrap();
+            let kinds: Vec<String> = got
+                .iter()
+                .map(|i| match i {
+                    Item::Data(d) => format!("Data({})", d.len()),
+                    Item::CutShort { offset, out } => format!("CutShort({offset}, {})", out.len()),
+                    Item::Corrupt { offset, out } => format!("Corrupt({offset}, {})", out.len()),
+                    Item::Break => "Break".into(),
+                })
+                .collect();
+            assert!(got.len() >= 3, "{codec:?}: {kinds:?}");
+            let n = got.len();
+            let cut = Item::CutShort {
+                offset: 0,
+                out: Vec::new().into(),
+            };
+            assert_eq!(
+                got[n - 3..],
+                [cut, Item::Break, Item::Data(b"z\t1\n".to_vec().into())],
+                "{codec:?}: {kinds:?}"
+            );
+        }
+    }
+
+    /// Rows of pseudo-random hex, which compress little.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u64 = 1;
+        (0..n)
+            .flat_map(|i| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                format!("k{i}\t{x:016x}\n").into_bytes()
+            })
+            .collect()
+    }
+
+    /// `items` with each run of `Item::Data` joined into one.
+    fn glue(items: Vec<Item<'static>>) -> Vec<Item<'static>> {
+        let mut out: Vec<Item<'static>> = Vec::new();
+        for item in items {
+            match (item, out.last_mut()) {
+                (Item::Data(d), Some(Item::Data(last))) => last.to_mut().extend_from_slice(&d),
+                (item, _) => out.push(item),
+            }
+        }
+        out
+    }
+
+    /// Every item a part reader keeping `keep` bytes of a member gives.
+    fn read_all(codec: Codec, data: &[u8], keep: usize) -> Vec<Item<'static>> {
+        let mut all = Vec::new();
+        read_items(codec, data, keep, &mut |item| {
+            all.push(item.into_owned());
+            true
+        })
+        .unwrap();
+        all
+    }
+
+    #[test]
+    fn a_member_longer_than_what_is_kept_is_given_in_pieces_once_it_passed_its_check() {
+        for codec in codecs() {
+            // more than one bzip2 block (900 kB), which gives its output whole
+            let big = noise(50_000);
+            let part = [
+                fixture(codec, b"a\tx\n"),
+                fixture(codec, &big),
+                fixture(codec, b"z\t1\n"),
+            ]
+            .concat();
+            assert_eq!(items(codec, &part).len(), 3, "{codec:?}");
+            let got = read_all(codec, &part, 1000);
+            assert!(got.len() > 3, "{codec:?}: {} items", got.len());
+            let data: Vec<u8> = got
+                .iter()
+                .flat_map(|i| match i {
+                    Item::Data(d) => d.to_vec(),
+                    other => panic!("{codec:?}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                data,
+                [&b"a\tx\n"[..], &big, b"z\t1\n"].concat(),
+                "{codec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_is_kept_changes_no_item_of_a_damaged_part() {
+        // The damage of §16.6 is judged the same whatever part of a member is held: a member cut
+        // short before another, a corrupt one in the middle, a cut tail, gzip's zero padding.
+        for codec in codecs() {
+            let big = noise(5_000);
+            let a = fixture(codec, &big);
+            let mut corrupt = fixture(codec, &big);
+            let n = corrupt.len();
+            if codec == Codec::Gzip {
+                corrupt[n - 8] ^= 1
+            } else {
+                corrupt[n / 2] ^= 0xff
+            }
+            let z = fixture(codec, b"z\t1\n");
+            let mut parts = vec![
+                [&a[..a.len() / 2], &z[..]].concat(),
+                [&a[..], &corrupt, &z].concat(),
+                [&a[..], &z, &a[..a.len() - 5]].concat(),
+                Vec::new(),
+            ];
+            if codec == Codec::Gzip {
+                parts.push([&a[..], &[0u8; 70_000], &z].concat());
+            }
+            for (i, part) in parts.iter().enumerate() {
+                let want = glue(items(codec, part));
+                for keep in [0, 100, 70_000] {
+                    assert_eq!(
+                        glue(read_all(codec, part, keep)),
+                        want,
+                        "{codec:?} part {i} keep {keep}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_that_stops_at_the_first_member_reads_no_further_than_it_needs() {
+        for codec in codecs() {
+            let first = fixture(codec, b"a\tx\n");
+            let rest = fixture(codec, &noise(50_000));
+            assert!(rest.len() > 4 * PAGE, "{codec:?}");
+            let part = [&first[..], &rest].concat();
+            let src = Counting {
+                data: &part,
+                reached: std::cell::Cell::new(0),
+            };
+            let mut seen = 0;
+            read_items(codec, &src, usize::MAX, &mut |_| {
+                seen += 1;
+                false
+            })
+            .unwrap();
+            assert_eq!(seen, 1, "{codec:?}");
+            assert!(
+                src.reached.get() <= (first.len() + PAGE) as u64,
+                "{codec:?}: read {} of {} bytes",
+                src.reached.get(),
+                part.len()
+            );
         }
     }
 

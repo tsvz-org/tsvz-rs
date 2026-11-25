@@ -29,23 +29,28 @@ Every operation of §20 is supported. Stores may be compressed (gzip, bzip2, xz,
 into parts; all four digests (crc32, crc32c, sha256, blake3) are verified. `scrub` compacts a
 one-part store in place. In a multi-part store it writes the parts before the active one as a
 new snapshot part, linked in whole (with no ordinal free, it compacts them in place), then
-applies the store's `#_rotate_#`; writers keep appending throughout. A read replays every part,
-as 0.1.3's did; beginning at the last snapshot part (§19.10.3) is deferred to 0.2.1. `scrub` and
-`clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
+applies the store's `#_rotate_#`; writers keep appending throughout. A read begins at the last
+snapshot part (§19.10.3) and does not open the parts before it; `verify` reads every part.
+`scrub` and `clear` refuse parts that declare a spec version newer than tsvz implements (§6.3).
 
-Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them,
-except where [docs/limitations.md](docs/limitations.md) says otherwise: tsvz-rs ignores an
-unterminated last line, reads `#_defaults_#` lines as comments (it fills no empty cell from
-them), keeps the whitespace at the end of a key or a cell and decodes neither, and keeps the empty
-cells at the end of a row longer than the file's column count. A rewrite writes each line it keeps
-as the file has it, but for three things: a byte-order mark an unterminated first line loses, the
-key a one-column `delete` puts where the line that set the column count went, and the blank
-`#_defaults_#` line a `clear` may write before the defaults it keeps. `scrub` keeps the lines a
-read depends on (a key's last line may take the place of its first, where nothing TSVZ.py reads
-changes), and `clear` the `#_defaults_#` lines in force
-([docs/silent-choices.md](docs/silent-choices.md)). One more limit an operator can meet: a
-`delete` of a loose file that runs at the very moment of a `clear` of it can leave the key as a
-row.
+Loose files (`.tsv .csv .nsv .psv`, §20.2.4) are read as TSVZ.py's command line reads them
+(`_processLine`): keys and cells without the whitespace at their end and decoded (`<sep>`, `<LF>`),
+`#_defaults_#` lines that fill the empty cells after them, the last line read also without its
+newline, and no row for a missing key. A key you name is the cell a reader reads from it as written:
+in a tab file `$'a\n'` and `$'a\t'` name only the row whose cell holds them, `a<LF>` and `a<sep>`, so
+with only `a` in the file they name no row (TSVZ.py's `get` reaches `a`:
+[docs/silent-choices.md](docs/silent-choices.md)); a blank at its end goes. Writes encode cells as
+TSVZ.py's do, and refuse a line that would not read back as its cells (a key that begins with `#`,
+but for one that begins with `#_defaults_#`, or with a NUL, or is only whitespace; `</sep/>`; with
+`-d e`, a cell whose encoding holds an `e`, as `<sep>` does); a `delete` of a key no row can have
+writes nothing and is no failure. An append to a compressed loose file whose text does
+not end with a newline joins that last line, as TSVZ.py's does (deferred to 0.2.2,
+[docs/limitations.md](docs/limitations.md)). A rewrite writes each
+line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
+line that set the column count went, and the blank `#_defaults_#` line a `clear` may write before
+the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
+place of its first, where nothing a reader reads changes), and `clear` the `#_defaults_#` lines in
+force ([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
 
@@ -66,9 +71,10 @@ The handler and TSVZ.py's (`tsvz serve`, `TSVZClient`) speak the same protocol: 
 commands go through either tool's handler. It serves strict stores (`.tsvz .csvz .nsvz .psvz`).
 Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode M` sets the
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
-(SMB) mount the other commands cannot read the handler's pointer file: they warn `ignoring the
-pointer file` and work on the files, and `tsvz stop` fails: stop the handler with a signal or let
-`--x-idle-timeout` do it (deferred to 0.2.1, [docs/limitations.md](docs/limitations.md)).
+(SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
+file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
+handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.2,
+[docs/limitations.md](docs/limitations.md)).
 
 ## Library
 
@@ -97,11 +103,50 @@ Build without the command line and C libraries with
 ## Conformance and compatibility
 
 tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conformance suite with
-every codec, every digest and multi-part scrub claimed, and is checked
+every codec, every digest, multi-part scrub and the snapshot skip claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.1 from 0.2.0
+
+Stores need nothing; the library's documented API does not change.
+
+- A read of a multi-part strict store begins at its last snapshot part (§19.10.3) and does not
+  open the parts before it, as TSVZ.py's does: a part there that is damaged under
+  `#_on_corruption_# stop` no longer stops the read. `verify`, `scrub` and `clear` still read
+  every part.
+- Loose files are read as TSVZ.py reads them: a key or cell loses the whitespace at its end
+  (`a ` and `a` are one key), `<sep>` and `<LF>` in a cell are the delimiter and a newline,
+  `#_defaults_#` lines fill the empty cells after them, a line whose key is only whitespace is
+  no row, the last line is read even without its newline, and `get` of a missing key prints
+  nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
+  (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, a cell whose encoding holds the delimiter
+  (`-d e`) and a key that no reader would read back (it begins with `#`, but for one that begins
+  with `#_defaults_#`, or with a NUL, or is only whitespace), and ends an unterminated last line of
+  a plain file with a newline before it appends (0.2.0 cut that line). A key typed with a trailing
+  line break, or in a tab file a trailing tab, names only the row whose cell holds it: `$'b\t'` no
+  longer reaches row `b` in a tab file (0.2.0's `delete` removed `b` in a file of one column;
+  TSVZ.py's `get` reaches it). `set -` fed the `#_defaults_#` line appends it, and `delete -` fed
+  it appends a defaults reset, as `delete f '#_defaults_#'` does (0.2.0 wrote nothing for either).
+- A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
+  less memory.
+- Through a handler: `tsvz stop` exits 0 when another stop or a signal stopped the handler first
+  (it exited 1, "does not answer" or "went away"), and exits 1 when the handler is still there
+  30 s after the request (it waited 10 s and exited 0 either way). A stopping handler no longer
+  cuts off a `pop` or `popitem` that waits for its write, even past the stop's 5 s; until it has
+  written its queued writes, a command that reaches it finds it gone (a write exits 1, a read uses
+  the files) instead of working on the files beside it. A routed `pop` whose row cannot be
+  printed is put back on the files when the handler cannot put it back, once the handler has
+  stopped (a handler that still serves the store leaves the files alone: the row is printed on
+  standard error). While a `#_write_ack_#`
+  the handler queued is not yet written, every write through it is answered once written and
+  synced. A read that falls back from a lost handler no longer warns that it "may or may not have
+  been applied", and a command that meets a handler just as it stops no longer warns of a hard
+  link.
+- A `scrub` or `clear` whose part another scrub renames away while it waits for the part's lock
+  reads the store again, instead of rewriting the renamed file.
 
 ## Upgrading to 0.2.0 from 0.1.4
 

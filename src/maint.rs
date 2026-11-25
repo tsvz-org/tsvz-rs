@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::escape;
 use crate::loose;
@@ -99,7 +100,7 @@ fn round_trips(key: &str, cells: &[String], m: &Markers) -> bool {
 /// The snapshot content of §19.2.3 for a strict store read whole, as TSVZ.py writes it: the
 /// header comment, the markers, then one fully resolved row per live key, padded with empty
 /// cells to the width of the final defaults; the compensating layout of §19.4 when a row would
-/// not read back the same. (A loose file's scrub keeps its lines instead: `loose::scrub`.)
+/// not read back the same. (A loose file's scrub keeps its lines instead: `loose::ScrubPlan`.)
 pub(crate) fn snapshot(s: &Store) -> String {
     let d = s.format().delimiter;
     let m = s.markers();
@@ -229,8 +230,10 @@ fn stamp(path: &Path) -> Result<Stamp, Error> {
 }
 
 /// Replace a part's bytes in place, keeping the file (§18.7, §19.8), under the write lock and
-/// only while the part still has the stamp it had before it was read. Ok(None): another writer
-/// changed it; Ok(Some(false)): it already held these bytes.
+/// only while the part still has the stamp it had before it was read and its path still names
+/// it: another scrub's rotation may rename it away between its opening and the lock, as
+/// [`Writer::append_at`] checks too. Ok(None): another writer changed it or renamed it;
+/// Ok(Some(false)): it already held these bytes.
 pub(crate) fn rewrite(
     path: &Path,
     content: &[u8],
@@ -240,13 +243,14 @@ pub(crate) fn rewrite(
     recovery: Option<&Path>,
 ) -> Result<Option<bool>, Error> {
     let io = |e: io::Error| Error::io(path, e);
-    let raw = match codec {
+    let raw: std::borrow::Cow<[u8]> = match codec {
         Some(c) if !content.is_empty() => codec::encode_members(c, content, member_size as usize)
             .ok_or_else(|| Error::UnsupportedCodec {
-            path: path.to_path_buf(),
-            codec: c.name(),
-        })?,
-        _ => content.to_vec(),
+                path: path.to_path_buf(),
+                codec: c.name(),
+            })?
+            .into(),
+        _ => content.into(),
     };
     let file = OpenOptions::new()
         .read(true)
@@ -254,12 +258,12 @@ pub(crate) fn rewrite(
         .open(path)
         .map_err(io)?;
     let _guard = lock::lock(&file).map_err(io)?;
-    if Stamp::of(&file.metadata().map_err(io)?) != expect {
+    if Stamp::of(&file.metadata().map_err(io)?) != expect || !crate::write::names(path, &file) {
         return Ok(None);
     }
     let mut old = Vec::new();
     (&file).read_to_end(&mut old).map_err(io)?;
-    if old == raw {
+    if old[..] == raw[..] {
         return Ok(Some(false));
     }
     // Reserve the space first (§19.8), so a full disk or a file-size limit refuses the rewrite
@@ -447,16 +451,54 @@ fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// A whole read for a rewrite: never past a part it cannot read, since what it writes would
-/// lose that part's rows.
+/// A whole read for a rewrite: of every part, also those before the last snapshot part, and never
+/// past a part it cannot read, since what it writes would lose that part's rows.
 fn whole(options: &Options) -> Options {
     Options {
         scope: Scope::All,
         verify: false,
         skip_unreadable: false,
-        lines: true,
+        every_part: true,
+        lines: None,
         ..options.clone()
     }
+}
+
+/// The delimiter of the loose file `store` as a read takes it (`-d`, else its name's), or None for
+/// a strict store.
+fn loose_delimiter(store: &Path, options: &Options) -> Result<Option<u8>, Error> {
+    let format = crate::name::format_of(store).ok_or_else(|| Error::BadPath(store.into()))?;
+    Ok((!format.strict).then(|| options.delimiter.unwrap_or(format.delimiter)))
+}
+
+/// A whole read of a loose file that gives its lines to `plan` (and rows to no one).
+fn planned<P: loose::Planner + 'static>(options: &Options, plan: &Arc<Mutex<P>>) -> Options {
+    let sink: loose::Sink = plan.clone();
+    Options {
+        lines: Some(sink),
+        ..whole(options)
+    }
+}
+
+/// The second read of a loose rewrite: the lines `kept` keeps, as the file has them or as the
+/// plan puts them. None when the file no longer gives the lines the plan was made from (it
+/// changed between the reads).
+fn write_kept(
+    store: &Path,
+    options: &Options,
+    kept: loose::Kept,
+) -> Result<Option<Vec<u8>>, Error> {
+    let writer = Arc::new(Mutex::new(loose::Writer::new(kept)));
+    let quiet = Options {
+        warnings: None, // the first read said them
+        ..options.clone()
+    };
+    Store::open(store, planned(&quiet, &writer))?;
+    let mut w = writer.lock().expect("a planner never panics");
+    if !w.same_lines() {
+        return Ok(None);
+    }
+    Ok(Some(std::mem::take(&mut w.out)))
 }
 
 /// Compact a store with §19.4 fidelity (§20.2 `scrub`). A one-part store is compacted in place
@@ -609,11 +651,14 @@ fn attempt(
             .collect::<Result<_, _>>(),
         Step::Again
     );
+    // A loose file is planned in this read, and written in a second (`write_kept`).
+    let plan =
+        loose_delimiter(store, options)?.map(|d| Arc::new(Mutex::new(loose::ScrubPlan::new(d))));
     let s = read!(
-        if multi {
-            Store::open_prefix(store, whole(options), prefix.len())
-        } else {
-            Store::open(store, whole(options))
+        match (&plan, multi) {
+            (Some(plan), _) => Store::open(store, planned(options, plan)),
+            (None, true) => Store::open_prefix(store, whole(options), prefix.len()),
+            (None, false) => Store::open(store, whole(options)),
         },
         Step::Again
     );
@@ -713,10 +758,16 @@ fn attempt(
         Some(earlier)
     };
     // With no part before it (a one-part store, or part 0), there is nothing to skip: the
-    // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), and
-    // the bytes after its last newline, which TSVZ.py reads as a line.
-    let content = match (&earlier, s.loose_lines()) {
-        (_, Some((lines, tail))) => [loose::scrub(&lines), tail.to_vec()].concat(),
+    // content is TSVZ.py's, unmarked. A loose file keeps its lines as they are (`loose`), its
+    // unterminated last line too.
+    let content = match (&earlier, plan) {
+        (_, Some(plan)) => {
+            let kept = plan.lock().expect("a planner never panics").finish();
+            match read!(write_kept(store, options, kept), Step::Again) {
+                Some(content) => content,
+                None => return Ok(Step::Again(None)), // the file changed between the reads
+            }
+        }
         (None, None) => snapshot(&s).into_bytes(),
         (Some(earlier), None) => match read!(
             live_after_any_prefix(store, options, others, earlier),
@@ -869,9 +920,12 @@ fn snapshot_part(
     // One that other parts precede must also carry #_snapshot_# (a part a 0.1.3 scrub wrote does
     // not), or readers would go on replaying them: such a part gets a marked copy, once.
     let others = &prefix[..prefix.len() - 1];
-    let marked = others.is_empty() || crate::store::is_snapshot_part(last, s.format());
     let size = std::fs::metadata(&last.path).map(|m| m.len());
-    if marked && size.is_ok_and(|len| len <= bytes.len() as u64) && reads_as(&last.path, s) {
+    let alone = match size {
+        Ok(len) if len <= bytes.len() as u64 => Store::open(&last.path, all_rows()).ok(),
+        _ => None,
+    };
+    if alone.is_some_and(|a| (others.is_empty() || a.marked()) && same_reading(&a, s)) {
         if others.is_empty() || action == "keep" {
             return Ok(Snapshotted::Done(Outcome::Unchanged));
         }
@@ -1064,11 +1118,15 @@ fn write_recovery(store: &Path, part: &Path, content: &[u8]) -> Result<PathBuf, 
 /// Whether the recovery copy reads as the store it compacts: the same rows (padding aside, §3.6)
 /// and the same final markers (§19.4). A guard before a part is rewritten.
 fn reads_as(recovery: &Path, s: &Store) -> bool {
-    let options = Options {
+    Store::open(recovery, all_rows()).is_ok_and(|r| same_reading(&r, s))
+}
+
+/// A read of every row, for a check of what a part reads as alone.
+fn all_rows() -> Options {
+    Options {
         scope: Scope::All,
         ..Options::default()
-    };
-    Store::open(recovery, options).is_ok_and(|r| same_reading(&r, s))
+    }
 }
 
 /// Whether the recovery copy, read after the parts `earlier` read, reads as the store it
@@ -1148,30 +1206,9 @@ fn live_after_any_prefix(
 }
 
 /// Whether the file system holding `path` overwrites a file's blocks in place, so that the
-/// space `reserve` takes for a rewrite is really there (ext2/3/4, XFS, f2fs, tmpfs). Not a
-/// copy-on-write one (btrfs, ZFS, bcachefs, APFS), which needs new blocks to overwrite, and not
-/// one it cannot tell.
-#[cfg(target_os = "linux")]
+/// space `reserve` takes for a rewrite is really there ([`parts::Fs`]).
 fn overwrites_in_place(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: statfs reads the NUL-terminated path and writes the struct it is given.
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
-        return false;
-    }
-    const EXT: i64 = 0xEF53;
-    const XFS: i64 = 0x5846_5342;
-    const F2FS: i64 = 0xF2F5_2010;
-    const TMPFS: i64 = 0x0102_1994;
-    matches!(fs.f_type as i64, EXT | XFS | F2FS | TMPFS)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn overwrites_in_place(_path: &Path) -> bool {
-    false
+    parts::fs_at(path).in_place
 }
 
 /// Whether `e` is a full disk or quota.
@@ -1414,7 +1451,12 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
         } else {
             None
         };
-        let s = Store::open(store, whole(options))?;
+        let plan = loose_delimiter(store, options)?
+            .map(|d| Arc::new(Mutex::new(loose::ClearPlan::new(d))));
+        let s = match &plan {
+            Some(plan) => Store::open(store, planned(options, plan))?,
+            None => Store::open(store, whole(options))?,
+        };
         if s.incomplete() {
             let why = if s.stopped().is_some() {
                 "the read stopped at damaged data (§4.10)"
@@ -1452,8 +1494,8 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 store.display()
             )));
         }
-        let content = match s.loose_lines() {
-            Some((lines, _)) => loose::cleared(&lines),
+        let content = match &plan {
+            Some(plan) => plan.lock().expect("a planner never panics").finish(),
             None => {
                 let mut content = String::new();
                 if let Some(h) = s.header() {
@@ -1489,9 +1531,7 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
 #[cfg(feature = "cli")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LooseDelete {
-    /// Tombstones appended (this many): each key asked as TSVZ.py names it, when it has a name,
-    /// and, where that differs, as given; with no keyed line yet, only a key of only whitespace,
-    /// which has no name, as given.
+    /// Tombstones appended (this many): each key asked, as a reader names it.
     Appended(usize),
     /// The file rewritten without the lines of the keys asked.
     Rewrote,
@@ -1501,29 +1541,25 @@ pub(crate) enum LooseDelete {
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
 /// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
-/// deletion, appended for each key asked, live or not, as TSVZ.py names it (without the
-/// whitespace at its end, unless nothing is left of it) and, where that differs, as given; one
-/// column, where a key alone is a row and no line can delete, a rewrite without the lines of the
-/// keys ([`loose::without`]); no keyed line yet, nothing, since a key alone would set one column
-/// and be a row (but a key of only whitespace, which sets none, is written as given). A plain
-/// file is read only as far as its first keyed line, and a compressed one into memory whole (docs/
-/// limitations.md); the whole file is read for a rewrite, at one column only. A missing file is
-/// created (§20.2.2).
+/// deletion, appended for each key asked, live or not, as a reader names it ([`loose::name`]: a
+/// line break or a delimiter at its end stays, a blank goes; a key no row can have names none), and only
+/// while the file is as the read found it; one column, where a key alone is a row and no line can
+/// delete, a rewrite without the lines of the keys ([`loose::WithoutPlan`]); no keyed line yet, nothing, since a key alone
+/// would set one column and be a row. The file is read only as far as its first keyed line (a
+/// compressed one to the end of the member that holds it); the whole file is read for a rewrite,
+/// at one column only. A missing file is created (§20.2.2).
 #[cfg(feature = "cli")]
 pub(crate) fn delete_loose(
     store: &Path,
     options: &Options,
     keys: &[String],
 ) -> Result<LooseDelete, Error> {
-    // Each key as TSVZ.py reads a line's key, without the whitespace at its end, and as given:
-    // tsvz-rs, which reads a key whole, deletes the row of either. A key with nothing left names
-    // no row to TSVZ.py, which skips such lines; tsvz-rs reads such a row, by its given spelling,
-    // at one column too: the line of that spelling goes, and no other.
-    use std::sync::{Arc, Mutex};
-    let asked: Vec<(&str, &str)> = keys
-        .iter()
-        .map(|k| (k.as_str(), k.trim_end_matches(loose::py_space)))
-        .collect();
+    let d = loose_delimiter(store, options)?.expect("a loose file");
+    // The names a reader names ([`loose::name`]), less the keys no row can have (its doc says
+    // which). Nothing is written for one, as for a key that is not there; for a key alone in a
+    // file of one column it would be a row.
+    let names: Vec<String> = keys.iter().filter_map(|k| loose::name(k, d)).collect();
+    let mut meanwhile = "rewritten"; // what the file was being when it kept changing
     for _ in 0..ATTEMPTS {
         let Some(part) = parts::list(store)?.into_iter().next() else {
             Writer::open(store)?
@@ -1533,6 +1569,12 @@ pub(crate) fn delete_loose(
             return Ok(LooseDelete::Nothing);
         };
         let before = stamp(&part.path)?;
+        let Some(seen) =
+            crate::write::Seen::of(&part.path).map_err(|e| Error::io(&part.path, e))?
+        else {
+            meanwhile = "read"; // truncated while its end was being read
+            continue;
+        };
         // The head's warnings are held: at one column the whole read below says them again.
         let held: Arc<Mutex<Vec<Warning>>> = Arc::default();
         let hold: crate::WarnFn = {
@@ -1557,57 +1599,58 @@ pub(crate) fn delete_loose(
         };
         let one = head.one_column();
         if one != Some(true) {
-            say();
-            // More than one column: a tombstone for each key. No keyed line yet: a key alone would
-            // set one column and be a row, so none, but for a key with nothing left of it, which
-            // TSVZ.py skips (it sets no column count) and tsvz-rs reads as a row: its tombstone
-            // deletes that row, so that a `popitem` loop drains a file that holds only such rows
-            // (without it the row stays, and `popitem` returns it again).
-            let all = one == Some(false);
-            let tombstones: Vec<crate::write::Record> = asked
-                .iter()
-                .flat_map(|&(given, name)| {
-                    let named = (all && !name.is_empty()).then_some(name);
-                    let as_given = (given != name && (all || name.is_empty())).then_some(given);
-                    named.into_iter().chain(as_given)
-                })
-                .map(|key| crate::write::Record::Tombstone {
-                    key: key.to_string(),
-                })
-                .collect();
-            if tombstones.is_empty() && !all {
-                return Ok(LooseDelete::Nothing);
+            if one.is_none() || names.is_empty() {
+                say();
+                return Ok(LooseDelete::Nothing); // a key alone would set one column, and be a row
             }
-            Writer::open(store)?
+            let tombstones: Vec<crate::write::Record> = names
+                .iter()
+                .map(|key| crate::write::Record::Tombstone { key: key.clone() })
+                .collect();
+            // Appended only to the file as it was read, or that file with more appended by another
+            // writer: one cleared meanwhile, with no keyed line left, would take a key alone for
+            // a row.
+            let appended = Writer::open(store)?
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
-                .append(&tombstones)?;
-            return Ok(LooseDelete::Appended(tombstones.len()));
+                .append_if_grown(&tombstones, &seen);
+            match appended {
+                Ok(false) => {
+                    meanwhile = "read"; // another writer cleared or rewrote it since the read
+                    continue;
+                }
+                Ok(true) => {
+                    say();
+                    return Ok(LooseDelete::Appended(tombstones.len()));
+                }
+                Err(e) => {
+                    say();
+                    return Err(e);
+                }
+            }
         }
-        let s = Store::open(store, whole(options))?;
+        // One column: planned in a whole read, written in a second.
+        let gone: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let plan = Arc::new(Mutex::new(loose::WithoutPlan::new(d, gone)));
+        let s = Store::open(store, planned(options, &plan))?;
         if s.incomplete() {
             return Err(Error::Refused(format!(
                 "{}: delete skipped: the file could not be read whole; nothing was written",
                 store.display()
             )));
         }
-        let (lines, tail) = s
-            .loose_lines()
-            .expect("a loose file read whole keeps its lines");
-        // a key is named without the whitespace at its end, one of only whitespace as given
-        let gone: std::collections::HashSet<&str> = asked
-            .iter()
-            .map(|&(given, name)| if name.is_empty() { given } else { name })
-            .collect();
-        let content = match loose::without(&lines, &gone) {
+        let decided = plan.lock().expect("a planner never panics").finish();
+        let kept = match decided {
             None => continue, // the file changed since its first line was read
             Some(None) => return Ok(LooseDelete::Nothing), // no line is one of the keys
-            Some(Some(content)) => content,
+            Some(Some(kept)) => kept,
+        };
+        let Some(content) = write_kept(store, options, kept)? else {
+            continue; // the file changed between the reads
         };
         if s.damaged() {
             backup(&part.path, options)?;
         }
-        let content = [content, tail.to_vec()].concat();
         match rewrite(
             &part.path,
             &content,
@@ -1622,7 +1665,7 @@ pub(crate) fn delete_loose(
         }
     }
     Err(Error::Refused(format!(
-        "{}: delete skipped: the file kept changing while it was being rewritten; nothing was written",
+        "{}: delete skipped: the file kept changing while it was being {meanwhile}; nothing was written",
         store.display()
     )))
 }
@@ -1817,6 +1860,163 @@ mod tests {
             None
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\nb\t2\n");
+    }
+
+    #[test]
+    fn a_part_renamed_away_while_its_lock_is_waited_for_is_not_rewritten() {
+        // Another scrub's rotation renames the part (to `.rotated`) between the rewrite's open and
+        // its lock: written into, it would change nothing the store reads, and the scrub or clear
+        // would say it had.
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\na\t2\n").unwrap();
+        let before = Stamp::of(&fs::metadata(&p).unwrap());
+        let holder = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        let held = lock::lock(&holder).unwrap();
+        let rewriting = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                rewrite(&p, b"a\t2\n", before, None, DEFAULT_MEMBER_SIZE, None)
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock::waiters_on(&p) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the rewrite never waited for the lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let rotated = dir.path().join("s.tsvz.0.rotated");
+        fs::rename(&p, &rotated).unwrap();
+        drop(held);
+        assert_eq!(rewriting.join().unwrap().unwrap(), None);
+        assert_eq!(fs::read_to_string(&rotated).unwrap(), "a\t1\na\t2\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_waiting_for_the_lock_while_the_file_is_cleared_writes_no_key_alone() {
+        // A clear lands between the delete's read (two columns) and its append: a key alone,
+        // written to the file as it is now, with no keyed line, would be a row of one column. The
+        // append is made only to the file as it was read; the delete reads it again, finds none.
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        let holder = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        let held = lock::lock(&holder).unwrap();
+        let deleting = {
+            let p = p.clone();
+            std::thread::spawn(move || delete_loose(&p, &opts(), &["a".to_string()]))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock::waiters_on(&p) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the delete never waited for the lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(&p, "").unwrap(); // the clear
+        drop(held);
+        assert_eq!(deleting.join().unwrap().unwrap(), LooseDelete::Nothing);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "");
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_waiting_for_the_lock_while_another_writer_appends_still_deletes() {
+        // The delete's append is made to the file as it was read with more appended, not refused
+        // for the append. The wait for the lock is one append, and the delete's retry masks a
+        // refusal of it (a stamp check passes this test), so the test below pins the property.
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["s.tsv", "s.tsv.gz"] {
+            let p = dir.path().join(name);
+            let text = |t: &str| t.as_bytes().to_vec();
+            let member = |t: &str| match name.ends_with(".gz") {
+                true => {
+                    crate::codec::encode_member(crate::name::Codec::Gzip, t.as_bytes()).unwrap()
+                }
+                false => text(t),
+            };
+            fs::write(&p, member("a\t1\nb\t2\n")).unwrap();
+            let holder = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            let held = lock::lock(&holder).unwrap();
+            let deleting = {
+                let p = p.clone();
+                std::thread::spawn(move || delete_loose(&p, &opts(), &["a".to_string()]))
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while lock::waiters_on(&p) == 0 {
+                assert!(Instant::now() < deadline, "{name}: no wait for the lock");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            OpenOptions::new()
+                .append(true)
+                .open(&p)
+                .unwrap()
+                .write_all(&member("c\t3\n"))
+                .unwrap();
+            drop(held);
+            assert_eq!(
+                deleting.join().unwrap().unwrap(),
+                LooseDelete::Appended(1),
+                "{name}"
+            );
+            let want = ["a\t1\nb\t2\n", "c\t3\n", "a\n"].map(member).concat();
+            assert_eq!(fs::read(&p).unwrap(), want, "{name}");
+            assert_eq!(
+                rows(&p),
+                vec![
+                    vec!["b".to_string(), "2".into()],
+                    vec!["c".to_string(), "3".into()]
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_beside_a_writer_that_keeps_appending_is_never_refused_for_it() {
+        // A check of the file's stamp (size, mtime) against the one before the head read refused
+        // (`kept changing`) a delete that each of its three tries found overtaken by an append (2
+        // of 150 beside six writers). Only a clear or a rewrite matters: the file's head sets its
+        // column count. A stamp check fails this test every time (500 deletes, 3 tries each; 30 of
+        // 30 runs measured).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "a\t1\n").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let appender = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut writer = Writer::open(&p).unwrap();
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let row = crate::write::Record::from_args(&format!("r{n}"), &["1".into()]);
+                    writer.append(&[row]).unwrap();
+                    n += 1;
+                }
+                n
+            })
+        };
+        let deleted: Vec<_> = (0..500)
+            .map(|i| delete_loose(&p, &opts(), &[format!("k{i}")]))
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        let appended = appender.join().unwrap();
+        for (i, d) in deleted.into_iter().enumerate() {
+            assert_eq!(
+                d.unwrap(),
+                LooseDelete::Appended(1),
+                "{i} of {appended} appends"
+            );
+        }
     }
 
     #[test]
@@ -2787,8 +2987,9 @@ mod tests {
     #[test]
     fn a_scrub_keeps_the_rows_of_every_part_also_those_before_a_snapshot_part() {
         // The snapshot part restates nothing of part 0, against §19.10.2: a reader that begins
-        // at it never sees `a`, but one that replays every part does (§19.10.3, as tsvz-rs
-        // does), and what a scrub writes must read the same to both.
+        // at it (§19.10.3, a read of tsvz-rs or TSVZ.py) never sees `a`, but one that replays
+        // every part does (a scrub's read, `verify`), and what a scrub writes must read the same
+        // to both.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "a\t1\n").unwrap();

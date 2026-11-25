@@ -382,11 +382,6 @@ fn both(py: &Path, op: &str, file: &Path) -> (String, String) {
     (text(rust(&[op, f], b"")), text(python(py, &[op, f], b"")))
 }
 
-/// Rows of records output with the empty cells a reader pads them with removed (§3.6).
-fn trimmed(out: &str) -> Vec<Vec<u8>> {
-    rows(out.as_bytes(), b'\t')
-}
-
 /// Loose files written as TSVZ.py writes and reads them (header lines, `#_defaults_#` lines,
 /// one-column files), and files as a TSVZ.py scrub and a TSVZed commit leave them.
 const LOOSE: &[&str] = &[
@@ -423,15 +418,13 @@ const LOOSE: &[&str] = &[
     "#h\n#_defaults_#x\na\nb\n#_defaults_#x\t2\n",
 ];
 
-/// Loose files that the two read differently (docs/limitations.md: a key with whitespace at its
-/// end, or a run of CRs, reads another way to TSVZ.py), and whose scrub changes what neither
-/// reads.
+/// Loose files with whitespace at the end of a key or a run of CRs at the end of a line, which a
+/// reader strips and a rewrite must keep as the file has it: a scrub changes what neither reads.
 const REWRITTEN: &[&str] = &[
     "#h\na \t1\nb\t2\na\t3\n",
     "a \nb\na\nb \n",
     "#h\nk\t1\nk \t2\nk\t3\nz\t\n",
-    // A run of CRs before a newline: TSVZ.py cuts them all, tsvz-rs one, and a rewrite must keep
-    // the rest of them, or the last cell reads otherwise.
+    // A run of CRs before a newline: both cut them all, and a rewrite keeps the line as it is.
     "#h\na\t1\nb\t1\r\r\n",
 ];
 
@@ -459,7 +452,7 @@ fn random_loose(seed: u64) -> String {
         "\tx",
         "K\t2",
         "K\t \t",
-        // What TSVZ.py reads differently from tsvz-rs: a key with whitespace at its end, a CR.
+        // A key with whitespace at its end, a CR: what a reader strips.
         "K \t1",
         "K\t1\r",
     ];
@@ -478,16 +471,6 @@ fn random_loose(seed: u64) -> String {
     text
 }
 
-/// Whether `text` has a `#_defaults_#` line, whose defaults TSVZ.py applies to the rows after it
-/// and tsvz-rs does not.
-fn has_defaults_line(text: &str) -> bool {
-    text.lines().any(|l| {
-        l.split('\t')
-            .next()
-            .is_some_and(|k| k.trim_end() == "#_defaults_#")
-    })
-}
-
 #[test]
 fn loose_files_list_the_keys_tsvz_py_lists() {
     let py = need_tsvz_py!();
@@ -497,10 +480,8 @@ fn loose_files_list_the_keys_tsvz_py_lists() {
         std::fs::write(&file, text).unwrap();
         let (rs, py_keys) = both(&py, "keys", &file);
         assert_eq!(rs, py_keys, "{text:?}");
-        if !has_defaults_line(text) {
-            let (rs, py_rows) = both(&py, "read", &file);
-            assert_eq!(trimmed(&rs), trimmed(&py_rows), "{text:?}");
-        }
+        let (rs, py_rows) = both(&py, "read", &file);
+        assert_eq!(rs, py_rows, "{text:?}");
     }
 }
 
@@ -510,9 +491,9 @@ fn loose_rows_are_padded_to_the_width_of_the_first_keyed_line() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("f.tsv");
     // The first keyed line sets the width, a deletion's blank cells included, where the first
-    // data row is a narrower one. No row has empty cells at its end past the width, which
-    // TSVZ.py cuts and tsvz-rs keeps (docs/limitations.md).
+    // data row is a narrower one; a row wider than it loses the empty cells at its end past it.
     for text in [
+        "a\t1\nb\t2\t\t\nc\t3\t4\n",
         "k\t\t\na\t1\n",
         "#h\nk\t \t\na\t1\nb\t2\t3\nc\t\t\tx\n",
         "x\t\t\t\ny\t1\nz\t2\t3\n",
@@ -523,27 +504,6 @@ fn loose_rows_are_padded_to_the_width_of_the_first_keyed_line() {
         let (rs, py_rows) = both(&py, "read", &file);
         assert_eq!(rs, py_rows, "{text:?}");
     }
-}
-
-/// Whether `text` is one column to TSVZ.py: its first keyed line (not a comment, but for a
-/// `#_defaults_#` line, and with a key that is not blank) holds no tab.
-fn one_column(text: &str) -> bool {
-    text.lines()
-        .map(|l| l.trim_start_matches('\0'))
-        .find(|l| {
-            let key = l.split('\t').next().unwrap_or("");
-            (!l.starts_with('#') || l.starts_with("#_defaults_#")) && !key.trim().is_empty()
-        })
-        .is_some_and(|l| !l.contains('\t'))
-}
-
-/// Whether tsvz-rs lists the keys of `text` as TSVZ.py does: not with a bare `#_defaults_#` line
-/// in a one-column file (a row to TSVZ.py there, and a comment to tsvz-rs), a key with
-/// whitespace at its end, or a CR (TSVZ.py strips them, docs/limitations.md).
-fn keys_agree(text: &str) -> bool {
-    let spaced = |l: &str| l.split('\t').next().is_some_and(|k| k.trim_end() != k);
-    let bare = one_column(text) && text.lines().any(|l| l == "#_defaults_#");
-    !text.contains('\r') && !bare && !text.lines().any(spaced)
 }
 
 #[test]
@@ -561,34 +521,21 @@ fn a_loose_scrub_changes_nothing_tsvz_py_reads() {
         std::fs::write(&file, &text).unwrap();
         let (rs, py_rows) = both(&py, "read", &file);
         let (rs_keys, py_keys) = both(&py, "keys", &file);
-        if keys_agree(&text) {
-            assert_eq!(rs_keys, py_keys, "{text:?}");
-        }
+        assert_eq!(rs_keys, py_keys, "{text:?}");
         let scrubbed = rust(&["scrub", file.to_str().unwrap()], b"");
         assert!(scrubbed.status.success(), "{text:?}");
         let (rs_after, py_after) = both(&py, "read", &file);
         let after = std::fs::read_to_string(&file).unwrap();
         compacted += (after.len() < text.len()) as usize;
-        // TSVZ.py reads exactly the same rows, its defaults applied; tsvz-rs the same rows,
-        // however it pads them, and the same keys.
+        // Both read exactly the same rows and keys as before, and as each other.
         assert_eq!(py_after, py_rows, "{text:?} scrubbed to {after:?}");
-        assert_eq!(
-            trimmed(&rs_after),
-            trimmed(&rs),
-            "{text:?} scrubbed to {after:?}"
-        );
+        assert_eq!(rs_after, rs, "{text:?} scrubbed to {after:?}");
+        assert_eq!(rs_after, py_after, "{text:?} scrubbed to {after:?}");
         assert_eq!(
             both(&py, "keys", &file).0,
             rs_keys,
             "{text:?} scrubbed to {after:?}"
         );
-        if keys_agree(&text) && !has_defaults_line(&text) {
-            assert_eq!(
-                trimmed(&rs_after),
-                trimmed(&py_after),
-                "{text:?} scrubbed to {after:?}"
-            );
-        }
     }
     // A scrub that wrote every line back would pass all of the above. 61 of the 88 texts shrink
     // (counted 2026-11-16): 40 is well under that, and above what a scrub that kept most lines
@@ -782,11 +729,12 @@ fn a_loose_delete_writes_what_tsvz_py_writes() {
         );
     }
     // One column: the same keys, in whatever order (TSVZ.py may move one first), whether or
-    // not the key as given has whitespace at its end.
+    // not the key as given has a blank at its end. (A tab there would be the key's own,
+    // `b<sep>`, as a reader names it: docs/silent-choices.md.)
     for (text, keys) in [
         ("a\nb\nc\n", &["b"][..]),
         ("#h\na\nb \nc\nb\n", &["b"]),
-        ("#h\na\nb\nc\nb\n", &["b\t", "zz"]),
+        ("#h\na\nb\nc\nb\n", &["b ", "zz"]),
         ("a\nb\t1\nc\n", &["a"]),
         ("a\n#_defaults_#\tP\nb\nc\n", &["a", "c"]),
     ] {
