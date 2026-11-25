@@ -545,9 +545,11 @@ impl Engine {
     /// Encode `records` for the store and queue them; None when there is nothing to write.
     /// Its member size follows the markers as they stand where it will be appended: the files
     /// followed now, then the markers still queued. It is made durable when the files say
-    /// `#_write_ack_# disk`, and while a `#_write_ack_#` this handler queued is not yet followed,
-    /// whatever that says: a `memory` whose batch fails leaves the files saying `disk` (§21.9).
-    /// The request waits for a durable write, and for any when `written`.
+    /// `#_write_ack_# disk`, when the request sets `#_write_ack_#` itself, and while a
+    /// `#_write_ack_#` this handler queued is not yet followed, whatever that says: a `memory`
+    /// whose batch fails leaves the files saying `disk` (§21.9), and a `disk` applies to the
+    /// request's own writes after it. The request waits for a durable write, and for any when
+    /// `written`.
     fn submit(
         &self,
         st: &mut State,
@@ -595,7 +597,11 @@ impl Engine {
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
         let payload = crate::write::encode(records, self.format)?;
-        let durable = sync || ack_queued || ack == Some("disk");
+        let own_ack = records
+            .iter()
+            .filter_map(crate::write::marker_effect)
+            .any(|(key, _)| key == "#_write_ack_#");
+        let durable = sync || ack_queued || own_ack || ack == Some("disk");
         let waited = durable || written;
         let seq = self.batcher.submit(payload, member_size, durable, waited);
         for (key, m) in records.iter().filter_map(crate::write::marker_effect) {
@@ -1191,7 +1197,7 @@ mod tests {
         };
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file).unwrap();
-        assert!(!submit(&ack("disk")).waited, "the store says memory");
+        assert!(submit(&ack("disk")).waited, "a request that sets it is durable itself");
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
         }
@@ -1201,6 +1207,42 @@ mod tests {
         drop(held);
         e.batcher.barrier();
         assert!(!submit(&data).waited, "written and followed: memory");
+    }
+
+    #[test]
+    fn a_request_that_sets_write_ack_is_durable_itself() {
+        // `set -` of `#_write_ack_#<TAB>disk` and `k<TAB>v`, in a store that says memory: the files
+        // say `disk` once it is written, so the request's own write is synced before it is answered
+        // (0.2.1 answered at once). One that sets `memory` too, as any `#_write_ack_#` queued is.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, Instant::now(), records, false, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let data = || Record::Data {
+            key: "k".into(),
+            values: vec!["v".into()],
+        };
+        let ack = |value: &str| Record::Marker {
+            key: "#_write_ack_#".into(),
+            values: vec![value.into()],
+        };
+        assert!(!submit(&[data()]).waited, "the store says memory");
+        e.batcher.barrier();
+        assert!(!e.batcher.unsynced().is_empty());
+        assert!(submit(&[ack("memory"), data()]).waited, "its own memory");
+        e.batcher.barrier();
+        assert!(!submit(&[data()]).waited, "written and followed: memory");
+        e.batcher.barrier();
+        assert!(submit(&[ack("disk"), data()]).waited, "its own disk");
+        e.batcher.barrier();
+        assert!(e.batcher.unsynced().is_empty(), "synced with its batch");
     }
 
     #[test]

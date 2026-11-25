@@ -138,20 +138,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### A request's own `#_write_ack_#` marker does not make that request's writes durable
-- Kind: deferred
-- What the operator sees: a bulk `set -` through a handler that carries `#_write_ack_#<TAB>disk` and then `k<TAB>v` is
-  answered at once, and `k<TAB>v` is not synced, though the files now say `disk`: after a power loss it can be gone,
-  where §21.9.2 says a write made while `disk` is in force is acknowledged after its sync. TSVZ.py decides the same
-  way.
-- Why: durability is decided before the request's own markers are queued; whether a request's markers apply to the
-  rest of that request is a question of the specification (§21.9.2) that both tools answer alike.
-- Revisit when: 0.2.2. The plan: settle the rule with the TSVZ session (a request's markers apply from the line after
-  them), put it in §21.9.2 and a conformance case, then queue the request's markers before deciding its durability in
-  both tools.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A routed `pop` or `popitem` whose answer is lost in transit loses its row
 - Kind: deferred
 - What the operator sees: the handler deletes the row before its answer is written to the client: a client that times
