@@ -582,7 +582,11 @@ fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
         assert!(Instant::now() < deadline, "{}", served.stderr());
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(served.stderr().contains("it was put back"), "{}", served.stderr());
+    assert!(
+        served.stderr().contains("it was put back"),
+        "{}",
+        served.stderr()
+    );
     assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\na\t1\n");
     assert_eq!(ask(&s, "get\ta").lines, ["a\t1"]);
 }

@@ -1404,13 +1404,16 @@ mod tests {
             String::from_utf8(out).unwrap()
         };
         let row = |k: &str, v: &str| Record::from_args(k, &[v.into()]);
-        fs::write(&p, crate::codec::encode_member(Codec::Gzip, b"a\t1\nb\t2").unwrap()).unwrap();
+        fs::write(
+            &p,
+            crate::codec::encode_member(Codec::Gzip, b"a\t1\nb\t2").unwrap(),
+        )
+        .unwrap();
         Writer::open(&p).unwrap().append(&[row("c", "3")]).unwrap();
         assert_eq!(text(&p), "a\t1\nb\t2\nc\t3\n");
         assert_eq!(
             read(&p),
-            [("a", "1"), ("b", "2"), ("c", "3")]
-                .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+            [("a", "1"), ("b", "2"), ("c", "3")].map(|(k, v)| (k.to_string(), vec![v.to_string()]))
         );
         // A file that holds nothing gets none: its first line is the row.
         let q = dir.path().join("e.tsv.gz");

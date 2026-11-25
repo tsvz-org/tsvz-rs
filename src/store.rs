@@ -1468,7 +1468,11 @@ mod tests {
         use crate::loose::DECODED;
         let dir = tempfile::tempdir().unwrap();
         let text: String = (0..1000).map(|i| format!("k{i}\t{i}\tx\n")).collect();
-        let p = write(dir.path(), "s.tsv", format!("#_defaults_#\tP\tQ\n{text}").as_bytes());
+        let p = write(
+            dir.path(),
+            "s.tsv",
+            format!("#_defaults_#\tP\tQ\n{text}").as_bytes(),
+        );
         DECODED.with(|n| n.set(0));
         let one = Options {
             scope: Scope::Keys(vec!["k5".into()]),
@@ -1500,10 +1504,17 @@ mod tests {
         assert_eq!((b.written(), b.len()), (1, 9));
         assert_eq!(b.to_vec(), [&["1"][..], &[""; 8]].concat());
         // A default fills a cell padded for it, and only as far as the defaults go.
-        let p = write(dir.path(), "d.tsv", b"#_defaults_#\t\tP\nk\t1\t2\t3\t4\nb\tx\n");
+        let p = write(
+            dir.path(),
+            "d.tsv",
+            b"#_defaults_#\t\tP\nk\t1\t2\t3\t4\nb\tx\n",
+        );
         let s = Store::open(&p, Options::default()).unwrap();
         let b = s.get("b").unwrap();
-        assert_eq!((b.written(), b.to_vec()), (2, vec!["x".to_string(), "P".to_string()]));
+        assert_eq!(
+            (b.written(), b.to_vec()),
+            (2, vec!["x".to_string(), "P".to_string()])
+        );
     }
 
     #[test]
