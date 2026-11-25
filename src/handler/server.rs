@@ -735,8 +735,9 @@ const ASK_AGAIN: Duration = Duration::from_millis(100);
 
 /// What one `stop` request came to.
 enum Asked {
-    /// Answered `#0`: the handler stops.
-    Stopping,
+    /// Answered: the handler stops. With what it says it could not do, when it answered other
+    /// than `#0` (a write it acknowledged was lost): it stops all the same.
+    Stopping(Option<String>),
     /// Closed unread: the handler is stopping already, or closed it for a reason of its own.
     Closed,
     /// Not answered in time, or answered otherwise: why.
@@ -756,10 +757,11 @@ fn ask_stop(info: &pointer::Info, wait: Duration) -> Asked {
         .write_all(b"stop\n")
         .and_then(|()| read_response(&mut BufReader::new(&conn)));
     match answer {
-        Ok(response) if response.status != 0 => {
-            Asked::Failed(format!("stop failed: {}", response.message))
+        Ok(response) if response.status != 0 && response.message.is_empty() => {
+            Asked::Stopping(Some(format!("it answered #{}", response.status)))
         }
-        Ok(_) => Asked::Stopping,
+        Ok(response) if response.status != 0 => Asked::Stopping(Some(response.message)),
+        Ok(_) => Asked::Stopping(None),
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Asked::Failed(
             format!("the handler did not answer within {} s", wait.as_secs()),
         ),
@@ -769,7 +771,9 @@ fn ask_stop(info: &pointer::Info, wait: Duration) -> Asked {
 
 /// [`stop`], waiting at most `wait`. A connection closed unread is asked again once, after
 /// [`ASK_AGAIN`]: a handler that answers then was serving, and stops; one that closes it again
-/// is stopping, and is waited for.
+/// is stopping, and is waited for. A handler that answers other than `#0` stops as well, and is
+/// waited for the same; once it is gone, the stop fails with what it answered (as TSVZ.py's does
+/// by its status).
 fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
     let refused = |why: String| Error::Refused(format!("{}: {why}", store.display()));
     let info = match pointer::lookup(store) {
@@ -779,9 +783,13 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
     };
     let deadline = Instant::now() + wait;
     let there = || pointer::names_handler(store, &info);
+    let mut answered = None;
     for again in [false, true] {
         match ask_stop(&info, deadline.saturating_duration_since(Instant::now())) {
-            Asked::Stopping => break,
+            Asked::Stopping(said) => {
+                answered = said;
+                break;
+            }
             Asked::Failed(why) => return Err(refused(why)),
             // Closed again, or not reached once seen closing: it is stopping.
             _ if again => break,
@@ -798,7 +806,10 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
         }
     }
     if pointer::wait_gone(store, &info, deadline) {
-        Ok(())
+        match answered {
+            None => Ok(()),
+            Some(why) => Err(refused(format!("the handler stopped, but {why}"))),
+        }
     } else {
         Err(refused(format!(
             "the handler (pid {}) has not stopped within {} s",
@@ -894,6 +905,38 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn a_stop_the_handler_answers_with_a_failure_waits_for_it_to_go_and_says_what_it_answered() {
+        // A handler that lost a write it acknowledged answers `stop` with #1 and stops all the same:
+        // the stop waits until it is gone, as after #0, then fails saying what it answered
+        // (0.2.1 failed at once with "stop failed", as if it were still running).
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.tsvz");
+        let (listener, held) = stand_in(dir.path(), &store);
+        let at = pointer::path_of(&store);
+        let handler = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&conn).read_line(&mut line).unwrap();
+            let lost = Response::failed(1, "writes answered before they were made were lost");
+            conn.write_all(&lost.encode()).unwrap();
+            std::thread::sleep(Duration::from_millis(400)); // writing its queue
+            std::fs::remove_file(at).unwrap(); // gone
+            drop((conn, held));
+        });
+        let started = Instant::now();
+        let e = stop_within(&store, Duration::from_secs(20)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(350), "{e}");
+        let said = e.to_string();
+        assert!(
+            said.contains("the handler stopped, but writes answered"),
+            "{said}"
+        );
+        assert!(!said.contains("stop failed"), "{said}");
         handler.join().unwrap();
     }
 
