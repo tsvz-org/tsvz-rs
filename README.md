@@ -107,6 +107,21 @@ share a store: their file locks exclude each other. Where the specification leav
 tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
 choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
+## Upgrading to 0.2.2 from 0.2.1
+
+Stores need nothing; the library's documented API does not change.
+
+- Loose files: an append to a compressed one that holds something begins with a newline, so its
+  last line is never joined (TSVZ.py's append joins it); `setdefault` of a missing key prints the
+  row `get` then reads (none, exit 3, where the line it wrote is a deletion); `clear` writes an
+  empty line 1 where line 1 was no comment, as TSVZ.py's does; `scrub` keeps what TSVZ.py's strict
+  reader reads too; `scrub` and `clear` take a file named `app.tsv.1` as one file. Reads that
+  want few rows (`get`, `len`, `keys`) take less CPU, and a row holds only its own cells.
+- Through a handler: `tsvz stop` of a handler that died, or that closed one connection for want of
+  a thread, ends at once (it waited 30 s); a stop that cannot make every acknowledged write
+  durable exits 1, and so does `serve`; a request that sets `#_write_ack_#` is answered once its
+  own writes are synced; a `pop` whose client went away before its answer puts its row back.
+
 ## Upgrading to 0.2.1 from 0.2.0
 
 Stores need nothing; the library's documented API does not change.
