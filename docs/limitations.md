@@ -91,37 +91,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 build (h021); a deferral under the user's standing rule that
   deferrals are noted, not asked.
 
-### Reads of a loose file take more CPU than 0.2.0's, and pad every line
-- Kind: deferred
-- What the operator sees: reading a loose file (`.tsv .csv .nsv .psv`) costs more CPU than in 0.2.0: on a 120 MB
-  `.tsv` of 2,000,000 rows of four cells, `get` of one key takes 0.21 s (0.2.0: 0.10 s), `len` 1.27 s (1.01 s), `keys`
-  1.18 s (1.03 s) and `read` 1.64 s (1.28 s); memory is the same, and a strict store is not affected. A file whose
-  first keyed line is very wide (a second opinion's reading, not measured: 10,000 tabs, then a million rows) costs a
-  step per
-  padded cell on every line, and a whole read holds every row padded to that width (8 bytes a cell), where 0.2.0 held
-  each row's own cells and padded them when it printed them.
-- Why: a loose line is read by TSVZ.py's line rule, which splits and decodes every cell of every line, and pads it to
-  the file's column count, before the read asks whether it wants that key.
-- Revisit when: 0.2.2. The plan: decode a line's key, count its cells and test them for a value without building them;
-  decode and pad the cells only for a `#_defaults_#` line or a key the read wants (a row keeps its own cells and is
-  padded when it is read).
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A head read can hold what one page of compressed input decodes to
-- Kind: deferred
-- What the operator sees: a loose `delete` in a compressed file (a read that stops at the file's first keyed line)
-  holds about 1 MiB of a member and, by the formats' best ratios, as much as one 64 KiB page of input decodes to
-  before the next check: up to 64 MiB for deflate (1032 to one) and 2 GiB for zstd (a 128 KiB run-length block in 4
-  bytes). Only crafted input reaches that (from the formats' ratios, not measured); files compressed by tsvz-rs or
-  TSVZ.py stay near 1 MiB.
-- Why: the decoder takes a whole page of input per call, and the part reader checks the output's length after the
-  call.
-- Revisit when: 0.2.2. The plan: give the decoder a bounded output buffer per call (the part reader then tells a stop
-  at that cap from a stall), and say the real bound in `codec::read_items`'s comment.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A routed `pop` or `popitem` whose answer is lost in transit loses its row
 - Kind: deferred
 - What the operator sees: the handler deletes the row before its answer is written to the client: a client that times

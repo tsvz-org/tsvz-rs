@@ -187,6 +187,28 @@ pub(crate) fn reads_back<'l>(
 /// nothing: empty, a comment (it begins with `#`, but not with `#_defaults_#`), or one whose key is
 /// empty once decoded (only whitespace). `line` is the line without its `\n`.
 pub(crate) fn parse(line: &str, d: u8, terminated: bool) -> Option<Vec<Cow<'_, str>>> {
+    split(line, d, terminated).map(Split::cells)
+}
+
+/// A line as [`parse`] reads it, but for its cells after the key, which are decoded only when
+/// asked for ([`Split::cells`]): a read that does not want a row's cells counts them and tells
+/// whether they hold a value without decoding them.
+pub(crate) struct Split<'l> {
+    /// The key, decoded.
+    pub(crate) key: Cow<'l, str>,
+    /// The fields after the key, as the line has them (None for a key alone).
+    rest: Option<&'l str>,
+    d: u8,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many lines' cells this thread decoded ([`Split::cells`]), for a test.
+    pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The line `line` split as [`parse`] reads it; None for a line read as nothing.
+pub(crate) fn split(line: &str, d: u8, terminated: bool) -> Option<Split<'_>> {
     let mut line = line.trim_start_matches('\0');
     if !terminated {
         line = line.trim_end_matches('\0');
@@ -195,8 +217,42 @@ pub(crate) fn parse(line: &str, d: u8, terminated: bool) -> Option<Vec<Cow<'_, s
     if line.is_empty() || (line.starts_with('#') && !line.starts_with(DEFAULTS)) {
         return None;
     }
-    let cells: Vec<Cow<str>> = line.split(d as char).map(|c| unsanitize(c, d)).collect();
-    (!cells[0].is_empty()).then_some(cells)
+    let (key, rest) = match line.split_once(d as char) {
+        Some((key, rest)) => (key, Some(rest)),
+        None => (line, None),
+    };
+    let key = unsanitize(key, d);
+    (!key.is_empty()).then_some(Split { key, rest, d })
+}
+
+impl<'l> Split<'l> {
+    /// How many cells the line has, its key's included.
+    pub(crate) fn count(&self) -> usize {
+        1 + self
+            .rest
+            .map_or(0, |r| memchr::memchr_iter(self.d, r.as_bytes()).count() + 1)
+    }
+
+    /// Whether the cells after the key are none or all empty once decoded ([`valueless`]): a
+    /// field decodes to nothing exactly when it is only whitespace.
+    pub(crate) fn valueless(&self) -> bool {
+        self.rest.is_none_or(|r| {
+            r.split(self.d as char)
+                .all(|f| f.trim_end_matches(py_space).is_empty())
+        })
+    }
+
+    /// The line's cells, its key first, each decoded ([`parse`]).
+    pub(crate) fn cells(self) -> Vec<Cow<'l, str>> {
+        #[cfg(test)]
+        DECODED.with(|n| n.set(n.get() + 1));
+        let d = self.d;
+        let mut cells = vec![self.key];
+        if let Some(rest) = self.rest {
+            cells.extend(rest.split(d as char).map(|c| unsanitize(c, d)));
+        }
+        cells
+    }
 }
 
 /// Whether a line's cells after its key are none or all empty: a deletion, a reset of the

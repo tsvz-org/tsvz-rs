@@ -1452,6 +1452,51 @@ mod tests {
     }
 
     #[test]
+    fn a_loose_read_decodes_the_cells_of_the_rows_it_wants_only() {
+        // 0.2.1 decoded every line's cells, and padded them, before it asked whether the read
+        // wanted that key: `get` of one key in a 120 MB file took twice 0.2.0's time.
+        use crate::loose::DECODED;
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (0..1000).map(|i| format!("k{i}\t{i}\tx\n")).collect();
+        let p = write(dir.path(), "s.tsv", format!("#_defaults_#\tP\tQ\n{text}").as_bytes());
+        DECODED.with(|n| n.set(0));
+        let one = Options {
+            scope: Scope::Keys(vec!["k5".into()]),
+            ..Options::default()
+        };
+        let s = Store::open(&p, one).unwrap();
+        assert_eq!(s.get("k5").unwrap().to_vec(), ["5", "x"]);
+        // the key named (`loose::lookup` reads it as a line), the `#_defaults_#` line, whose cells
+        // every later row may take, and the row wanted
+        assert_eq!(DECODED.with(|n| n.get()), 3);
+        DECODED.with(|n| n.set(0));
+        let keys = Options {
+            scope: Scope::KeysOnly,
+            ..Options::default()
+        };
+        assert_eq!(Store::open(&p, keys).unwrap().len(), 1000);
+        assert_eq!(DECODED.with(|n| n.get()), 1);
+    }
+
+    #[test]
+    fn a_loose_row_keeps_its_own_cells_padded_only_where_a_default_fills_one() {
+        // A wide first keyed line made every row hold that many cells (8 bytes a cell): a row is
+        // padded as it is read, as 0.2.0 did, and holds its own cells.
+        let dir = tempfile::tempdir().unwrap();
+        let wide = format!("k{}\nb\t1\n", "\tv".repeat(9));
+        let p = write(dir.path(), "w.tsv", wide.as_bytes());
+        let s = Store::open(&p, Options::default()).unwrap();
+        let b = s.get("b").unwrap();
+        assert_eq!((b.written(), b.len()), (1, 9));
+        assert_eq!(b.to_vec(), [&["1"][..], &[""; 8]].concat());
+        // A default fills a cell padded for it, and only as far as the defaults go.
+        let p = write(dir.path(), "d.tsv", b"#_defaults_#\t\tP\nk\t1\t2\t3\t4\nb\tx\n");
+        let s = Store::open(&p, Options::default()).unwrap();
+        let b = s.get("b").unwrap();
+        assert_eq!((b.written(), b.to_vec()), (2, vec!["x".to_string(), "P".to_string()]));
+    }
+
+    #[test]
     fn rows_pad_to_the_width_of_the_first_data_row() {
         let dir = tempfile::tempdir().unwrap();
         // The first data row sets the width even when a tombstone later removes it.

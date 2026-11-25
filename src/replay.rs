@@ -601,9 +601,9 @@ impl Replay {
     /// line sets those (its own empty cells taking the ones before), and is no row. A line read as
     /// nothing is a comment, or empty, or a key of only whitespace; line 1 there is the header.
     fn loose_line(&mut self, text: &str, terminated: bool, sink: &mut dyn Sink) {
-        use crate::loose::{DEFAULTS, parse, valueless};
+        use crate::loose::{DEFAULTS, split, valueless};
         let d = self.format.delimiter;
-        let Some(mut cells) = parse(text, d, terminated) else {
+        let Some(line) = split(text, d, terminated) else {
             // Without the NULs a reader drops: at its start, and at the end of an unterminated one.
             let line = text.trim_start_matches('\0');
             let line = if terminated {
@@ -619,16 +619,29 @@ impl Replay {
         };
         self.lines_read += 1;
         let defaults = &mut self.loose_defaults;
-        let width = *self.loose_width.get_or_insert(if defaults.len() > 1 {
-            defaults.len()
-        } else {
-            cells.len()
+        let width = *self.loose_width.get_or_insert_with(|| {
+            if defaults.len() > 1 {
+                defaults.len()
+            } else {
+                line.count()
+            }
         });
         if self.one_column.is_none() {
             self.one_column = Some(width == 1);
             self.width = Some(width - 1);
         }
-        let is_defaults = cells[0] == DEFAULTS;
+        let is_defaults = line.key == DEFAULTS;
+        if !is_defaults && !sink.wants_cells(&line.key) {
+            // No cell of the row is read: none is decoded.
+            if width > 1 && line.valueless() {
+                sink.delete(&line.key);
+            } else {
+                let binding = self.binding();
+                sink.put(&line.key, Cells::default(), &binding);
+            }
+            return;
+        }
+        let mut cells = line.cells();
         if valueless(&cells) {
             if width == 1 {
                 self.put_loose(&cells, sink);
@@ -640,7 +653,17 @@ impl Replay {
             return;
         }
         if cells.len() < width {
-            cells.resize(width, Cow::Borrowed(""));
+            // A row keeps its own cells, padded only as far as a default may fill one: it is
+            // padded to the column count as it is read (`Row`), and a cell padded here past the
+            // defaults would stay empty.
+            let to = match (is_defaults, defaults.len() > 1) {
+                (true, _) => width,
+                (false, true) => width.min(defaults.len()),
+                (false, false) => 0,
+            };
+            if cells.len() < to {
+                cells.resize(to, Cow::Borrowed(""));
+            }
         } else {
             while cells.len() > width && cells.last().is_some_and(|c| c.is_empty()) {
                 cells.pop();
