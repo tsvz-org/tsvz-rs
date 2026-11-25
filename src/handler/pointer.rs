@@ -157,21 +157,37 @@ pub fn lookup(store: &Path) -> Result<Option<Info>, String> {
     trust(store, &path, fields, &meta)
 }
 
-/// Whether `store`'s pointer file still names the handler with process id `pid`. One that cannot
-/// be read or is not trusted says nothing of the handler, so it counts as still naming it.
-pub fn names_handler(store: &Path, pid: &str) -> bool {
+/// Whether a handler holds the pointer file of `store`: its `flock`, which the system lets go when
+/// the handler's process ends, so that a handler killed before it removed its pointer file holds
+/// none. True when that cannot be told (the file cannot be opened, or locking it fails otherwise
+/// than because the lock is held). The look takes a shared lock for a moment, when none is held: a
+/// `serve` that starts in that moment finds the file busy.
+pub fn held(store: &Path) -> bool {
+    let Ok(file) = open_pointer(&path_of(store)) else {
+        return true;
+    };
+    // SAFETY: flock only operates on the descriptor, which `file` keeps open; closing it lets go
+    // of the lock taken here.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+}
+
+/// Whether `store`'s pointer file still names the handler `handler`: the same process id and
+/// address (another handler may have the same id, reused), and a handler holds it ([`held`]). One
+/// that cannot be read or is not trusted says nothing of the handler, so it counts as still naming
+/// it.
+pub fn names_handler(store: &Path, handler: &Info) -> bool {
     match lookup(store) {
         Ok(None) => false,
-        Ok(Some(now)) => now.pid == pid,
+        Ok(Some(now)) => now.pid == handler.pid && now.address == handler.address && held(store),
         Err(_) => true,
     }
 }
 
-/// Wait until the pointer file of `store` no longer names the handler with process id `pid`,
-/// which a handler removes once every write it acknowledged is written; false when `deadline`
-/// comes first.
-pub fn wait_gone(store: &Path, pid: &str, deadline: Instant) -> bool {
-    while names_handler(store, pid) {
+/// Wait until the pointer file of `store` no longer names the handler `handler`, which removes it
+/// once every write it acknowledged is written, or holds it no longer (its process ended); false
+/// when `deadline` comes first.
+pub fn wait_gone(store: &Path, handler: &Info, deadline: Instant) -> bool {
+    while names_handler(store, handler) {
         if Instant::now() >= deadline {
             return false;
         }
@@ -756,25 +772,70 @@ mod tests {
         assert_eq!(trust(&s, &path_of(&s), fields, &meta), Ok(None));
     }
 
+    /// The handler `text` names: pid 1 at `address`.
+    fn handler(address: &str) -> Info {
+        Info {
+            address: address.into(),
+            host: hostname(),
+            pid: "1".into(),
+            owner: 0,
+        }
+    }
+
+    /// The pointer file of `store`, locked as a handler holds it.
+    fn hold(store: &Path) -> File {
+        let file = open_pointer(&path_of(store)).unwrap();
+        assert!(try_flock(&file).unwrap());
+        file
+    }
+
     #[test]
     fn a_pointer_that_cannot_be_trusted_still_names_its_handler() {
-        // Only a pointer file that is gone, or names another process, says the handler stopped.
+        // Only a pointer file that is gone, or names another handler, or that no handler holds,
+        // says the handler stopped.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
+        let one = handler("unix:/x/s");
         plant(&s, &text("unix:/x/s", &hostname()), 0o644);
-        assert!(names_handler(&s, "1"));
-        assert!(!names_handler(&s, "2"));
+        let lock = hold(&s);
+        assert!(names_handler(&s, &one));
+        assert!(!names_handler(&s, &Info { pid: "2".into(), ..one.clone() }));
+        // The same pid at another address: another handler, with a pid that was reused.
+        assert!(!names_handler(&s, &handler("unix:/y/s")));
+        drop(lock);
         plant(&s, &text("unix:/x/s", &hostname()), 0o620);
+        let lock = hold(&s);
         assert!(lookup(&s).is_err());
-        assert!(names_handler(&s, "1"), "a pointer not trusted is no sign");
+        assert!(names_handler(&s, &one), "a pointer not trusted is no sign");
         let soon = Instant::now() + Duration::from_millis(120);
         assert!(
-            !wait_gone(&s, "1", soon),
+            !wait_gone(&s, &one, soon),
             "it still names it at the deadline"
         );
+        drop(lock);
         fs::remove_file(path_of(&s)).unwrap();
-        assert!(!names_handler(&s, "1"));
-        assert!(wait_gone(&s, "1", soon));
+        assert!(!names_handler(&s, &one));
+        assert!(wait_gone(&s, &one, soon));
+    }
+
+    #[test]
+    fn a_pointer_no_handler_holds_names_none() {
+        // A handler killed before it removed its pointer file holds its lock no longer: the file
+        // still names it, but it is gone, at once.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let one = handler("unix:/x/s");
+        plant(&s, &text("unix:/x/s", &hostname()), 0o644);
+        let lock = hold(&s);
+        assert!(held(&s) && names_handler(&s, &one));
+        drop(lock);
+        assert!(!held(&s));
+        assert!(!names_handler(&s, &one));
+        let started = Instant::now();
+        assert!(wait_gone(&s, &one, started + Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // The look let go of its own lock: a handler can take the file.
+        take(&s).unwrap().release();
     }
 
     #[test]

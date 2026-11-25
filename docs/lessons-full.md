@@ -230,3 +230,20 @@ entries go last, in the same commit as the change:
 - Lesson: when a write is made only while the file is as it was read, check what the decision depended on (here: the same
   file, no shorter, its end as it was), not a stamp of everything; a stamp refuses every change, the harmless ones
   too, and so fails under the load it was meant to tolerate.
+
+## 2026-11-25 A handler is gone when no process holds its pointer file
+- Changed: `tsvz stop`, and a routed `pop` that puts its row back on the files, take a handler for gone once its
+  pointer file no longer names it by pid and address, or once no process holds the file's `flock` (the system lets
+  go of it when the handler's process ends); a stop finds no handler to stop in a pointer file no process holds. A
+  stop whose connection is closed unread asks once more, 100 ms later, before it waits for the handler to go.
+- Why we had to change: 0.2.1 told a gone handler by the pointer file's name and pid alone. A handler killed after
+  it answered a stop, or a pop, left its file, which still named it: the stop waited 30 s and failed (0.2.0 exited 0
+  after 10 s), and the pop's command waited 30 s and printed its row on standard error instead of putting it back;
+  another handler with the same pid (reused) was taken for the one asked; and a handler that closed one connection
+  for want of a descriptor or a thread was taken for one stopping (0.2.1's final review).
+- Original design was wrong because: it judged a process by a record the process wrote, which outlives a process
+  that is killed, and whose pid the system gives to the next one; the handler already held a lock that the system
+  releases at exactly the moment that matters.
+- Lesson: to tell whether the process behind a file is still there, ask the kernel lock it holds on that file,
+  released when the process ends, not the name, pid or address it wrote; a record outlives the writer that is
+  killed before it removes it.

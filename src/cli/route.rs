@@ -114,7 +114,7 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
                 && response.status == 0
                 && !response.lines.is_empty() =>
         {
-            Some(deliver(ctx, &mut client, &info.pid, &response))
+            Some(deliver(ctx, &mut client, &info, &response))
         }
         Ok(response) => Some(print(ctx, &response)),
         // A read applies nothing: the reason alone, not a write's "may or may not have been applied".
@@ -133,15 +133,16 @@ pub(crate) fn route(ctx: &mut Ctx) -> Option<Result<i32, Error>> {
 /// files the row is printed first): when it cannot be printed (a closed pipe, a full disk), it
 /// is put back with `setdefault`, which keeps a row written for its key since, and the command
 /// fails. When the handler does not put it back because it went away or is stopping, the
-/// `setdefault` is made on the files once its pointer file no longer names it (`pid`), which it
-/// removes after it has written its queue: sooner, a write it acknowledged to another client
+/// `setdefault` is made on the files once its pointer file no longer names it (`handler`), which it
+/// removes after it has written its queue, or its process has ended (a handler that died holds the
+/// file's lock no longer): sooner, a write it acknowledged to another client
 /// could land after the put-back reads the files and be overwritten by it. A handler that
 /// answers otherwise than that it is stopping is still serving the store, and the files are left
 /// alone. Where the row cannot be put back, it is printed on standard error.
 fn deliver(
     ctx: &mut Ctx,
     client: &mut Client,
-    pid: &str,
+    handler: &pointer::Info,
     response: &Response,
 ) -> Result<i32, Error> {
     let printed = {
@@ -189,9 +190,7 @@ fn deliver(
             };
             let files = if !stopping {
                 Err("the handler is still serving the store, so the files were left alone".into())
-            } else if !pointer::wait_gone(&ctx.store, pid, Instant::now() + STOP_WAIT) {
-                // (a handler that died leaves its pointer file, which still names it: the wait runs
-                // its time out and the row is printed; docs/limitations.md says how 0.2.2 tells it)
+            } else if !pointer::wait_gone(&ctx.store, handler, Instant::now() + STOP_WAIT) {
                 Err(format!(
                     "the handler has not finished stopping within {} s, so the files were left alone",
                     STOP_WAIT.as_secs()

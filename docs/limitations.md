@@ -152,25 +152,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### `tsvz stop` can wait 30 s and fail where the old stop answered at once
-- Kind: deferred
-- What the operator sees: two cases (a second opinion's reading of the code, not reproduced). (1) The handler closes a
-  connection unanswered for a reason of its own (no descriptor left, no thread to start): `tsvz stop` takes that for
-  "stopping already", waits 30 s and fails with `has not stopped within 30 s` while the handler serves (0.2.0 failed
-  at once). (2) A handler killed after it replied to a stop and before it removed its pointer file leaves the file,
-  which still names it: `tsvz stop` waits 30 s and fails (0.2.0 gave 0 after 10 s). (3) The same stale pointer after
-  a routed `pop` or `popitem`: a handler that dies after answering the pop and before the command prints the row (the
-  put-back path, `cli::route`) leaves its pointer, so the command waits 30 s for it to go, leaves the files alone and
-  prints the row on standard error (0.2.0 printed the row at once and never put it back).
-- Why: the stop, and the put-back after a routed pop, tell a handler that is gone from one that is not by the
-  pointer file's name alone.
-- Revisit when: 0.2.2. The plan: also try the pointer file's `flock`, which the system releases when the handler's
-  process ends (gone when it can be taken), and after a close with no answer ask once more after a short wait: a
-  handler that answers is serving, and the stop says so at once. The put-back asks the same question
-  (`pointer::wait_gone`), so a dead handler's row goes back at once.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
 ### A routed `pop` or `popitem` whose answer is lost in transit loses its row
 - Kind: deferred
 - What the operator sees: the handler deletes the row before its answer is written to the client: a client that times
@@ -205,16 +186,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   process. `tsvz serve` itself exits.
 - Why: `serve` blocks the signals for the thread it started in and never restores the mask.
 - Revisit when: 0.2.2. The plan: restore the mask and end the signal thread when `serve` returns.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### The stop's gone check compares the process id alone
-- Kind: deferred
-- What the operator sees: a pointer file of another handler that has the process id of the one `tsvz stop` stopped (a
-  pid that was reused) is that handler to `tsvz stop`, which waits for it to go (a second opinion's reading, not
-  reproduced).
-- Why: the gone check compares the pid alone.
-- Revisit when: 0.2.2. The plan: compare the pointer's address too.
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 

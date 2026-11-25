@@ -601,32 +601,36 @@ fn answer(
 pub const STOP_WAIT: Duration = Duration::from_secs(2 * FINISH.as_secs() + 20);
 
 /// Ask the handler of `store` to stop and wait until it has (§21.13.2): Ok once its pointer file
-/// no longer names it, which it removes once every acknowledged write is written; also when
-/// another stop, a signal or its idle timeout stopped it first. An error when there is no
-/// handler, when it does not answer, or when it is still there after [`STOP_WAIT`].
+/// no longer names it, which it removes once every acknowledged write is written, or no handler
+/// holds it (its process ended); also when another stop, a signal or its idle timeout stopped it
+/// first. An error when there is no handler, when it does not answer, or when it is still there
+/// after [`STOP_WAIT`].
 pub fn stop(store: &Path) -> Result<(), Error> {
     stop_within(store, STOP_WAIT)
 }
 
-/// [`stop`], waiting at most `wait`.
-fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
-    let refused = |why: String| Error::Refused(format!("{}: {why}", store.display()));
-    let info = match pointer::lookup(store) {
-        Ok(Some(info)) => info,
-        Ok(None) => return Err(refused("no handler is running".into())),
-        Err(why) => return Err(refused(why)),
-    };
-    let deadline = Instant::now() + wait;
-    let there = || pointer::names_handler(store, &info.pid);
-    let mut conn = match pointer::connect(&info, None) {
+/// How long a stop whose connection was closed unread waits before it asks again: ten times the
+/// accept loop's pause when it has no descriptor for a connection, the one wait of a handler that
+/// closes a connection for a reason of its own (no descriptor, no thread to start).
+const ASK_AGAIN: Duration = Duration::from_millis(100);
+
+/// What one `stop` request came to.
+enum Asked {
+    /// Answered `#0`: the handler stops.
+    Stopping,
+    /// Closed unread: the handler is stopping already, or closed it for a reason of its own.
+    Closed,
+    /// Not answered in time, or answered otherwise: why.
+    Failed(String),
+    /// Not reached.
+    Unreachable(String),
+}
+
+/// Send one `stop` request to the handler `info` names, waiting at most `wait` for its answer.
+fn ask_stop(info: &pointer::Info, wait: Duration) -> Asked {
+    let mut conn = match pointer::connect(info, None) {
         Ok(conn) => conn,
-        Err(_) if !there() => return Ok(()), // it stopped meanwhile
-        Err(e) => {
-            return Err(refused(format!(
-                "the handler does not answer ({})",
-                e.message
-            )));
-        }
+        Err(e) => return Asked::Unreachable(e.message),
     };
     let _ = conn.set_read_timeout(Some(wait.max(Duration::from_millis(1))));
     let answer = conn
@@ -634,20 +638,47 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
         .and_then(|()| read_response(&mut BufReader::new(&conn)));
     match answer {
         Ok(response) if response.status != 0 => {
-            return Err(refused(format!("stop failed: {}", response.message)));
+            Asked::Failed(format!("stop failed: {}", response.message))
         }
-        Ok(_) => {}
-        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            return Err(refused(format!(
-                "the handler did not answer within {} s",
-                wait.as_secs()
-            )));
-        }
-        // Closed unread: the handler is stopping already (another stop, a signal, its idle
-        // timeout), and this stop waits for it as the one that asked first does.
-        Err(_) => {}
+        Ok(_) => Asked::Stopping,
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Asked::Failed(
+            format!("the handler did not answer within {} s", wait.as_secs()),
+        ),
+        Err(_) => Asked::Closed,
     }
-    if pointer::wait_gone(store, &info.pid, deadline) {
+}
+
+/// [`stop`], waiting at most `wait`. A connection closed unread is asked again once, after
+/// [`ASK_AGAIN`]: a handler that answers then was serving, and stops; one that closes it again
+/// is stopping, and is waited for.
+fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
+    let refused = |why: String| Error::Refused(format!("{}: {why}", store.display()));
+    let info = match pointer::lookup(store) {
+        Ok(Some(info)) if pointer::held(store) => info,
+        Ok(_) => return Err(refused("no handler is running".into())),
+        Err(why) => return Err(refused(why)),
+    };
+    let deadline = Instant::now() + wait;
+    let there = || pointer::names_handler(store, &info);
+    for again in [false, true] {
+        match ask_stop(&info, deadline.saturating_duration_since(Instant::now())) {
+            Asked::Stopping => break,
+            Asked::Failed(why) => return Err(refused(why)),
+            // Closed again, or not reached once seen closing: it is stopping.
+            _ if again => break,
+            Asked::Closed => {
+                std::thread::sleep(ASK_AGAIN);
+                if !there() {
+                    return Ok(()); // it stopped meanwhile
+                }
+            }
+            Asked::Unreachable(_) if !there() => return Ok(()), // it stopped meanwhile
+            Asked::Unreachable(why) => {
+                return Err(refused(format!("the handler does not answer ({why})")));
+            }
+        }
+    }
+    if pointer::wait_gone(store, &info, deadline) {
         Ok(())
     } else {
         Err(refused(format!(
@@ -691,8 +722,9 @@ mod tests {
         })
     }
 
-    /// A pointer file of `store` naming a socket this test listens on: a stand-in handler.
-    fn stand_in(dir: &Path, store: &Path) -> UnixListener {
+    /// A pointer file of `store` naming a socket this test listens on: a stand-in handler, and
+    /// the pointer file, locked as a handler holds it (dropped, the handler's process ended).
+    fn stand_in(dir: &Path, store: &Path) -> (UnixListener, std::fs::File) {
         let sock = dir.join("sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let at = pointer::path_of(store);
@@ -703,7 +735,65 @@ mod tests {
         );
         std::fs::write(&at, text).unwrap();
         std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o644)).unwrap();
-        listener
+        let held = std::fs::File::open(&at).unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock only operates on the descriptor, which `held` keeps open.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        (listener, held)
+    }
+
+    /// Answer one `stop` on `listener` with `#0`; the connection, still open.
+    fn answer_stop(listener: &UnixListener) -> UnixStream {
+        use std::io::BufRead;
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&conn).read_line(&mut line).unwrap();
+        assert_eq!(line, "stop\n");
+        conn.write_all(b"#0\n").unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_stop_whose_connection_was_closed_for_another_reason_asks_again() {
+        // A handler that closes a connection for a reason of its own (no descriptor, no thread to
+        // start) is serving: the stop asked again is answered, and the handler stops, at once
+        // (0.2.1 took the close for a stop under way and waited 30 s for it).
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.tsvz");
+        let (listener, held) = stand_in(dir.path(), &store);
+        let at = pointer::path_of(&store);
+        let handler = std::thread::spawn(move || {
+            drop(listener.accept().unwrap()); // closed unread, and serving on
+            let conn = answer_stop(&listener);
+            std::fs::remove_file(at).unwrap(); // gone
+            drop((conn, held));
+        });
+        let started = Instant::now();
+        stop_within(&store, Duration::from_secs(20)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn a_stop_of_a_handler_that_died_after_its_answer_ends_at_once() {
+        // Killed after it answered and before it removed its pointer file: the file still names
+        // it, but no process holds its lock, so the handler is gone (0.2.1 waited 30 s, then
+        // failed); and a pointer file that no handler holds is no handler to stop.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.tsvz");
+        let (listener, held) = stand_in(dir.path(), &store);
+        let handler = std::thread::spawn(move || {
+            let conn = answer_stop(&listener);
+            drop(held); // its process ended: the system lets go of its lock
+            conn
+        });
+        let started = Instant::now();
+        stop_within(&store, Duration::from_secs(20)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        drop(handler.join());
+        assert!(pointer::path_of(&store).exists(), "left as it was");
+        let e = stop_within(&store, Duration::from_secs(20)).unwrap_err();
+        assert!(e.to_string().contains("no handler is running"), "{e}");
     }
 
     #[test]
@@ -712,7 +802,7 @@ mod tests {
         // unread, and this stop waits for it to be gone as the first does, and succeeds.
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("s.tsvz");
-        let listener = stand_in(dir.path(), &store);
+        let (listener, _held) = stand_in(dir.path(), &store);
         let at = pointer::path_of(&store);
         let handler = std::thread::spawn(move || {
             drop(listener.accept().unwrap()); // closed unread
@@ -727,17 +817,10 @@ mod tests {
     fn a_stop_fails_when_the_handler_is_still_there_after_its_wait() {
         // A handler that answers and is not gone in time (slow writes, or killed before it
         // removed its pointer file): the stop says so, and does not report it stopped.
-        use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("s.tsvz");
-        let listener = stand_in(dir.path(), &store);
-        let handler = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            BufReader::new(&conn).read_line(&mut line).unwrap();
-            conn.write_all(b"#0\n").unwrap();
-            conn
-        });
+        let (listener, _held) = stand_in(dir.path(), &store);
+        let handler = std::thread::spawn(move || answer_stop(&listener));
         let e = stop_within(&store, Duration::from_millis(500)).unwrap_err();
         assert!(e.to_string().contains("has not stopped within"), "{e}");
         drop(handler.join());
@@ -748,7 +831,7 @@ mod tests {
         use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("s.tsvz");
-        let listener = stand_in(dir.path(), &store);
+        let (listener, _held) = stand_in(dir.path(), &store);
         let handler = std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
             let mut line = String::new();

@@ -143,8 +143,10 @@ fn store(dir: &Path, content: &str) -> PathBuf {
 }
 
 /// The pointer file of `store` naming a socket this test listens on: a stand-in for a handler,
-/// to do with a connection what a real one does only when the timing allows.
-fn stand_in_handler(dir: &Path, store: &Path) -> UnixListener {
+/// to do with a connection what a real one does only when the timing allows; and the pointer file,
+/// locked as a handler holds it (a command takes a pointer file that no process holds for one its
+/// handler left when it ended).
+fn stand_in_handler(dir: &Path, store: &Path) -> (UnixListener, fs::File) {
     let sock = dir.join("sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let at = pointer::path_of(store);
@@ -159,7 +161,11 @@ fn stand_in_handler(dir: &Path, store: &Path) -> UnixListener {
     )
     .unwrap();
     fs::set_permissions(&at, fs::Permissions::from_mode(0o644)).unwrap();
-    listener
+    let held = fs::File::open(&at).unwrap();
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock only operates on the descriptor, which `held` keeps open.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    (listener, held)
 }
 
 /// The next connection to a stand-in handler, with a limit on every wait for its request: a
@@ -610,7 +616,7 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
     let s = store(dir.path(), "k\tv\n");
     let (code, direct, _) = cli(dir.path(), &["--x-direct", "get", "s.tsvz", "k"], b"");
     assert_eq!(code, 0);
-    let listener = stand_in_handler(dir.path(), &s);
+    let (listener, _held) = stand_in_handler(dir.path(), &s);
     let closer = std::thread::spawn(move || {
         // The read's connection: closed once its request came, unanswered.
         let conn = accept_within_10s(&listener);
@@ -655,9 +661,10 @@ fn pop_a_from_a_stand_in<T: Send + 'static>(
     then: impl FnOnce(UnixStream, &Path, &Path) -> T + Send + 'static,
 ) -> (Output, T) {
     use std::io::BufRead;
-    let listener = stand_in_handler(dir, s);
+    let (listener, held) = stand_in_handler(dir, s);
     let (part, at) = (s.to_path_buf(), pointer::path_of(s));
     let handler = std::thread::spawn(move || {
+        let _held = held;
         let conn = accept_within_10s(&listener);
         let mut request = String::new();
         BufReader::new(&conn).read_line(&mut request).unwrap();
@@ -704,6 +711,34 @@ fn a_row_taken_and_not_printed_is_put_back_on_the_files_when_the_handler_has_hun
         Some(vec!["1".to_string()])
     );
     assert!(left.get("b").is_some());
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_put_back_at_once_when_the_handler_died() {
+    // The handler died after it answered (killed): its pointer file is left and still names it,
+    // but no process holds its lock, so the row goes back on the files at once (0.2.1 waited 30 s
+    // for the file to go, then printed the row on standard error).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let started = Instant::now();
+    let (out, ()) = pop_a_from_a_stand_in(dir.path(), &s, true, |_conn, _part, _at| {});
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("it was put back"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(pointer::path_of(&s).exists(), "left by the handler that died");
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    assert_eq!(
+        left.get("a").map(|r| r.to_vec()),
+        Some(vec!["1".to_string()])
+    );
 }
 
 #[test]
