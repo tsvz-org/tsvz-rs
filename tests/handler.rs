@@ -562,6 +562,41 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
 }
 
 #[test]
+fn a_second_signal_during_a_stop_does_not_end_serve() {
+    // The stop waits for a write (here the part's lock, held past the signals); the operator
+    // presses Ctrl-C again, or sends HUP after TERM. Each is taken and changes nothing: left
+    // pending, it ended `serve` by its default action once it gave its signal mask back, after the
+    // stop was done (0.2.2's first build; 0.2.1 ended with status 0).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let mut served = Served::start(&s, &[]);
+    let mut client = tsvz::handler::Client::connect(&s).unwrap();
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let popper = std::thread::spawn(move || client.pop("a"));
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    served.signal(libc::SIGTERM);
+    wait_until_stopping(&served);
+    served.signal(libc::SIGHUP);
+    served.signal(libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(300)); // the signals are taken; the stop still waits
+    drop(held);
+    let popped = popper.join().unwrap();
+    assert_eq!(served.wait(), 0, "{}", served.stderr()); // -1: ended by a signal
+    assert!(
+        served.stderr().contains("stopped serving"),
+        "{}",
+        served.stderr()
+    );
+    assert_eq!(served.stderr().matches("; stopping").count(), 1);
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    match popped {
+        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
+        other => assert!(left.get("a").is_some(), "lost: {other:?}"),
+    }
+}
+
+#[test]
 fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
     // The handler deletes the row before it answers: a client that hangs up meanwhile (killed, or
     // given up waiting) never gets the answer, the row's only copy, so the handler puts the row

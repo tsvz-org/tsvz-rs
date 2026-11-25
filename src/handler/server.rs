@@ -93,14 +93,18 @@ impl Shared {
 }
 
 /// SIGINT, SIGTERM and SIGHUP blocked in the thread that serves and in every thread it starts, so
-/// that one thread of their own receives them with `sigwait` ([`Signals::wait`]); a signal ignored
-/// when `serve` starts (`nohup`) stays ignored. Dropped as `serve` returns, it ends that thread and
-/// gives the serving thread its signal mask back: a program that embeds `serve` and goes on after
-/// it gets those signals again.
+/// that one thread of their own receives them with `sigwait` ([`Signals::wait`]), every one that
+/// comes until `serve` returns (the first stops the handler; a later one, during the stop, changes
+/// nothing: left pending, it would end the process by its default action once the mask is given
+/// back); a signal ignored when `serve` starts (`nohup`) stays ignored. Dropped as `serve`
+/// returns, it ends that thread and gives the serving thread its signal mask back: a program that
+/// embeds `serve` and goes on after it gets those signals again.
 struct Signals {
     set: libc::sigset_t,
     old: libc::sigset_t,
     waiter: Option<std::thread::JoinHandle<()>>,
+    /// Set by the drop before it wakes the waiter, which then ends.
+    done: Arc<AtomicBool>,
 }
 
 impl Signals {
@@ -124,6 +128,7 @@ impl Signals {
                 set,
                 old,
                 waiter: None,
+                done: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -139,10 +144,10 @@ impl Signals {
     /// Start the thread that waits for the signals and stops the handler when one comes.
     fn wait(&mut self, shared: Arc<Shared>) -> std::io::Result<()> {
         if self.first().is_some() {
-            let set = self.set;
+            let (set, done) = (self.set, self.done.clone());
             let waiter = std::thread::Builder::new()
                 .name("tsvz-signals".into())
-                .spawn(move || wait_for_signal(set, shared))?;
+                .spawn(move || wait_for_signals(set, shared, done))?;
             self.waiter = Some(waiter);
         }
         Ok(())
@@ -153,8 +158,10 @@ impl Drop for Signals {
     fn drop(&mut self) {
         if let (Some(waiter), Some(signal)) = (self.waiter.take(), self.first()) {
             use std::os::unix::thread::JoinHandleExt;
-            // Sent to the waiter alone, which takes it in `sigwait` (or has ended, and it is
-            // dropped): it blocks it, as every thread of the handler does.
+            // Sent to the waiter alone, which takes it in `sigwait` (or is making a claim, and
+            // takes it next), sees `done` and ends: it blocks it, as every thread of the handler
+            // does.
+            self.done.store(true, Ordering::SeqCst);
             // SAFETY: a thread not yet joined keeps its pthread_t valid.
             unsafe { libc::pthread_kill(waiter.as_pthread_t(), signal) };
             let _ = waiter.join();
@@ -164,10 +171,15 @@ impl Drop for Signals {
     }
 }
 
-fn wait_for_signal(set: libc::sigset_t, shared: Arc<Shared>) {
-    let mut signal = 0;
-    // SAFETY: sigwait reads the set and writes the signal number.
-    if unsafe { libc::sigwait(&set, &mut signal) } == 0 {
+/// Take every signal of `set` until `done`: each is a claim of the stop, which changes nothing
+/// once the handler is stopping.
+fn wait_for_signals(set: libc::sigset_t, shared: Arc<Shared>, done: Arc<AtomicBool>) {
+    loop {
+        let mut signal = 0;
+        // SAFETY: sigwait reads the set and writes the signal number.
+        if unsafe { libc::sigwait(&set, &mut signal) } != 0 || done.load(Ordering::SeqCst) {
+            return;
+        }
         shared.claim(Some(format!("signal {signal}; stopping")));
     }
 }
