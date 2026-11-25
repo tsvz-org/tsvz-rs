@@ -41,22 +41,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: an operator shares a store with another writer on a system without either lock.
 - Approved: 2026-11-17, the user's pick (relayed by chief): "Switch, accept it (Recommended)".
 
-### An append to a compressed loose file joins its unterminated last line
-- Kind: deferred
-- What the operator sees: a compressed loose file (`.tsv.gz` and the like) whose decoded text does not end with a
-  newline (a file compressed from one saved without a final newline) has its last line joined by the next `set`,
-  `append` or `delete`: the appended member's first record continues that line, so the record is not read, and
-  the last row reads with its cells run on (`b<TAB>1` then `delete b` reads `b<TAB>1b`). TSVZ.py's writers do
-  the same ("a compressed file's last line is not looked at"). A plain loose file gets a newline first, as
-  TSVZ.py's does.
-- Why: whether the decoded text ends with a newline is known only by decoding the file to its end, which an
-  append does not do.
-- Revisit when: 0.2.2. The plan: begin each member a writer appends to a compressed loose file that holds
-  something with a newline: an empty line is read as nothing by both tools, so the cost is a byte per append,
-  and the line before it is ended; or learn the end from the last member, found by the part reader.
-- Noted: 2026-11-23, in the 0.2.1 build (the loose differential test); a deferral under the user's standing rule
-  that deferrals are noted, not asked.
-
 ### A handler on a cifs (SMB) mount is unreachable for the command line, on older client kernels
 - Kind: deferred
 - What the operator sees: on a cifs mount from a Linux client older than 7.0 (measured: 6.1 and RHEL 8's 4.18;

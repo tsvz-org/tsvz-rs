@@ -213,19 +213,18 @@ def make_loose(rng, directory):
 LOOSE_OPS = [['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'a  ', ' ', 'b', 'k\t1', '#_defaults_#']]
 
 
-def open_compressed_tail(store):
-    """Whether `store` is compressed and what it decodes to does not end with a newline."""
+def decoded(store):
+    """What the compressed `store` decodes to; None for a plain file, or one that does not decode."""
     suffix = store.rsplit('.', 1)[-1]
     if suffix not in CODECS:
-        return False
+        return None
     with open(store, 'rb') as f:
         raw = f.read()
     try:
-        text = {'gz': gzip.decompress, 'bz2': bz2.decompress, 'xz': lzma.decompress,
+        return {'gz': gzip.decompress, 'bz2': bz2.decompress, 'xz': lzma.decompress,
                 'zst': lambda b: _zstd.decompress(b)}[suffix](raw)
     except Exception:
-        return True
-    return bool(text) and not text.endswith(b'\n')
+        return None
 
 
 def changed_reads(rust, python, store, delimiter, directory, how):
@@ -243,10 +242,14 @@ def changed_reads(rust, python, store, delimiter, directory, how):
             return []
         rows = [line for line in before['TSVZ.py'][1].split(b'\n') if line]
         d = delimiter.encode()
-        if how != 'scrub' and open_compressed_tail(store):
-            # An append to a compressed file joins its unterminated last line, in either tool:
-            # neither looks at a compressed file's last line before it appends (docs/limitations.md).
-            return []
+        compressed = store.rsplit('.', 1)[-1] in CODECS
+        text = decoded(store)
+        if compressed and text is None:
+            return []  # no text to compare a change against
+        # A compressed file whose text does not end with a newline: tsvz-rs ends its last line before
+        # it appends (a member that begins with a newline), as both tools do in a plain file, where
+        # TSVZ.py's own append to the compressed file joins that line.
+        open_tail = compressed and bool(text) and not text.endswith(b'\n')
         if how == 'delete':
             if not rows:
                 return []
@@ -254,7 +257,7 @@ def changed_reads(rust, python, store, delimiter, directory, how):
             if '<' in key or '\ufffd' in key or '\0' in key:
                 return []  # printed encoded, not as it was written, or no argument can hold it
             with open(store, 'rb') as f:
-                if f.read().endswith(b'\0'):
+                if (text if compressed else f.read()).endswith(b'\0'):
                     # An unterminated last line that ends in NULs reads with them once a write ends it
                     # (TSVZ.py's own delete does the same), so the rows no longer follow from the old ones.
                     return []
@@ -275,6 +278,12 @@ def changed_reads(rust, python, store, delimiter, directory, how):
             shutil.copytree(directory, mine)
             try:
                 theirs = os.path.join(mine, os.path.basename(store))
+                if open_tail:
+                    # TSVZ.py's set on the same text, uncompressed: it ends the last line first.
+                    os.remove(theirs)
+                    theirs = theirs.rsplit('.', 1)[0]
+                    with open(theirs, 'wb') as f:
+                        f.write(text)
                 subprocess.run(python + ['-q', 'set', theirs, 'new', 'v'], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=60)
                 want = [line for line in ask(python, theirs, ['read'])[1].split(b'\n') if line]

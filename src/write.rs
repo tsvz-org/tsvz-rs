@@ -449,18 +449,30 @@ impl Writer {
             };
             let path = part.path.as_path();
             let io = |e: io::Error| Error::io(path, e);
-            let bytes: Cow<[u8]> = match part.codec {
-                Some(codec) => {
-                    let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
-                    codec::encode_members(codec, payload, size)
-                        .ok_or_else(|| Error::UnsupportedCodec {
-                            path: path.to_path_buf(),
-                            codec: codec.name(),
-                        })?
-                        .into()
-                }
-                None => payload.into(),
+            // A compressed loose file that holds something gets a newline first: its decoded text
+            // may not end with one (TSVZ.py reads such a last line as a row), and an empty line is
+            // read as nothing. Encoded for the length seen now, and again under the lock in the
+            // rare case that it was empty and is no longer, or the other way round.
+            let leads = |held: bool| held && !self.format.strict && part.codec.is_some();
+            let held = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+            let encode = |lead: bool| -> Result<Cow<[u8]>, Error> {
+                let Some(codec) = part.codec else {
+                    return Ok(payload.into());
+                };
+                let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
+                let text: Cow<[u8]> = if lead {
+                    [&b"\n"[..], payload].concat().into()
+                } else {
+                    payload.into()
+                };
+                codec::encode_members(codec, &text, size)
+                    .map(Cow::Owned)
+                    .ok_or_else(|| Error::UnsupportedCodec {
+                        path: path.to_path_buf(),
+                        codec: codec.name(),
+                    })
             };
+            let encoded = encode(leads(held))?;
             let mut options = OpenOptions::new();
             options
                 .append(true)
@@ -499,8 +511,12 @@ impl Writer {
                         return Ok(None);
                     }
                 }
-                let mut bytes = Cow::Borrowed(&bytes[..]);
+                let mut bytes = Cow::Borrowed(&encoded[..]);
                 let start = match part.codec {
+                    Some(_) if leads(held) != leads(before.size > 0) => {
+                        bytes = encode(leads(before.size > 0))?;
+                        before.size
+                    }
                     Some(_) => before.size,
                     None if self.format.strict => {
                         cut = self.cut_torn_tail(&file, path).map_err(io)?;
@@ -1366,6 +1382,42 @@ mod tests {
             .append(&[Record::from_args("c", &["3".into()])])
             .unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\nc\t3\n");
+    }
+
+    #[test]
+    fn a_compressed_loose_files_last_line_is_never_joined_by_an_append() {
+        // Its decoded text may not end with a newline, which an append does not decode to see:
+        // each member it appends to a file that holds something begins with one (an empty line,
+        // read as nothing), so the last line is ended (0.2.1 joined it: `b<TAB>2c<TAB>3`).
+        use crate::codec::{Item, for_each_item};
+        use crate::name::Codec;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv.gz");
+        let text = |p: &Path| {
+            let mut out = Vec::new();
+            for_each_item(Codec::Gzip, &fs::read(p).unwrap(), &mut |item| {
+                if let Item::Data(d) = item {
+                    out.extend_from_slice(&d);
+                }
+                true
+            });
+            String::from_utf8(out).unwrap()
+        };
+        let row = |k: &str, v: &str| Record::from_args(k, &[v.into()]);
+        fs::write(&p, crate::codec::encode_member(Codec::Gzip, b"a\t1\nb\t2").unwrap()).unwrap();
+        Writer::open(&p).unwrap().append(&[row("c", "3")]).unwrap();
+        assert_eq!(text(&p), "a\t1\nb\t2\nc\t3\n");
+        assert_eq!(
+            read(&p),
+            [("a", "1"), ("b", "2"), ("c", "3")]
+                .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+        );
+        // A file that holds nothing gets none: its first line is the row.
+        let q = dir.path().join("e.tsv.gz");
+        Writer::open(&q).unwrap().append(&[row("c", "3")]).unwrap();
+        assert_eq!(text(&q), "c\t3\n");
+        Writer::open(&q).unwrap().append(&[row("d", "4")]).unwrap();
+        assert_eq!(text(&q), "c\t3\n\nd\t4\n");
     }
 
     #[test]
