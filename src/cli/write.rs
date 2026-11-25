@@ -201,10 +201,12 @@ pub(crate) fn setdefault(ctx: &mut Ctx) -> Result<i32, Error> {
     let requested = ctx.args.args[0].clone();
     let values = ctx.args.args[1..].to_vec();
     // A loose key is checked as a reader names it (`#_defaults_# ` is `#_defaults_#`).
-    let named = (!ctx.format.strict)
-        .then(|| crate::loose::name(&requested, ctx.format.delimiter))
-        .flatten();
-    if is_marker_key(named.as_deref().unwrap_or(&requested)) {
+    let named = if ctx.format.strict {
+        std::borrow::Cow::Borrowed(requested.as_str())
+    } else {
+        crate::loose::lookup(&requested, ctx.format.delimiter)
+    };
+    if is_marker_key(&named) {
         diag!("tsvz: setdefault: {requested} is a marker key (§21.7.3)");
         return Ok(2);
     }

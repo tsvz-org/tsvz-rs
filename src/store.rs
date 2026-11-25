@@ -164,7 +164,8 @@ struct Table {
 
 impl Table {
     /// A table for `scope`, of a strict or a loose store; under `Scope::Keys` it keeps each requested
-    /// key and, for a strict store, the key a reader resolves it to (§20.2.7).
+    /// key and the key it names: for a strict store the key a reader resolves it to (§20.2.7), for a
+    /// loose one the key a reader names it by ([`crate::loose::lookup`]).
     fn new(scope: &Scope, format: Format) -> Table {
         let wanted = match scope {
             Scope::Keys(keys) => Some(
@@ -173,7 +174,7 @@ impl Table {
                         let resolved = if format.strict {
                             crate::write::resolve(k, format.delimiter).into_owned()
                         } else {
-                            crate::loose::name(k, format.delimiter).unwrap_or_else(|| k.clone())
+                            crate::loose::lookup(k, format.delimiter).into_owned()
                         };
                         [k.clone(), resolved]
                     })
