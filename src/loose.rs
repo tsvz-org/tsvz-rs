@@ -196,8 +196,8 @@ pub(crate) fn parse(line: &str, d: u8, terminated: bool) -> Option<Vec<Cow<'_, s
 pub(crate) struct Split<'l> {
     /// The key, decoded.
     pub(crate) key: Cow<'l, str>,
-    /// The fields after the key, as the line has them (None for a key alone).
-    rest: Option<&'l str>,
+    /// The line, without what a reader drops at its ends.
+    line: &'l str,
     d: u8,
 }
 
@@ -217,29 +217,24 @@ pub(crate) fn split(line: &str, d: u8, terminated: bool) -> Option<Split<'_>> {
     if line.is_empty() || (line.starts_with('#') && !line.starts_with(DEFAULTS)) {
         return None;
     }
-    let (key, rest) = match line.split_once(d as char) {
-        Some((key, rest)) => (key, Some(rest)),
-        None => (line, None),
-    };
-    let key = unsanitize(key, d);
-    (!key.is_empty()).then_some(Split { key, rest, d })
+    let first = line.split(d as char).next().unwrap_or(line);
+    let key = unsanitize(first, d);
+    (!key.is_empty()).then_some(Split { key, line, d })
 }
 
 impl<'l> Split<'l> {
     /// How many cells the line has, its key's included.
     pub(crate) fn count(&self) -> usize {
-        1 + self
-            .rest
-            .map_or(0, |r| memchr::memchr_iter(self.d, r.as_bytes()).count() + 1)
+        1 + memchr::memchr_iter(self.d, self.line.as_bytes()).count()
     }
 
     /// Whether the cells after the key are none or all empty once decoded ([`valueless`]): a
     /// field decodes to nothing exactly when it is only whitespace.
     pub(crate) fn valueless(&self) -> bool {
-        self.rest.is_none_or(|r| {
-            r.split(self.d as char)
-                .all(|f| f.trim_end_matches(py_space).is_empty())
-        })
+        self.line
+            .split(self.d as char)
+            .skip(1)
+            .all(|f| f.trim_end_matches(py_space).is_empty())
     }
 
     /// The line's cells, its key first, each decoded ([`parse`]).
@@ -247,11 +242,10 @@ impl<'l> Split<'l> {
         #[cfg(test)]
         DECODED.with(|n| n.set(n.get() + 1));
         let d = self.d;
-        let mut cells = vec![self.key];
-        if let Some(rest) = self.rest {
-            cells.extend(rest.split(d as char).map(|c| unsanitize(c, d)));
-        }
-        cells
+        self.line
+            .split(d as char)
+            .map(|c| unsanitize(c, d))
+            .collect()
     }
 }
 
