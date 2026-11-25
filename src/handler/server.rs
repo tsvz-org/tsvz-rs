@@ -97,18 +97,23 @@ impl Shared {
 /// comes until `serve` returns (the first stops the handler; a later one, during the stop, changes
 /// nothing: left pending, it would end the process by its default action once the mask is given
 /// back); a signal ignored when `serve` starts (`nohup`) stays ignored. Dropped as `serve`
-/// returns, it ends that thread and gives the serving thread its signal mask back: a program that
-/// embeds `serve` and goes on after it gets those signals again.
+/// returns, it ends that thread and gives the serving thread its signal mask back, so a program
+/// that embeds `serve` gets those signals again; the command line's ([`serve_to_exit`]) keeps
+/// them blocked to its exit, as 0.2.1's did.
 struct Signals {
     set: libc::sigset_t,
     old: libc::sigset_t,
     waiter: Option<std::thread::JoinHandle<()>>,
+    /// Whether the drop gives the mask back (`serve`, for an embedder) or leaves the three blocked
+    /// ([`serve_to_exit`], for the command line, which goes on for a moment and then exits: a signal
+    /// that came meanwhile would end it by its default action once unblocked).
+    restore: bool,
     /// Set by the drop before it wakes the waiter, which then ends.
     done: Arc<AtomicBool>,
 }
 
 impl Signals {
-    fn block() -> Signals {
+    fn block(restore: bool) -> Signals {
         // SAFETY: the sets are initialized by sigemptyset and pthread_sigmask before use;
         // sigaction with a null new action only reads the current one; pthread_sigmask changes
         // this thread's mask.
@@ -128,6 +133,7 @@ impl Signals {
                 set,
                 old,
                 waiter: None,
+                restore,
                 done: Arc::new(AtomicBool::new(false)),
             }
         }
@@ -166,8 +172,10 @@ impl Drop for Signals {
             unsafe { libc::pthread_kill(waiter.as_pthread_t(), signal) };
             let _ = waiter.join();
         }
-        // SAFETY: pthread_sigmask sets this thread's mask to the one `block` saved.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+        if self.restore {
+            // SAFETY: pthread_sigmask sets this thread's mask to the one `block` saved.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+        }
     }
 }
 
@@ -241,6 +249,17 @@ fn bind(dir: &Path, config: &Config) -> Result<(UnixListener, PathBuf), Error> {
 /// request, a signal, or the idle timeout. Errors: another handler serves the store (its pid
 /// and host are in the message), the store is loose, or the files or socket cannot be set up.
 pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
+    run(store, config, true)
+}
+
+/// [`serve`] for the command line: the three signals stay blocked once it returns, to the exit,
+/// where a pending one is dropped (0.2.1 never gave the mask back). They are blocked after the
+/// pointer file is taken, so that a signal ends a start whose first access to it hangs.
+pub(crate) fn serve_to_exit(store: &Path, config: Config) -> Result<(), Error> {
+    run(store, config, false)
+}
+
+fn run(store: &Path, config: Config, restore: bool) -> Result<(), Error> {
     if !name::format_of(store).is_some_and(|f| f.strict) {
         return Err(Error::Refused(format!(
             "{}: serve takes a strict store (.tsvz .csvz .nsvz .psvz)",
@@ -271,7 +290,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    let mut signals = Signals::block();
+    let mut signals = Signals::block(restore);
     let engine = match Engine::open(store, config.log.clone(), config.errors.clone()) {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
@@ -1065,6 +1084,45 @@ mod tests {
         }
     }
 
+    /// A config with no logging, which idles out after `idle`.
+    fn quiet_config(idle: Option<Duration>) -> Config {
+        Config {
+            idle,
+            group: None,
+            mode: None,
+            log: None,
+            errors: None,
+            info: Arc::new(|_: &str| {}),
+            verbose: false,
+        }
+    }
+
+    #[test]
+    fn a_serve_that_does_not_get_the_pointer_file_leaves_the_signals_unblocked() {
+        // The signals are blocked once `serve` holds the pointer file, never before: a start
+        // whose first access to it hangs (a hard-mounted file system whose server is down) then
+        // ends on a signal, as 0.2.1's did, also on the command line's path, which gives no mask
+        // back (`serve_to_exit`: a block taken before the file would stay).
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.tsvz");
+        let (_listener, _held) = stand_in(dir.path(), &store);
+        let outcome = std::thread::spawn(move || {
+            let before = blocks_sigterm();
+            let a = serve(&store, quiet_config(None)).unwrap_err().to_string();
+            let after_serve = blocks_sigterm();
+            let b = serve_to_exit(&store, quiet_config(None))
+                .unwrap_err()
+                .to_string();
+            (before, after_serve, blocks_sigterm(), a, b)
+        })
+        .join()
+        .unwrap();
+        let (before, after_serve, after_to_exit, a, b) = outcome;
+        assert!(a.contains("already served by pid 4242"), "{a}");
+        assert!(b.contains("already served by pid 4242"), "{b}");
+        assert_eq!((before, after_serve, after_to_exit), (false, false, false));
+    }
+
     #[test]
     fn serve_gives_its_thread_the_signal_mask_back_and_ends_its_signal_thread() {
         // A program that embeds `serve` gets SIGINT, SIGTERM and SIGHUP again once it returns, and
@@ -1073,16 +1131,7 @@ mod tests {
         let store = dir.path().join("s.tsvz");
         let serving = std::thread::spawn(move || {
             let before = blocks_sigterm();
-            let config = Config {
-                idle: Some(Duration::from_millis(200)),
-                group: None,
-                mode: None,
-                log: None,
-                errors: None,
-                info: Arc::new(|_: &str| {}),
-                verbose: false,
-            };
-            serve(&store, config).unwrap();
+            serve(&store, quiet_config(Some(Duration::from_millis(200)))).unwrap();
             (before, blocks_sigterm())
         });
         assert_eq!(serving.join().unwrap(), (false, false));

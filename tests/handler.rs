@@ -598,19 +598,22 @@ fn a_second_signal_during_a_stop_does_not_end_serve() {
 
 #[test]
 fn signals_sent_without_pause_through_the_stop_and_past_it_do_not_end_the_command() {
-    // `serve` gives its signal mask back as it returns, and the command goes on for a moment (the
-    // lost-write report, the exit): a SIGINT in that moment ended it by its default action,
-    // after the stop was done (0.2.2's second build: 40 of 40 runs sent without pause; 0.2.1, which
-    // never gave the mask back, ended with status 0). The command keeps the signals blocked
-    // until it exits, so the pending ones die with it. Sent here from the test's own thread, one
-    // after the other until the child has gone, and never after it was reaped: a pid is not
-    // signalled once it may have another owner.
+    // The command goes on for a moment after `serve` returns (the lost-write report, the exit): a
+    // signal in that moment ends it by its default action, after the stop was done, if `serve`
+    // gave its signal mask back (0.2.2's second build: 40 of 40 runs sent SIGINT without pause;
+    // 0.2.1, which never gave the mask back, ended with status 0). The command line's
+    // `serve_to_exit` keeps the three blocked until the exit, so the pending ones die with it.
+    // Sent here from the test's own thread, SIGINT, SIGTERM and SIGHUP in turn, until the child
+    // has gone, and never after it was reaped: a pid is not signalled once it may have another
+    // owner.
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "a\t1\nb\t2\n");
     let mut served = Served::start(&s, &[]);
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sent = 0;
     let status = loop {
-        served.signal(libc::SIGINT);
+        served.signal([libc::SIGINT, libc::SIGTERM, libc::SIGHUP][sent % 3]);
+        sent += 1;
         if let Some(status) = served.child.try_wait().unwrap() {
             break status;
         }
@@ -618,7 +621,7 @@ fn signals_sent_without_pause_through_the_stop_and_past_it_do_not_end_the_comman
             panic!("serve did not exit: {}", served.stderr());
         }
     };
-    assert_eq!(status.code(), Some(0), "{status}: {}", served.stderr()); // ended by SIGINT: None
+    assert_eq!(status.code(), Some(0), "{status}: {}", served.stderr()); // ended by a signal: None
     assert!(
         served.stderr().contains("stopped serving"),
         "{}",
