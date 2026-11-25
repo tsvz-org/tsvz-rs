@@ -24,6 +24,19 @@ pub(crate) fn serve(ctx: &mut Ctx) -> Result<i32, Error> {
         info,
         verbose: ctx.args.verbose,
     };
+    // `serve` gives its signal mask back as it returns, and this command goes on for a moment
+    // (the lost-write report, the exit): a signal in that moment would end it by its default
+    // action after the stop was done. Blocked here, the three stay blocked to the exit, where
+    // a pending one is dropped, as when `serve` never gave the mask back (0.2.1).
+    // SAFETY: sigemptyset and sigaddset fill the set; pthread_sigmask changes this thread's mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaddset(&mut set, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
     server::serve(&ctx.store, config)?;
     Ok(0)
 }

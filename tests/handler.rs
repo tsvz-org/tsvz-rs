@@ -597,6 +597,36 @@ fn a_second_signal_during_a_stop_does_not_end_serve() {
 }
 
 #[test]
+fn signals_sent_without_pause_through_the_stop_and_past_it_do_not_end_the_command() {
+    // `serve` gives its signal mask back as it returns, and the command goes on for a moment (the
+    // lost-write report, the exit): a SIGINT in that moment ended it by its default action,
+    // after the stop was done (0.2.2's second build: 40 of 40 runs sent without pause; 0.2.1, which
+    // never gave the mask back, ended with status 0). The command keeps the signals blocked
+    // until it exits, so the pending ones die with it. Sent here from the test's own thread, one
+    // after the other until the child has gone, and never after it was reaped: a pid is not
+    // signalled once it may have another owner.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let mut served = Served::start(&s, &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        served.signal(libc::SIGINT);
+        if let Some(status) = served.child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            panic!("serve did not exit: {}", served.stderr());
+        }
+    };
+    assert_eq!(status.code(), Some(0), "{status}: {}", served.stderr()); // ended by SIGINT: None
+    assert!(
+        served.stderr().contains("stopped serving"),
+        "{}",
+        served.stderr()
+    );
+}
+
+#[test]
 fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
     // The handler deletes the row before it answers: a client that hangs up meanwhile (killed, or
     // given up waiting) never gets the answer, the row's only copy, so the handler puts the row
