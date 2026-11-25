@@ -130,7 +130,9 @@ pub(crate) fn cause(fields: &[&str], d: u8) -> String {
     for (i, f) in fields.iter().enumerate() {
         let what = if i == 0 { "the key" } else { "the value" };
         if i == 0 && f.starts_with('#') {
-            return format!("{what} {f:?} begins with `#`, so a reader takes the line for a comment");
+            return format!(
+                "{what} {f:?} begins with `#`, so a reader takes the line for a comment"
+            );
         }
         if i == 0 && f.starts_with('\0') {
             return format!("{what} {f:?} begins with a NUL, which a reader drops");

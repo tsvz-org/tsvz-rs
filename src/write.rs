@@ -1475,14 +1475,19 @@ mod loose_round_trip {
         ];
         for &(d, fields, line) in table {
             let rec = match fields {
-                [key] => Record::Tombstone { key: key.to_string() },
+                [key] => Record::Tombstone {
+                    key: key.to_string(),
+                },
                 [key, values @ ..] => Record::Data {
                     key: key.to_string(),
                     values: values.iter().map(|v| v.to_string()).collect(),
                 },
                 [] => unreachable!(),
             };
-            let format = Format { delimiter: d, strict: false };
+            let format = Format {
+                delimiter: d,
+                strict: false,
+            };
             let mut out = String::new();
             let written = encode_record(&rec, format, &mut out);
             match line {

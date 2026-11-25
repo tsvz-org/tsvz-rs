@@ -403,7 +403,10 @@ fn loose_files_as_tsvz_py_reads_and_writes_them() {
     assert_eq!(records(dir, &["set", "s.csv", "dave", "a,b"]).0, 0);
     assert_eq!(records(dir, &["get", "s.csv", "dave"]).1, "dave,a<sep>b\n");
     let (code, _, err) = records(dir, &["set", "s.csv", "eve", "x</sep/>"]);
-    assert!(code == 1 && err.contains("holds `</sep/>` or `</LF/>`"), "{err}");
+    assert!(
+        code == 1 && err.contains("holds `</sep/>` or `</LF/>`"),
+        "{err}"
+    );
     assert_eq!(records(dir, &["set", "s.csv", "dave", "41"]).0, 0);
     assert_eq!(
         records(dir, &["verify", "s.csv"]),
@@ -753,8 +756,14 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
         (&["set", "t.tsv", "#tag", "1"][..], "begins with `#`"),
         (&["set", "t.tsv", " ", "1"], "is empty or only whitespace"),
         (&["set", "t.tsv", "#_rotate_#", "1"], "begins with `#`"),
-        (&["set", "t.tsv", "k</LF/>", "1"], "holds `</sep/>` or `</LF/>`"),
-        (&["set", "t.tsv", "k", "</sep/>"], "holds `</sep/>` or `</LF/>`"),
+        (
+            &["set", "t.tsv", "k</LF/>", "1"],
+            "holds `</sep/>` or `</LF/>`",
+        ),
+        (
+            &["set", "t.tsv", "k", "</sep/>"],
+            "holds `</sep/>` or `</LF/>`",
+        ),
     ] {
         let (code, _, err) = records(dir, args);
         assert!(code == 1 && err.contains(cause), "{args:?} {err}");
@@ -763,7 +772,10 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
     // A comment is no key, and a delete of one is no failure.
     assert_eq!(records(dir, &["delete", "t.tsv", "#tag"]).0, 0);
     let (code, _, err) = records(dir, &["-d", "e", "set", "e.tsv", "k", "hello"]);
-    assert!(code == 1 && err.contains("holds the delimiter `e`"), "{err}");
+    assert!(
+        code == 1 && err.contains("holds the delimiter `e`"),
+        "{err}"
+    );
     assert!(fs::read(dir.join("e.tsv")).is_ok_and(|f| f.is_empty()) || !dir.join("e.tsv").exists());
     assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
     assert_eq!(file(dir, "e.tsv"), "kehllo\n");
@@ -849,7 +861,11 @@ fn a_loose_key_with_a_line_break_at_its_end_names_its_own_row() {
         // `a` itself is still `a`.
         fs::write(dir.join("f.tsv"), init).unwrap();
         assert_eq!(records(dir, &["delete", "f.tsv", "a"]).0, 0);
-        let after_a = if init == m { "k\na<LF>\nb\n" } else { "a<LF>\nb\n" };
+        let after_a = if init == m {
+            "k\na<LF>\nb\n"
+        } else {
+            "a<LF>\nb\n"
+        };
         assert_eq!(keys("f.tsv"), after_a);
     }
     // A file with only `a`: `$'a\n'` names no row of it.
@@ -903,9 +919,15 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
     assert_eq!(file(dir, "f.tsv"), "k\tv\na\t5\n#_defaults_#\tD\nb\t2\n");
     let before = file(dir, "f.tsv");
     let del = ["--format", "records", "delete", "f.tsv", "-"];
-    assert_eq!(run_in(dir, &del, b"#_defaults_# \tP\n#_defaults_#x\t1\n").0, 0);
+    assert_eq!(
+        run_in(dir, &del, b"#_defaults_# \tP\n#_defaults_#x\t1\n").0,
+        0
+    );
     assert_eq!(file(dir, "f.tsv"), before);
-    assert_eq!(run_in(dir, &all, b"#_defaults_#x\t1\n#_defaults_# \tP\n").0, 0);
+    assert_eq!(
+        run_in(dir, &all, b"#_defaults_#x\t1\n#_defaults_# \tP\n").0,
+        0
+    );
     assert_eq!(file(dir, "f.tsv"), before);
     // setdefault on a file that is not there names the key as a reader does, as every loose key
     // is (0.2.0 and the build before this named `a ` as given).
