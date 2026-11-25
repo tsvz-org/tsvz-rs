@@ -733,7 +733,10 @@ fn a_row_taken_and_not_printed_is_put_back_at_once_when_the_handler_died() {
         "{}",
         text(&out.stderr)
     );
-    assert!(pointer::path_of(&s).exists(), "left by the handler that died");
+    assert!(
+        pointer::path_of(&s).exists(),
+        "left by the handler that died"
+    );
     let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
     assert_eq!(
         left.get("a").map(|r| r.to_vec()),

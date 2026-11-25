@@ -844,7 +844,11 @@ mod tests {
         });
         let started = Instant::now();
         stop_within(&store, Duration::from_secs(20)).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         handler.join().unwrap();
     }
 
@@ -863,7 +867,11 @@ mod tests {
         });
         let started = Instant::now();
         stop_within(&store, Duration::from_secs(20)).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         drop(handler.join());
         assert!(pointer::path_of(&store).exists(), "left as it was");
         let e = stop_within(&store, Duration::from_secs(20)).unwrap_err();
@@ -1017,15 +1025,17 @@ mod tests {
         let info: InfoFn = Arc::new(|_: &str| {});
         let (mut client, end) = UnixStream::pair().unwrap();
         client.write_all(b"set\tk\tv\n").unwrap();
-        assert!(start_connection(
-            std::thread::Builder::new(),
-            end,
-            engine.clone(),
-            shared.clone(),
-            info,
-            false
-        )
-        .is_none());
+        assert!(
+            start_connection(
+                std::thread::Builder::new(),
+                end,
+                engine.clone(),
+                shared.clone(),
+                info,
+                false
+            )
+            .is_none()
+        );
         let mut answer = Vec::new();
         let _ = client.read_to_end(&mut answer); // the end of the connection, or a reset
         assert!(answer.is_empty(), "answered {answer:?}");
@@ -1059,15 +1069,17 @@ mod tests {
         // No system can map a stack this large: the thread cannot be made.
         let impossible = std::thread::Builder::new().stack_size(usize::MAX / 2);
         let (mut client, end) = UnixStream::pair().unwrap();
-        assert!(start_connection(
-            impossible,
-            end,
-            engine.clone(),
-            shared.clone(),
-            info.clone(),
-            false
-        )
-        .is_none());
+        assert!(
+            start_connection(
+                impossible,
+                end,
+                engine.clone(),
+                shared.clone(),
+                info.clone(),
+                false
+            )
+            .is_none()
+        );
         let mut byte = [0u8; 1];
         assert_eq!(
             client.read(&mut byte).unwrap(),

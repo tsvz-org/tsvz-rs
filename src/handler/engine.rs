@@ -1197,7 +1197,10 @@ mod tests {
         };
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file).unwrap();
-        assert!(submit(&ack("disk")).waited, "a request that sets it is durable itself");
+        assert!(
+            submit(&ack("disk")).waited,
+            "a request that sets it is durable itself"
+        );
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
         }

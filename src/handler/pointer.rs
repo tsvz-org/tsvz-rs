@@ -799,7 +799,13 @@ mod tests {
         plant(&s, &text("unix:/x/s", &hostname()), 0o644);
         let lock = hold(&s);
         assert!(names_handler(&s, &one));
-        assert!(!names_handler(&s, &Info { pid: "2".into(), ..one.clone() }));
+        assert!(!names_handler(
+            &s,
+            &Info {
+                pid: "2".into(),
+                ..one.clone()
+            }
+        ));
         // The same pid at another address: another handler, with a pid that was reused.
         assert!(!names_handler(&s, &handler("unix:/y/s")));
         drop(lock);
