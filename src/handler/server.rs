@@ -255,6 +255,7 @@ pub fn serve(store: &Path, config: Config) -> Result<(), Error> {
 /// [`serve`] for the command line: the three signals stay blocked once it returns, to the exit,
 /// where a pending one is dropped (0.2.1 never gave the mask back). They are blocked after the
 /// pointer file is taken, so that a signal ends a start whose first access to it hangs.
+#[cfg(any(feature = "cli", test))] // the command line's, and a lib test's
 pub(crate) fn serve_to_exit(store: &Path, config: Config) -> Result<(), Error> {
     run(store, config, false)
 }
