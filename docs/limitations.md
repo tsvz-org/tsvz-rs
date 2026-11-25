@@ -149,18 +149,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### `setdefault` on a loose file prints the row as it was asked for, not as a reader then reads it
-- Kind: deferred
-- What the operator sees: `setdefault KEY VALUE ...` on a loose file that lacks KEY appends the line and prints the
-  cells given, padded to the file's width with blanks. A reader then reads another row: trailing blanks of a value
-  are gone (`tsvz setdefault f n 'x '` prints `n<TAB>x<SP><TAB>`, the file reads `n<TAB>x`), the cells a
-  `#_defaults_#` line in force fills are not filled in the print, and, at two or more columns, a value list of
-  blanks (`setdefault f m ''`) prints a row though the line written is a deletion, which no reader reads as a row
-  (0.2.0 the same). The key itself is named as a reader names it (0.2.1).
-- Why: the print is built with the strict store's padding (`Row::new`); a loose row's cells come from the
-  reader's rule (`loose::parse`, the `#_defaults_#` lines, the column count), which that code does not call.
-- Revisit when: 0.2.2. The plan: print what the store's own read gives for the key after the append (the same code
-  `get` uses), and, where the line written is a deletion, what TSVZ.py's `setdefault` returns there (to be read
-  from its code first).
-- Noted: 2026-11-24, in the 0.2.1 short round f021c (second opinions s01 2, s02 1, s03 1 of rr021c); a deferral
-  under the user's standing rule that deferrals are noted, not asked.

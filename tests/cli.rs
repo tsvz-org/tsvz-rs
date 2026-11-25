@@ -965,6 +965,38 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
     assert_eq!(records(dir, &["keys", "n.tsv"]).1, "a\n");
 }
 
+/// `setdefault` of a missing key in a loose file prints the row a reader then reads, as `get`
+/// does, as TSVZ.py 5.18's does: a cell without the whitespace at its end, blank cells filled by
+/// the `#_defaults_#` line in force, and no row (3) for a line of blank values, which a reader
+/// reads as a deletion (0.2.1 printed the cells given, padded with blanks, and exited 0).
+#[test]
+fn a_loose_setdefault_prints_the_row_a_reader_then_reads() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("f.tsv"), "k\tv\tw\n").unwrap();
+    let printed = |args: &[&str]| {
+        let (code, out, err) = records(dir, args);
+        assert!(err.is_empty(), "{args:?}: {err}");
+        (code, out)
+    };
+    assert_eq!(
+        printed(&["setdefault", "f.tsv", "n", "x "]),
+        (0, "n\tx\t\n".into())
+    );
+    assert_eq!(printed(&["setdefault", "f.tsv", "m", ""]), (3, "".into()));
+    assert_eq!(records(dir, &["has", "f.tsv", "m"]).0, 3);
+    fs::write(dir.join("g.tsv"), "#_defaults_#\tP\tQ\nk\tv\tw\n").unwrap();
+    assert_eq!(
+        printed(&["setdefault", "g.tsv", "z", "", "r"]),
+        (0, "z\tP\tr\n".into())
+    );
+    // A live key's row is printed as before.
+    assert_eq!(
+        printed(&["setdefault", "g.tsv", "k", "other"]),
+        (0, "k\tv\tw\n".into())
+    );
+}
+
 /// Bulk input to a loose file loses the NULs at a line's start, as a reader does (0.2.0 and the
 /// 0.2.1 build before it wrote the line with them, and a reader read the key without them; the
 /// key check of 0.2.1's first fix round refused the whole input for it).
