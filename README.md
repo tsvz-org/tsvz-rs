@@ -40,16 +40,15 @@ newline, and no row for a missing key. A key you name is the cell a reader reads
 in a tab file `$'a\n'` and `$'a\t'` name only the row whose cell holds them, `a<LF>` and `a<sep>`, so
 with only `a` in the file they name no row (TSVZ.py's `get` reaches `a`:
 [docs/silent-choices.md](docs/silent-choices.md)); a blank at its end goes. Writes encode cells as
-TSVZ.py's do, and refuse a line that would not read back as its cells (a key that begins with `#`,
-but for one that begins with `#_defaults_#`, or with a NUL, or is only whitespace; `</sep/>`; with
-`-d e`, a cell whose encoding holds an `e`, as `<sep>` does); a `delete` of a key no row can have
-writes nothing and is no failure. An append to a compressed loose file whose text does
-not end with a newline joins that last line, as TSVZ.py's does (deferred to 0.2.2,
-[docs/limitations.md](docs/limitations.md)). A rewrite writes each
-line it keeps as the file has it, but for two things: the key a one-column `delete` puts where the
-line that set the column count went, and the blank `#_defaults_#` line a `clear` may write before
-the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
-place of its first, where nothing a reader reads changes), and `clear` the `#_defaults_#` lines in
+TSVZ.py's do, and refuse a line that would not read back as its cells (a key such as `#tag`,
+a cell holding `</sep/>`), saying why; a `delete` of a key no row can have writes nothing and is
+no failure. An append ends an unterminated last line first, in a
+compressed file too (TSVZ.py's joins the compressed one's). A rewrite writes each
+line it keeps as the file has it, but for three things: the key a one-column `delete` puts where the
+line that set the column count went, and the empty line 1 and blank `#_defaults_#` line a `clear`
+may write before the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
+place of its first, where the command lines' reading stays; [docs/limitations.md](docs/limitations.md) has where
+TSVZ.py's strict reader's does not), and `clear` the `#_defaults_#` lines in
 force ([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
@@ -73,7 +72,7 @@ Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
 (SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
 file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
-handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.2,
+handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.3,
 [docs/limitations.md](docs/limitations.md)).
 
 ## Library
@@ -106,8 +105,26 @@ tsvz-rs passes the reader, writer, cli and handler classes of the TSVZ conforman
 every codec, every digest, multi-part scrub and the snapshot skip claimed, and is checked
 against TSVZ.py on random stores, with and without its handler. Rust and Python writers can
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
-tsvz-rs does what TSVZ.py does; [docs/silent-choices.md](docs/silent-choices.md) lists those
-choices. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+tsvz-rs does what TSVZ.py does, except where [docs/silent-choices.md](docs/silent-choices.md), which
+lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.2 from 0.2.1
+
+Stores need nothing; the library's documented API does not change.
+
+- Loose files: an append to a compressed one that holds something begins with a newline, so its
+  last line is never joined (TSVZ.py's append joins it); `setdefault` of a missing key prints the
+  row `get` then reads (none, exit 3, where the line it wrote is a deletion); `clear` writes an
+  empty line 1 where line 1 was no comment, as TSVZ.py's does (TSVZ.py's also replaces a comment
+  line 1, which tsvz-rs keeps); `scrub` keeps the rows TSVZ.py's strict reader reads too (not always
+  their order), where no `#_defaults_#` line holds a value ([docs/limitations.md](docs/limitations.md)); `scrub` and
+  `clear` take a file named `app.tsv.1` as one file. Reads that
+  want few rows (`get`, `len`, `keys`) take less CPU, and a row holds only its own cells.
+- Through a handler: `tsvz stop` of a handler killed after it answered, or that closed one connection
+  for want of a thread, ends at once (it waited 30 s); a stop that finds an acknowledged write lost answers 1
+  (`tsvz stop` waits for the handler to go, then exits 1), and `serve` ends with status 1; a
+  request that sets `#_write_ack_#` is answered once its own writes are synced; a `pop` whose
+  client went away before its answer gets its row put back, while the handler serves.
 
 ## Upgrading to 0.2.1 from 0.2.0
 
@@ -122,14 +139,13 @@ Stores need nothing; the library's documented API does not change.
   `#_defaults_#` lines fill the empty cells after them, a line whose key is only whitespace is
   no row, the last line is read even without its newline, and `get` of a missing key prints
   nothing (it still exits 3). `set` writes a delimiter or newline in a cell as `<sep>` or `<LF>`
-  (0.2.0 refused it), refuses `</sep/>` and `</LF/>`, a cell whose encoding holds the delimiter
-  (`-d e`) and a key that no reader would read back (it begins with `#`, but for one that begins
-  with `#_defaults_#`, or with a NUL, or is only whitespace), and ends an unterminated last line of
-  a plain file with a newline before it appends (0.2.0 cut that line). A key typed with a trailing
+  (0.2.0 refused it), refuses a line that would not read back as its cells (a key such as
+  `#tag`, a cell holding `</sep/>`), and ends an unterminated last line of a plain file with a newline
+  before it appends (0.2.0 cut that line). A key typed with a trailing
   line break, or in a tab file a trailing tab, names only the row whose cell holds it: `$'b\t'` no
   longer reaches row `b` in a tab file (0.2.0's `delete` removed `b` in a file of one column;
-  TSVZ.py's `get` reaches it). `set -` fed the `#_defaults_#` line appends it, and `delete -` fed
-  it appends a defaults reset, as `delete f '#_defaults_#'` does (0.2.0 wrote nothing for either).
+  TSVZ.py's `get` reaches it). `set -` and `delete -` take the `#_defaults_#` line as `set` and
+  `delete` of it do (0.2.0 wrote nothing for either).
 - A `delete` in a compressed loose file, and a loose `scrub` or one-column `delete`, use far
   less memory.
 - Through a handler: `tsvz stop` exits 0 when another stop or a signal stopped the handler first

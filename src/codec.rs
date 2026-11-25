@@ -212,13 +212,34 @@ impl Decoder {
     /// Feed `input`, appending output to `out`. Ok((bytes consumed, member ended and checked))
     /// or Err(()) on a data error. Output decoded before an error stays in `out`.
     pub(crate) fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(usize, bool), ()> {
+        self.feed_upto(input, out, usize::MAX)
+    }
+
+    /// [`Decoder::feed`], which also returns once `out` has grown by `room` bytes or more: then
+    /// it may have taken less than `input`, or all of it with output still to come (fed the rest,
+    /// or nothing, it gives that). A return short of `input`, with less output than `room` and
+    /// the member not ended, means the decoder takes no more. A call grows `out` by less than
+    /// `room` plus what `out` has spare (a decoder fills the room reserved for it).
+    pub(crate) fn feed_upto(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        room: usize,
+    ) -> Result<(usize, bool), ()> {
+        // Whether `out` has grown by `room` (gzip keeps its own count, the only codec of a build
+        // without features).
+        #[cfg(any(feature = "bzip2", feature = "xz", feature = "zstd"))]
+        let full = {
+            let start = out.len();
+            move |out: &Vec<u8>| out.len() - start >= room
+        };
         match self {
-            Decoder::Gzip(g) => g.feed(input, out),
+            Decoder::Gzip(g) => g.feed(input, out, room),
             #[cfg(feature = "bzip2")]
             Decoder::Bzip2(d) => {
                 let before = d.total_in();
                 loop {
-                    out.reserve(64 * 1024);
+                    reserve(out);
                     let status = d
                         .decompress_vec(&input[(d.total_in() - before) as usize..], out)
                         .map_err(|_| ())?;
@@ -226,7 +247,7 @@ impl Decoder {
                     if status == bzip2::Status::StreamEnd {
                         return Ok((used, true));
                     }
-                    if used >= input.len() && out.len() < out.capacity() {
+                    if (used >= input.len() && out.len() < out.capacity()) || full(out) {
                         return Ok((used, false));
                     }
                 }
@@ -235,7 +256,7 @@ impl Decoder {
             Decoder::Xz(s) => {
                 let before = s.total_in();
                 loop {
-                    out.reserve(64 * 1024);
+                    reserve(out);
                     let used = (s.total_in() - before) as usize;
                     let status = s
                         .process_vec(&input[used..], out, liblzma::stream::Action::Run)
@@ -244,7 +265,7 @@ impl Decoder {
                     if status == liblzma::stream::Status::StreamEnd {
                         return Ok((used, true));
                     }
-                    if used >= input.len() && out.len() < out.capacity() {
+                    if (used >= input.len() && out.len() < out.capacity()) || full(out) {
                         return Ok((used, false));
                     }
                 }
@@ -253,16 +274,16 @@ impl Decoder {
             Decoder::Zstd(d) => {
                 let mut src = zstd::zstd_safe::InBuffer::around(input);
                 loop {
-                    out.reserve(64 * 1024);
-                    let start = out.len();
+                    reserve(out);
+                    let at = out.len();
                     let hint = {
-                        let mut dst = zstd::zstd_safe::OutBuffer::around_pos(out, start);
+                        let mut dst = zstd::zstd_safe::OutBuffer::around_pos(out, at);
                         d.decompress_stream(&mut dst, &mut src).map_err(|_| ())?
                     };
                     if hint == 0 {
                         return Ok((src.pos(), true));
                     }
-                    if src.pos() >= input.len() && out.len() < out.capacity() {
+                    if (src.pos() >= input.len() && out.len() < out.capacity()) || full(out) {
                         return Ok((src.pos(), false));
                     }
                 }
@@ -272,8 +293,14 @@ impl Decoder {
     }
 }
 
+/// Room in `out` for at least 64 KiB more of output (a decoder fills it in one step).
+fn reserve(out: &mut Vec<u8>) {
+    out.reserve(64 * 1024);
+}
+
 impl GzipDecoder {
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(usize, bool), ()> {
+    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>, room: usize) -> Result<(usize, bool), ()> {
+        let start = out.len();
         let mut used = 0;
         if self.done {
             return Ok((0, true));
@@ -291,10 +318,12 @@ impl GzipDecoder {
             self.inflate = Some((flate2::Decompress::new(false), false));
         }
         let (z, ended) = self.inflate.as_mut().expect("set above");
-        while !*ended && used < input.len() {
+        // Fed until the input is taken and the inflater gives no more for it, or `room` is used.
+        let mut more = true;
+        while !*ended && more && out.len() - start < room {
             let before_in = z.total_in();
             let before_out = out.len();
-            out.reserve(64 * 1024);
+            reserve(out);
             let status = z
                 .decompress_vec(&input[used..], out, flate2::FlushDecompress::None)
                 .map_err(|_| ())?;
@@ -306,6 +335,8 @@ impl GzipDecoder {
             } else if z.total_in() == before_in && out.len() == before_out {
                 break;
             }
+            // Input left, or the output filled what was reserved (more may be pending).
+            more = used < input.len() || out.len() == out.capacity();
         }
         if !*ended {
             return Ok((used, false));
@@ -487,6 +518,23 @@ impl Source for std::fs::File {
     }
 }
 
+/// The first `len` bytes of `src`, as a source of their own: past them it ends.
+pub(crate) struct Prefix<'a, S: ?Sized> {
+    pub(crate) src: &'a S,
+    pub(crate) len: u64,
+}
+
+impl<S: Source + ?Sized> Source for Prefix<'_, S> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let left = self.len.saturating_sub(offset);
+        let n = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        if n == 0 {
+            return Ok(0);
+        }
+        self.src.read_at(&mut buf[..n], offset)
+    }
+}
+
 /// How many compressed bytes are read at a time: what `decode_alone` feeds a decoder in one call.
 const PAGE: usize = 1 << 16;
 
@@ -503,13 +551,11 @@ enum Verdict {
 /// the part a page at a time and holds one member's output at a time, in a buffer reused from
 /// member to member, so a part costs its largest member's output, not the part. A member whose
 /// output passes `keep` bytes is judged without keeping it, and once it has passed its check it is
-/// decoded again and given a page at a time (several `Item::Data`): a read that stops early, at a
-/// part's first lines, then costs the time of decoding the member to its check and holds about
-/// `keep` whatever the member's size, plus what one input page decodes to before the next check
-/// (a decoder takes the whole page): by the formats' best ratios up to 64 MiB for deflate (1032 to
-/// one) and 2 GiB for zstd (a 128 KiB run-length block in 4 bytes), which only crafted input
-/// reaches (docs/limitations.md). Only a damaged member's bytes, which run to the next member
-/// start (rule 2), are held whole.
+/// decoded again and given `keep` bytes at a time (several `Item::Data`): a read that stops early,
+/// at a part's first lines, then costs the time of decoding the member to its check and holds
+/// less than three times `keep` whatever the member's size or ratio (a decoder is given room for
+/// `keep` more at a time, and fills what its buffer has spare, which `keep` bounds). Only a
+/// damaged member's bytes, which run to the next member start (rule 2), are held whole.
 pub(crate) fn read_items<S: Source + ?Sized>(
     codec: Codec,
     src: &S,
@@ -533,7 +579,7 @@ pub(crate) fn read_items<S: Source + ?Sized>(
                     return Ok(());
                 }
             } else {
-                match redecode(codec, src, pos, len, &mut page, &mut buf, each)? {
+                match redecode(codec, src, pos, len, keep, &mut page, &mut buf, each)? {
                     Redone::Whole => {}
                     Redone::Stopped => return Ok(()),
                     // The bytes ended sooner than they did a moment ago (a failed batch cut back
@@ -608,6 +654,18 @@ fn past_zeros<S: Source + ?Sized>(src: &S, mut pos: u64, page: &mut [u8]) -> io:
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The most output this thread's reads of a part held at once ([`judge`], [`redecode`]).
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Note what `out` holds now, for a test.
+fn held(_out: &[u8]) {
+    #[cfg(test)]
+    HELD.with(|h| h.set(h.get().max(_out.len())));
+}
+
 /// Decode the member at `pos` to judge it, its output in `out` while it is no longer than `keep`
 /// bytes; None when the part ends at `pos`.
 fn judge<S: Source + ?Sized>(
@@ -627,17 +685,39 @@ fn judge<S: Source + ?Sized>(
         if n == 0 {
             return Ok((at > pos).then_some(Verdict::Damaged)); // cut short, or the end
         }
-        match decoder.feed(&page[..n], out) {
-            Err(()) => return Ok(Some(Verdict::Damaged)),
-            Ok((used, true)) => return Ok(Some(Verdict::Complete(at + used as u64 - pos, kept))),
-            // A decoder that takes less than it was given and has not ended takes no more.
-            Ok((used, false)) if used < n => return Ok(Some(Verdict::Damaged)),
-            Ok(_) => at += n as u64,
+        // The page is fed only as far as the output may grow past `keep` before it is looked at:
+        // a member that decodes to more is never held whole, however well it compresses.
+        let mut fed = 0;
+        loop {
+            let room = keep.saturating_sub(out.len()).saturating_add(1);
+            match decoder.feed_upto(&page[fed..n], out, room) {
+                Err(()) => return Ok(Some(Verdict::Damaged)),
+                Ok((used, true)) => {
+                    held(out);
+                    return Ok(Some(Verdict::Complete(
+                        at + (fed + used) as u64 - pos,
+                        kept,
+                    )));
+                }
+                Ok((used, false)) => {
+                    fed += used;
+                    held(out);
+                    let filled = out.len() > keep;
+                    if filled {
+                        kept = false;
+                        out.clear();
+                    } else if fed < n {
+                        // A decoder that takes less than it was given and has not ended takes
+                        // no more.
+                        return Ok(Some(Verdict::Damaged));
+                    } else {
+                        break; // the page is taken
+                    }
+                    // Its room filled: on with the rest of the page, or what it still gives.
+                }
+            }
         }
-        if out.len() > keep {
-            kept = false;
-            out.clear();
-        }
+        at += n as u64;
     }
 }
 
@@ -653,30 +733,40 @@ enum Redone {
 
 /// Decode again the member at `pos`, `len` bytes that passed their check, giving its output to
 /// `each` a page at a time.
+#[allow(clippy::too_many_arguments)]
 fn redecode<S: Source + ?Sized>(
     codec: Codec,
     src: &S,
     pos: u64,
     len: u64,
+    keep: usize,
     page: &mut [u8],
     out: &mut Vec<u8>,
     each: &mut dyn FnMut(Item<'_>) -> bool,
 ) -> io::Result<Redone> {
     let mut decoder = Decoder::new(codec);
+    let room = keep.max(1);
     let mut at = pos;
     while at < pos + len {
         let want = (pos + len - at).min(page.len() as u64) as usize;
         let n = src.read_at(&mut page[..want], at)?;
-        out.clear();
-        let fed = decoder.feed(&page[..n], out);
-        if !out.is_empty() && !each(Item::Data(Cow::Borrowed(out))) {
-            return Ok(Redone::Stopped);
+        // Given `keep` at a time at most (and what `out` has spare), as `judge` holds it.
+        let mut fed = 0;
+        loop {
+            out.clear();
+            let step = decoder.feed_upto(&page[fed..n], out, room);
+            held(out);
+            if !out.is_empty() && !each(Item::Data(Cow::Borrowed(out))) {
+                return Ok(Redone::Stopped);
+            }
+            match step {
+                Ok((_, true)) => return Ok(Redone::Whole),
+                Ok((used, false)) if out.len() >= room => fed += used, // on with the rest
+                Ok((used, false)) if n > 0 && fed + used == n => break,
+                _ => return Ok(Redone::Cut),
+            }
         }
-        match fed {
-            Ok((used, false)) if n > 0 && used == n => at += n as u64,
-            Ok((_, true)) => return Ok(Redone::Whole),
-            _ => return Ok(Redone::Cut),
-        }
+        at += n as u64;
     }
     Ok(if len == 0 { Redone::Whole } else { Redone::Cut })
 }
@@ -1195,6 +1285,30 @@ mod tests {
                 src.reached.get(),
                 part.len()
             );
+        }
+    }
+
+    /// A member that compresses at the formats' best ratios (deflate 1032 to one, zstd far
+    /// more): one 64 KiB page of it decoded at once was 64 MiB of output for deflate, 2 GiB for
+    /// zstd, before the read looked at it. A read that keeps 1 MiB holds no more than a few.
+    #[test]
+    fn a_read_that_keeps_little_holds_little_of_a_member_that_compresses_well() {
+        let zeros = vec![0u8; 16 << 20];
+        for codec in codecs() {
+            let data = encode_member(codec, &zeros).unwrap();
+            HELD.with(|h| h.set(0));
+            let (mut total, mut largest) = (0, 0);
+            read_items(codec, &data[..], 1 << 20, &mut |item| {
+                if let Item::Data(out) = item {
+                    total += out.len();
+                    largest = largest.max(out.len());
+                }
+                true
+            })
+            .unwrap();
+            assert_eq!(total, zeros.len(), "{codec:?}: every byte, in pieces");
+            let held = HELD.with(|h| h.get()).max(largest);
+            assert!(held < 3 << 20, "{codec:?} held {held} bytes at once");
         }
     }
 

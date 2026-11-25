@@ -276,6 +276,13 @@ impl Seen {
         )
     }
 
+    /// How long the file was: an append made on [`Seen::grew`] is made to a file that still has
+    /// those bytes' length (the same file, no shorter; only its last bytes are compared).
+    #[cfg(feature = "cli")]
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Whether `file` is the file seen, no shorter, with the bytes it ended in.
     fn grew(&self, file: &File) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
@@ -443,18 +450,34 @@ impl Writer {
             };
             let path = part.path.as_path();
             let io = |e: io::Error| Error::io(path, e);
-            let bytes: Cow<[u8]> = match part.codec {
-                Some(codec) => {
-                    let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
-                    codec::encode_members(codec, payload, size)
-                        .ok_or_else(|| Error::UnsupportedCodec {
-                            path: path.to_path_buf(),
-                            codec: codec.name(),
-                        })?
-                        .into()
-                }
-                None => payload.into(),
+            // A compressed loose file that holds something gets a newline first: its decoded text
+            // may not end with one (TSVZ.py reads such a last line as a row), and an empty line is
+            // read as nothing; an append of nothing writes nothing (0.2.1 did not, 0.2.2's first
+            // build added a member of a newline to each). Encoded for the length seen now, and
+            // again under the lock in the rare case that it was empty and is no longer, or the
+            // other way round.
+            let leads = |held: bool| {
+                held && !payload.is_empty() && !self.format.strict && part.codec.is_some()
             };
+            let held = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+            let encode = |lead: bool| -> Result<Cow<[u8]>, Error> {
+                let Some(codec) = part.codec else {
+                    return Ok(payload.into());
+                };
+                let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
+                let text: Cow<[u8]> = if lead {
+                    [&b"\n"[..], payload].concat().into()
+                } else {
+                    payload.into()
+                };
+                codec::encode_members(codec, &text, size)
+                    .map(Cow::Owned)
+                    .ok_or_else(|| Error::UnsupportedCodec {
+                        path: path.to_path_buf(),
+                        codec: codec.name(),
+                    })
+            };
+            let encoded = encode(leads(held))?;
             let mut options = OpenOptions::new();
             options
                 .append(true)
@@ -493,8 +516,12 @@ impl Writer {
                         return Ok(None);
                     }
                 }
-                let mut bytes = Cow::Borrowed(&bytes[..]);
+                let mut bytes = Cow::Borrowed(&encoded[..]);
                 let start = match part.codec {
+                    Some(_) if leads(held) != leads(before.size > 0) => {
+                        bytes = encode(leads(before.size > 0))?;
+                        before.size
+                    }
                     Some(_) => before.size,
                     None if self.format.strict => {
                         cut = self.cut_torn_tail(&file, path).map_err(io)?;
@@ -1320,10 +1347,15 @@ mod tests {
         // rewritten in place at the same length
         fs::write(&p, "a\t1\nb\t3\n").unwrap();
         assert!(!w.append_if_grown(&gone, &seen).unwrap());
-        // replaced by another file with the same bytes
-        fs::remove_file(&p).unwrap();
-        fs::write(&p, "a\t1\nb\t2\n").unwrap();
+        // replaced by another file with the same bytes: renamed over it while the old one is held
+        // open, so that the new one cannot take its inode (ext4 gives a freed inode to the next
+        // file made, and a file with the same bytes and inode is the file the delete read)
+        let held = fs::File::open(&p).unwrap();
+        let other = dir.path().join("s.tsv.new");
+        fs::write(&other, "a\t1\nb\t2\n").unwrap();
+        fs::rename(&other, &p).unwrap();
         assert!(!w.append_if_grown(&gone, &seen).unwrap());
+        drop(held);
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\n", "nothing written");
         let now = Seen::of(&p).unwrap().unwrap();
         assert!(w.append_if_grown(&gone, &now).unwrap());
@@ -1355,6 +1387,68 @@ mod tests {
             .append(&[Record::from_args("c", &["3".into()])])
             .unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"a\t1\nb\t2\nc\t3\n");
+    }
+
+    #[test]
+    fn a_compressed_loose_files_last_line_is_never_joined_by_an_append() {
+        // Its decoded text may not end with a newline, which an append does not decode to see:
+        // each member it appends to a file that holds something begins with one (an empty line,
+        // read as nothing), so the last line is ended (0.2.1 joined it: `b<TAB>2c<TAB>3`).
+        use crate::codec::{Item, for_each_item};
+        use crate::name::Codec;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv.gz");
+        let text = |p: &Path| {
+            let mut out = Vec::new();
+            for_each_item(Codec::Gzip, &fs::read(p).unwrap(), &mut |item| {
+                if let Item::Data(d) = item {
+                    out.extend_from_slice(&d);
+                }
+                true
+            });
+            String::from_utf8(out).unwrap()
+        };
+        let row = |k: &str, v: &str| Record::from_args(k, &[v.into()]);
+        fs::write(
+            &p,
+            crate::codec::encode_member(Codec::Gzip, b"a\t1\nb\t2").unwrap(),
+        )
+        .unwrap();
+        Writer::open(&p).unwrap().append(&[row("c", "3")]).unwrap();
+        assert_eq!(text(&p), "a\t1\nb\t2\nc\t3\n");
+        assert_eq!(
+            read(&p),
+            [("a", "1"), ("b", "2"), ("c", "3")].map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+        );
+        // A file that holds nothing gets none: its first line is the row.
+        let q = dir.path().join("e.tsv.gz");
+        Writer::open(&q).unwrap().append(&[row("c", "3")]).unwrap();
+        assert_eq!(text(&q), "c\t3\n");
+        Writer::open(&q).unwrap().append(&[row("d", "4")]).unwrap();
+        assert_eq!(text(&q), "c\t3\n\nd\t4\n");
+    }
+
+    #[test]
+    fn an_append_of_nothing_to_a_compressed_loose_file_writes_nothing() {
+        // `set f.tsv.gz -` with empty input, or comments only, appends no record: no member, so a
+        // job that pipes in a possibly empty list does not grow the file (0.2.1 wrote nothing;
+        // 0.2.2's first build wrote a member of a newline each time).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv.gz");
+        let held = crate::codec::encode_member(crate::name::Codec::Gzip, b"a\t1\nb\t2").unwrap();
+        fs::write(&p, &held).unwrap();
+        Writer::open(&p).unwrap().append(&[]).unwrap();
+        Writer::open(&p).unwrap().append(&[]).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), held);
+        // and the next record still begins with its newline
+        Writer::open(&p)
+            .unwrap()
+            .append(&[Record::from_args("c", &["3".into()])])
+            .unwrap();
+        assert_eq!(
+            read(&p),
+            [("a", "1"), ("b", "2"), ("c", "3")].map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+        );
     }
 
     #[test]

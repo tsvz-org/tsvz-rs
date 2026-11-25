@@ -143,8 +143,10 @@ fn store(dir: &Path, content: &str) -> PathBuf {
 }
 
 /// The pointer file of `store` naming a socket this test listens on: a stand-in for a handler,
-/// to do with a connection what a real one does only when the timing allows.
-fn stand_in_handler(dir: &Path, store: &Path) -> UnixListener {
+/// to do with a connection what a real one does only when the timing allows; and the pointer file,
+/// locked as a handler holds it (a command takes a pointer file that no process holds for one its
+/// handler left when it ended).
+fn stand_in_handler(dir: &Path, store: &Path) -> (UnixListener, fs::File) {
     let sock = dir.join("sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let at = pointer::path_of(store);
@@ -159,7 +161,11 @@ fn stand_in_handler(dir: &Path, store: &Path) -> UnixListener {
     )
     .unwrap();
     fs::set_permissions(&at, fs::Permissions::from_mode(0o644)).unwrap();
-    listener
+    let held = fs::File::open(&at).unwrap();
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock only operates on the descriptor, which `held` keeps open.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    (listener, held)
 }
 
 /// The next connection to a stand-in handler, with a limit on every wait for its request: a
@@ -556,6 +562,138 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
 }
 
 #[test]
+fn a_second_signal_during_a_stop_does_not_end_serve() {
+    // The stop waits for a write (here the part's lock, held past the signals); the operator
+    // presses Ctrl-C again, or sends HUP after TERM. Each is taken and changes nothing: left
+    // pending, it ended `serve` by its default action once it gave its signal mask back, after the
+    // stop was done (0.2.2's first build; 0.2.1 ended with status 0).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let mut served = Served::start(&s, &[]);
+    let mut client = tsvz::handler::Client::connect(&s).unwrap();
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let popper = std::thread::spawn(move || client.pop("a"));
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    served.signal(libc::SIGTERM);
+    wait_until_stopping(&served);
+    served.signal(libc::SIGHUP);
+    served.signal(libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(300)); // the signals are taken; the stop still waits
+    drop(held);
+    let popped = popper.join().unwrap();
+    assert_eq!(served.wait(), 0, "{}", served.stderr()); // -1: ended by a signal
+    assert!(
+        served.stderr().contains("stopped serving"),
+        "{}",
+        served.stderr()
+    );
+    assert_eq!(served.stderr().matches("; stopping").count(), 1);
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    match popped {
+        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
+        other => assert!(left.get("a").is_some(), "lost: {other:?}"),
+    }
+}
+
+#[test]
+fn signals_sent_without_pause_through_the_stop_and_past_it_do_not_end_the_command() {
+    // The command goes on for a moment after `serve` returns (the lost-write report, the exit): a
+    // signal in that moment ends it by its default action, after the stop was done, if `serve`
+    // gave its signal mask back (0.2.2's second build: 40 of 40 runs sent SIGINT without pause;
+    // 0.2.1, which never gave the mask back, ended with status 0). The command line's
+    // `serve_to_exit` keeps the three blocked until the exit, so the pending ones die with it.
+    // Sent here from the test's own thread, SIGINT, SIGTERM and SIGHUP in turn, until the child
+    // has gone, and never after it was reaped: a pid is not signalled once it may have another
+    // owner.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let mut served = Served::start(&s, &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sent = 0;
+    let status = loop {
+        served.signal([libc::SIGINT, libc::SIGTERM, libc::SIGHUP][sent % 3]);
+        sent += 1;
+        if let Some(status) = served.child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            panic!("serve did not exit: {}", served.stderr());
+        }
+    };
+    assert_eq!(status.code(), Some(0), "{status}: {}", served.stderr()); // ended by a signal: None
+    assert!(
+        served.stderr().contains("stopped serving"),
+        "{}",
+        served.stderr()
+    );
+}
+
+#[test]
+fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
+    // The handler deletes the row before it answers: a client that hangs up meanwhile (killed, or
+    // given up waiting) never gets the answer, the row's only copy, so the handler puts the row
+    // back (0.2.1 lost it).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let served = Served::start(&s, &[]);
+    // The part's write lock, held here, stalls the pop's tombstone until the client is gone.
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let mut conn = connect(&s).unwrap();
+    conn.write_all(b"pop\ta\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    drop(conn);
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !served.stderr().contains("could not be written") {
+        assert!(Instant::now() < deadline, "{}", served.stderr());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        served.stderr().contains("it was put back"),
+        "{}",
+        served.stderr()
+    );
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\na\t1\n");
+    assert_eq!(ask(&s, "get\ta").lines, ["a\t1"]);
+}
+
+#[test]
+fn a_pop_whose_client_went_away_after_its_key_was_written_prints_the_row_taken_even_with_q() {
+    // The put-back keeps a row written for the key since, so nothing is put back: the handler
+    // says so, and prints the row taken (in no file and in no log else), as an error, which `-q`
+    // does not hide; it does not say that the row "was put back".
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let served = Served::start(&s, &["-q"]);
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let mut conn = connect(&s).unwrap();
+    conn.write_all(b"pop\ta\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    let writer = {
+        let s = s.clone();
+        std::thread::spawn(move || ask(&s, "set\ta\t9"))
+    };
+    std::thread::sleep(Duration::from_millis(200)); // queued behind the pop's tombstone
+    drop(conn);
+    drop(held);
+    assert_eq!(writer.join().unwrap().status, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !served.stderr().contains("the row taken was") {
+        assert!(Instant::now() < deadline, "{}", served.stderr());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let said = served.stderr();
+    assert!(said.contains("its key reads a\t9"), "{said}");
+    assert!(said.contains("the row taken was: a\t1"), "{said}");
+    assert!(!said.contains("it was put back"), "{said}");
+    assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\na\t9\n");
+    assert_eq!(ask(&s, "get\ta").lines, ["a\t9"]);
+}
+
+#[test]
 fn a_pop_that_finds_a_handler_stopping_never_takes_the_row_its_pop_took() {
     // While a stopping handler has a pop's tombstone still to write, a pop on the files would
     // read that row as live and take it too: a command in that window finds the handler gone
@@ -610,7 +748,7 @@ fn a_connection_a_stopping_handler_closes_sends_reads_to_the_files() {
     let s = store(dir.path(), "k\tv\n");
     let (code, direct, _) = cli(dir.path(), &["--x-direct", "get", "s.tsvz", "k"], b"");
     assert_eq!(code, 0);
-    let listener = stand_in_handler(dir.path(), &s);
+    let (listener, _held) = stand_in_handler(dir.path(), &s);
     let closer = std::thread::spawn(move || {
         // The read's connection: closed once its request came, unanswered.
         let conn = accept_within_10s(&listener);
@@ -655,9 +793,10 @@ fn pop_a_from_a_stand_in<T: Send + 'static>(
     then: impl FnOnce(UnixStream, &Path, &Path) -> T + Send + 'static,
 ) -> (Output, T) {
     use std::io::BufRead;
-    let listener = stand_in_handler(dir, s);
+    let (listener, held) = stand_in_handler(dir, s);
     let (part, at) = (s.to_path_buf(), pointer::path_of(s));
     let handler = std::thread::spawn(move || {
+        let _held = held;
         let conn = accept_within_10s(&listener);
         let mut request = String::new();
         BufReader::new(&conn).read_line(&mut request).unwrap();
@@ -704,6 +843,37 @@ fn a_row_taken_and_not_printed_is_put_back_on_the_files_when_the_handler_has_hun
         Some(vec!["1".to_string()])
     );
     assert!(left.get("b").is_some());
+}
+
+#[test]
+fn a_row_taken_and_not_printed_is_put_back_at_once_when_the_handler_died() {
+    // The handler died after it answered (killed): its pointer file is left and still names it,
+    // but no process holds its lock, so the row goes back on the files at once (0.2.1 waited 30 s
+    // for the file to go, then printed the row on standard error).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\nb\t2\n");
+    let started = Instant::now();
+    let (out, ()) = pop_a_from_a_stand_in(dir.path(), &s, true, |_conn, _part, _at| {});
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("it was put back"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        pointer::path_of(&s).exists(),
+        "left by the handler that died"
+    );
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    assert_eq!(
+        left.get("a").map(|r| r.to_vec()),
+        Some(vec!["1".to_string()])
+    );
 }
 
 #[test]
@@ -910,6 +1080,25 @@ fn one_connection_carries_many_requests_including_bad_ones() {
     assert_eq!(r.lines, [format!("big\t{big}")]);
     assert_eq!(send(&mut conn, b"set\t-\nb\t2\n#\n").status, 0);
     assert_eq!(send(&mut conn, b"keys\n").lines, ["a", "big", "b"]);
+}
+
+#[test]
+fn a_stop_after_an_acknowledged_write_was_lost_fails_and_so_does_serve() {
+    // A write answered before it was made (no `--x-written`), whose batch then fails: the stop
+    // cannot make it durable, so it answers 1 and says why, and `serve` ends with status 1 (0.2.1
+    // answered #0 and ended with 0).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let mut served = Served::start(&s, &[]);
+    // A directory where the part was: every append fails, even as root.
+    fs::remove_file(&s).unwrap();
+    fs::create_dir(&s).unwrap();
+    assert_eq!(ask(&s, "set\tc\t3").status, 0, "answered before it is made");
+    let (code, _, err) = cli(dir.path(), &["stop", "s.tsvz"], b"");
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("were lost"), "{err}");
+    assert_eq!(served.wait(), 1, "{}", served.stderr());
+    assert!(served.stderr().contains("were lost"), "{}", served.stderr());
 }
 
 #[test]

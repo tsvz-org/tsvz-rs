@@ -233,7 +233,10 @@ fn stamp(path: &Path) -> Result<Stamp, Error> {
 /// only while the part still has the stamp it had before it was read and its path still names
 /// it: another scrub's rotation may rename it away between its opening and the lock, as
 /// [`Writer::append_at`] checks too. Ok(None): another writer changed it or renamed it;
-/// Ok(Some(false)): it already held these bytes.
+/// Ok(Some(false)): it already held these bytes. With `damaged`, the part's old bytes are first
+/// copied to a `.damaged-` backup ([`copy_damaged`]), under the same lock, just before the rewrite,
+/// once the part is the one read and holds other bytes, and the backup's path is put there for the caller to tell
+/// ([`tell_kept`]) once the lock is let go.
 pub(crate) fn rewrite(
     path: &Path,
     content: &[u8],
@@ -241,6 +244,7 @@ pub(crate) fn rewrite(
     codec: Option<Codec>,
     member_size: u64,
     recovery: Option<&Path>,
+    damaged: Option<&mut Option<PathBuf>>,
 ) -> Result<Option<bool>, Error> {
     let io = |e: io::Error| Error::io(path, e);
     let raw: std::borrow::Cow<[u8]> = match codec {
@@ -265,6 +269,10 @@ pub(crate) fn rewrite(
     (&file).read_to_end(&mut old).map_err(io)?;
     if old[..] == raw[..] {
         return Ok(Some(false));
+    }
+    if let Some(kept) = damaged {
+        let part = file.metadata().map_err(io)?;
+        *kept = Some(copy_damaged(path, &part, &mut &old[..])?);
     }
     // Reserve the space first (§19.8), so a full disk or a file-size limit refuses the rewrite
     // before any byte changes.
@@ -392,10 +400,26 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
         .open(path)
         .map_err(io)?;
     let guard = lock::lock(&file).map_err(io)?;
+    let part = file.metadata().map_err(io)?;
+    let target = copy_damaged(path, &part, &mut &file)?;
+    // Told once the lock is let go: a callback that opens the part would release a classic lock
+    // (docs/limitations.md).
+    drop(guard);
+    tell_kept(path, &target, options);
+    Ok(target)
+}
+
+/// Write the bytes of the damaged part at `path` (`part`, its metadata), read from `bytes`, to a
+/// new `<part>.damaged-<local time>` (`.1`, `.2`, … when taken), synced; its path. The caller
+/// holds the part's lock.
+fn copy_damaged(
+    path: &Path,
+    part: &std::fs::Metadata,
+    bytes: &mut dyn Read,
+) -> Result<PathBuf, Error> {
     // The copy is readable by whoever could read the part, and writable by its owner only when
     // the part is: its read bits and owner write bit (`mode & 0o644`), never its setuid, setgid,
     // sticky or execute bits, nor write access for others (the umask still applies on top).
-    let part = file.metadata().map_err(io)?;
     let mode = part.permissions().mode() & 0o644;
     let first = PathBuf::from(format!("{}.damaged-{}", path.display(), local_timestamp()));
     let mut target = first.clone();
@@ -415,34 +439,38 @@ fn backup(path: &Path, options: &Options) -> Result<PathBuf, Error> {
             Err(e) => return Err(Error::io(&target, e)),
         }
     };
-    let copied = match_owner(&copy, &part)
-        .and_then(|()| io::copy(&mut &file, &mut copy))
+    let copied = match_owner(&copy, part)
+        .and_then(|()| io::copy(bytes, &mut copy))
         .and_then(|_| copy.sync_all());
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&target);
         return Err(Error::io(&target, e));
     }
     sync_dir(&target);
-    // Told once the lock is let go: a callback that opens the part would release a classic lock
-    // (docs/limitations.md).
-    drop(guard);
+    Ok(target)
+}
+
+/// Say that the damaged part at `path` was kept in `copy`.
+fn tell_kept(path: &Path, copy: &Path, options: &Options) {
     if let Some(w) = &options.warnings {
         w(&Warning {
             part: path.to_path_buf(),
             offset: None,
             message: format!(
                 "kept the bytes of this damaged part, whose damage is not rewritten, in {}",
-                target.display()
+                copy.display()
             ),
         });
     }
-    Ok(target)
 }
 
-/// A path naming one numbered part is not a store: rewriting that part alone would drop the
-/// tombstones and markers the rest of the store needs (TSVZ.py refuses it too).
+/// A path naming one numbered part of a strict store is not a store: rewriting that part alone
+/// would drop the tombstones and markers the rest of the store needs (TSVZ.py refuses it too). A
+/// loose file is one file whatever its name (§20.2.4), `app.tsv.1` too, as every other operation
+/// takes it.
 fn refuse_a_part(op: &str, path: &Path) -> Result<(), Error> {
-    if crate::name::names_a_part(path) {
+    let strict = crate::name::format_of(path).is_some_and(|f| f.strict);
+    if strict && crate::name::names_a_part(path) {
         return Err(Error::Refused(format!(
             "{}: {op} skipped: the path names one part of a multi-part store; {op} the store path instead; nothing was written",
             path.display()
@@ -836,6 +864,7 @@ fn attempt(
         target.codec,
         s.markers().member_size,
         recovery.as_deref(),
+        None,
     );
     if let (Some(old), true) = (narrowed, put_mode_back(&written)) {
         let _ = std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(old));
@@ -1444,7 +1473,10 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
                 .warnings(options.warnings.clone())
                 .delimiter(options.delimiter)
                 .append(&[])?;
-            return Ok(Outcome::Written);
+            if loose_delimiter(store, options)?.is_none() {
+                return Ok(Outcome::Written);
+            }
+            continue; // a loose file is then cleared as an empty one: an empty line 1, as TSVZ.py's
         }
         let before = if list.len() == 1 {
             Some(stamp(&list[0].path)?)
@@ -1515,6 +1547,7 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
             part.codec,
             s.markers().member_size,
             None,
+            None,
         )? {
             None => continue,
             Some(true) => return Ok(Outcome::Written),
@@ -1525,6 +1558,27 @@ pub fn clear(store: &Path, options: &Options) -> Result<Outcome, Error> {
         "{}: clear skipped: the store kept changing while it was being cleared; nothing was written",
         store.display()
     )))
+}
+
+#[cfg(all(test, feature = "cli"))]
+thread_local! {
+    /// What another process does while a loose delete in this thread works, for a test: one is run
+    /// at each step of an attempt ([`between`]), in turn.
+    static BETWEEN: std::cell::RefCell<std::collections::VecDeque<Box<dyn FnOnce()>>> =
+        Default::default();
+}
+
+/// A step of a loose delete's attempt (after it took the file's size, after its head read, before
+/// a rewrite): where a test lets another process act ([`BETWEEN`]).
+#[cfg(feature = "cli")]
+fn between() {
+    #[cfg(test)]
+    {
+        let next = BETWEEN.with(|b| b.borrow_mut().pop_front());
+        if let Some(act) = next {
+            act();
+        }
+    }
 }
 
 /// What a loose delete did.
@@ -1540,7 +1594,7 @@ pub(crate) enum LooseDelete {
 }
 
 /// Delete `keys` from a loose file (§20.2 `delete`, and the deletion of `pop` and `popitem`),
-/// as TSVZ.py does, from the file's column count alone: more than one column, a key alone is a
+/// from the file's column count alone: more than one column, a key alone is a
 /// deletion, appended for each key asked, live or not, as a reader names it ([`loose::name`]: a
 /// line break or a delimiter at its end stays, a blank goes; a key no row can have names none), and only
 /// while the file is as the read found it; one column, where a key alone is a row and no line can
@@ -1575,23 +1629,27 @@ pub(crate) fn delete_loose(
             meanwhile = "read"; // truncated while its end was being read
             continue;
         };
+        between();
         // The head's warnings are held: at one column the whole read below says them again.
         let held: Arc<Mutex<Vec<Warning>>> = Arc::default();
         let hold: crate::WarnFn = {
             let held = held.clone();
             Arc::new(move |w: &Warning| held.lock().unwrap().push(w.clone()))
         };
+        // No further than the size seen: the decision (the column count) never rests on a first
+        // keyed line appended since.
         let head = Store::open(
             store,
             Options {
                 scope: Scope::KeysOnly,
                 verify: false,
                 skip_unreadable: false,
-                head: true,
+                head: Some(seen.size()),
                 warnings: Some(hold),
                 ..options.clone()
             },
         )?;
+        between();
         let say = || {
             for w in held.lock().unwrap().iter() {
                 options.warnings.iter().for_each(|f| f(w));
@@ -1648,17 +1706,23 @@ pub(crate) fn delete_loose(
         let Some(content) = write_kept(store, options, kept)? else {
             continue; // the file changed between the reads
         };
-        if s.damaged() {
-            backup(&part.path, options)?;
-        }
-        match rewrite(
+        between();
+        // A damaged file is backed up by the rewrite itself, under its lock, once: an attempt that
+        // loses its race to another writer makes no copy.
+        let mut kept = None;
+        let written = rewrite(
             &part.path,
             &content,
             before,
             part.codec,
             DEFAULT_MEMBER_SIZE,
             None,
-        )? {
+            s.damaged().then_some(&mut kept),
+        );
+        if let Some(copy) = &kept {
+            tell_kept(&part.path, copy, options);
+        }
+        match written? {
             None => continue, // another writer committed after the read
             Some(true) => return Ok(LooseDelete::Rewrote),
             Some(false) => return Ok(LooseDelete::Nothing),
@@ -1856,7 +1920,7 @@ mod tests {
         let stale = Stamp::of(&fs::metadata(&p).unwrap());
         fs::write(&p, "a\t1\nb\t2\n").unwrap();
         assert_eq!(
-            rewrite(&p, b"x\n", stale, None, DEFAULT_MEMBER_SIZE, None).unwrap(),
+            rewrite(&p, b"x\n", stale, None, DEFAULT_MEMBER_SIZE, None, None).unwrap(),
             None
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "a\t1\nb\t2\n");
@@ -1877,7 +1941,7 @@ mod tests {
         let rewriting = {
             let p = p.clone();
             std::thread::spawn(move || {
-                rewrite(&p, b"a\t2\n", before, None, DEFAULT_MEMBER_SIZE, None)
+                rewrite(&p, b"a\t2\n", before, None, DEFAULT_MEMBER_SIZE, None, None)
             })
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1925,6 +1989,84 @@ mod tests {
         assert_eq!(fs::read_to_string(&p).unwrap(), "");
     }
 
+    /// Queue what another process does at each step of the next loose delete in this thread.
+    #[cfg(feature = "cli")]
+    fn meanwhile(acts: Vec<Box<dyn FnOnce()>>) {
+        BETWEEN.with(|b| *b.borrow_mut() = acts.into());
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_decides_from_no_line_appended_after_it_took_the_file_s_size() {
+        // An empty file; the delete takes its size (nothing); another process appends `a<TAB>1`;
+        // the head read would see two columns; a clear empties the file again, the same inode;
+        // under the lock the file is as first seen, so a key alone appended now would be a row of
+        // one column. The head read goes no further than the size seen, finds no keyed line, and
+        // the delete writes nothing (0.2.1 appended `k`).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsv");
+        fs::write(&p, "").unwrap();
+        let (a, b) = (p.clone(), p.clone());
+        meanwhile(vec![
+            Box::new(move || fs::write(a, "a\t1\n").unwrap()),
+            Box::new(move || fs::write(b, "").unwrap()),
+        ]);
+        let done = delete_loose(&p, &opts(), &["k".to_string()]).unwrap();
+        assert_eq!(done, LooseDelete::Nothing);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "");
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn a_loose_delete_that_loses_its_race_backs_the_damaged_file_up_once() {
+        // A damaged one-column file whose rewrite is overtaken by another writer's append: the
+        // delete reads it again and rewrites it then, with one `.damaged-` copy, of the file as it
+        // rewrote it (0.2.1 made one for each attempt, and said the damage twice).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.tsv.gz");
+        let gz = |t: &str| codec::encode_member(Codec::Gzip, t.as_bytes()).unwrap();
+        let mut second = gz(&"b\nc\n".repeat(20));
+        let middle = second.len() / 2;
+        second[middle] ^= 0xff;
+        fs::write(&p, [gz("#h\na\n"), second].concat()).unwrap();
+        let q = p.clone();
+        let append = move || {
+            let mut f = OpenOptions::new().append(true).open(q).unwrap();
+            f.write_all(&gz("d\n")).unwrap();
+        };
+        meanwhile(vec![Box::new(|| {}), Box::new(|| {}), Box::new(append)]);
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let hear = said.clone();
+        let options = Options {
+            warnings: Some(Arc::new(move |w: &Warning| {
+                hear.lock().unwrap().push(w.message.clone())
+            })),
+            ..opts()
+        };
+        assert_eq!(
+            delete_loose(&p, &options, &["a".to_string()]).unwrap(),
+            LooseDelete::Rewrote
+        );
+        let copies: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".damaged-"))
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        let kept = said
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.starts_with("kept the bytes"))
+            .count();
+        assert_eq!(kept, 1, "{:?}", said.lock().unwrap());
+        let copy = fs::read(dir.path().join(&copies[0])).unwrap();
+        assert!(
+            copy.ends_with(&gz("d\n")),
+            "the file as the rewrite found it"
+        );
+    }
+
     #[test]
     #[cfg(feature = "cli")]
     fn a_loose_delete_waiting_for_the_lock_while_another_writer_appends_still_deletes() {
@@ -1966,7 +2108,14 @@ mod tests {
                 LooseDelete::Appended(1),
                 "{name}"
             );
-            let want = ["a\t1\nb\t2\n", "c\t3\n", "a\n"].map(member).concat();
+            // In a compressed file the key alone begins with a newline (an empty line), as every
+            // append to one that holds something does.
+            let alone = if name.ends_with(".gz") {
+                "\na\n"
+            } else {
+                "a\n"
+            };
+            let want = ["a\t1\nb\t2\n", "c\t3\n", alone].map(member).concat();
             assert_eq!(fs::read(&p).unwrap(), want, "{name}");
             assert_eq!(
                 rows(&p),
@@ -2764,10 +2913,13 @@ mod tests {
         // A copy-on-write file system (btrfs, ZFS, APFS) needs new blocks even to overwrite:
         // there a full disk can leave a rewrite half done, so the copy is not skipped.
         let dir = tempfile::tempdir().unwrap();
-        let tmpfs = std::process::Command::new("stat")
-            .args(["-f", "-c", "%T"])
-            .arg(dir.path())
-            .output();
+        let tmpfs = {
+            let _alone = lock::forking();
+            std::process::Command::new("stat")
+                .args(["-f", "-c", "%T"])
+                .arg(dir.path())
+                .output()
+        };
         let kind = tmpfs.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         if let Ok(kind) = kind {
             let expected = matches!(kind.as_str(), "tmpfs" | "ext2/ext3" | "xfs" | "f2fs");

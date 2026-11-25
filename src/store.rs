@@ -55,9 +55,11 @@ pub struct Options {
     /// (§19.10.4).
     pub(crate) every_part: bool,
     /// Read a loose file only as far as its first keyed line, which sets its column count
-    /// ([`Store::one_column`]). A compressed file's member is still decoded to its check before
-    /// its lines are used (§16.6), holding no more of it than a member of the default size.
-    pub(crate) head: bool,
+    /// ([`Store::one_column`]), and no further than its first `head` bytes as stored: a decision
+    /// made from that line then never rests on a line appended since ([`crate::write::Seen`]). A
+    /// compressed file's member is still decoded to its check before its lines are used (§16.6), a
+    /// few MiB at a time when it passes the check.
+    pub(crate) head: Option<u64>,
 }
 
 /// One part as `parts` lists it (§20.2).
@@ -412,7 +414,9 @@ fn first_lines(codec: Codec, reader: &mut impl Read, on_line: &mut dyn FnMut(&Li
             _ => return,
         };
         let mut input = &page[..n];
-        while !input.is_empty() {
+        // The last step filled its room: the decoder may have output still to give.
+        let mut pending = false;
+        while !input.is_empty() || pending {
             if between {
                 if codec == Codec::Gzip {
                     let zeros = input.iter().take_while(|&&b| b == 0).count();
@@ -425,17 +429,25 @@ fn first_lines(codec: Codec, reader: &mut impl Read, on_line: &mut dyn FnMut(&Li
                 between = false;
             }
             out.clear();
-            let Ok((used, ended)) = decoder.feed(input, &mut out) else {
+            // No more output at a time than a member of the default size, however well a page
+            // compresses.
+            let room = DEFAULT_MEMBER_SIZE as usize;
+            let Ok((used, ended)) = decoder.feed_upto(input, &mut out, room) else {
                 return;
             };
             if !framer.push(&out, on_line) {
                 return;
             }
-            if !ended {
+            pending = !ended && out.len() >= room;
+            if ended {
+                between = true;
+                // as `codec::read_items` steps past a member
+                input = &input[used.max(1).min(input.len())..];
+            } else if pending {
+                input = &input[used..]; // on with the rest of the page, or what it still gives
+            } else {
                 break;
             }
-            between = true;
-            input = &input[used.max(1)..]; // as `codec::read_items` steps past a member
         }
     }
 }
@@ -660,7 +672,7 @@ impl Store {
             if !format.strict {
                 replay.lines = options.lines.clone();
             }
-            replay.head = options.head && !format.strict;
+            replay.head = options.head.is_some() && !format.strict;
             // A loose rewrite works on the lines it keeps and reads no row: no key is wanted.
             let no_rows = Scope::Keys(Vec::new());
             let scope = if options.lines.is_some() && !format.strict {
@@ -784,7 +796,9 @@ impl Store {
         judge: Option<&mut SnapshotLines>,
     ) -> Result<(), Error> {
         let file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
-        let mut reader: &File = &file;
+        // A head read takes the file's first bytes only; any other read, all of it.
+        let within = self.options.head.filter(|_| self.replay.head);
+        let mut reader = Read::take(&file, within.unwrap_or(u64::MAX));
         let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
         if meta.is_dir() {
             return Err(Error::io(
@@ -812,7 +826,11 @@ impl Store {
         let mut framer = Framer::new();
         match part.codec {
             Some(codec) => {
-                codec::read_items(codec, &file, keep, &mut |item| match item {
+                let src = codec::Prefix {
+                    src: &file,
+                    len: within.unwrap_or(u64::MAX),
+                };
+                codec::read_items(codec, &src, keep, &mut |item| match item {
                     Item::Data(out) => framer.push(&out, &mut |l| feed.line(l)),
                     Item::CutShort { offset, out } => {
                         feed.damage();
@@ -1441,6 +1459,62 @@ mod tests {
         let s = Store::open(&q, Options::default()).unwrap();
         assert_eq!(s.get("a").unwrap().to_vec(), v(&["d1", "q"]));
         assert!(s.missing().is_none());
+    }
+
+    #[test]
+    fn a_loose_read_decodes_the_cells_of_the_rows_it_wants_only() {
+        // 0.2.1 decoded every line's cells, and padded them, before it asked whether the read
+        // wanted that key: `get` of one key in a 120 MB file took twice 0.2.0's time.
+        use crate::loose::DECODED;
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (0..1000).map(|i| format!("k{i}\t{i}\tx\n")).collect();
+        let p = write(
+            dir.path(),
+            "s.tsv",
+            format!("#_defaults_#\tP\tQ\n{text}").as_bytes(),
+        );
+        DECODED.with(|n| n.set(0));
+        let one = Options {
+            scope: Scope::Keys(vec!["k5".into()]),
+            ..Options::default()
+        };
+        let s = Store::open(&p, one).unwrap();
+        assert_eq!(s.get("k5").unwrap().to_vec(), ["5", "x"]);
+        // the key named (`loose::lookup` reads it as a line), the `#_defaults_#` line, whose cells
+        // every later row may take, and the row wanted
+        assert_eq!(DECODED.with(|n| n.get()), 3);
+        DECODED.with(|n| n.set(0));
+        let keys = Options {
+            scope: Scope::KeysOnly,
+            ..Options::default()
+        };
+        assert_eq!(Store::open(&p, keys).unwrap().len(), 1000);
+        assert_eq!(DECODED.with(|n| n.get()), 1);
+    }
+
+    #[test]
+    fn a_loose_row_keeps_its_own_cells_padded_only_where_a_default_fills_one() {
+        // A wide first keyed line made every row hold that many cells (8 bytes a cell): a row is
+        // padded as it is read, as 0.2.0 did, and holds its own cells.
+        let dir = tempfile::tempdir().unwrap();
+        let wide = format!("k{}\nb\t1\n", "\tv".repeat(9));
+        let p = write(dir.path(), "w.tsv", wide.as_bytes());
+        let s = Store::open(&p, Options::default()).unwrap();
+        let b = s.get("b").unwrap();
+        assert_eq!((b.written(), b.len()), (1, 9));
+        assert_eq!(b.to_vec(), [&["1"][..], &[""; 8]].concat());
+        // A default fills a cell padded for it, and only as far as the defaults go.
+        let p = write(
+            dir.path(),
+            "d.tsv",
+            b"#_defaults_#\t\tP\nk\t1\t2\t3\t4\nb\tx\n",
+        );
+        let s = Store::open(&p, Options::default()).unwrap();
+        let b = s.get("b").unwrap();
+        assert_eq!(
+            (b.written(), b.to_vec()),
+            (2, vec!["x".to_string(), "P".to_string()])
+        );
     }
 
     #[test]

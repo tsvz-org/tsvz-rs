@@ -148,8 +148,19 @@ fn carry_out(ctx: &mut Ctx, plan: Plan) -> Result<i32, Error> {
             member_size,
         } => {
             writer(ctx, Some(member_size))?.append(std::slice::from_ref(&record))?;
-            print(ctx, &key, &cells)?;
-            Ok(0)
+            if ctx.format.strict {
+                print(ctx, &key, &cells)?;
+                return Ok(0);
+            }
+            // A loose row is what a reader then reads, as `get` reads it: the `#_defaults_#` lines
+            // fill its blank cells, a cell loses the whitespace at its end, and a line of blank
+            // values is a deletion (no row, 3, as TSVZ.py's `setdefault` answers it).
+            let store = ctx.open(Scope::Keys(vec![key.clone()]), false)?;
+            let mut out = Printer::rows(ctx);
+            let code = ops::get(&store, &[key], &mut out)?;
+            out.finish()?;
+            ctx.out.flush().map_err(stdout_error)?;
+            Ok(code)
         }
     }
 }

@@ -713,6 +713,33 @@ fn a_loose_rewrite_keeps_the_bytes_after_the_last_newline() {
 }
 
 #[test]
+fn a_write_of_no_row_to_a_compressed_loose_file_leaves_its_bytes() {
+    // `set f.tsv.gz -` or `append f.tsv.gz -` with empty input, or comments only, writes no row,
+    // so no member: a job that pipes in a possibly empty list does not grow the file (0.2.1 wrote
+    // nothing; 0.2.2's first build appended a member of a newline each time).
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let gz = tsvz::codec::encode_member(tsvz::name::Codec::Gzip, b"a\t1\nb\t2").unwrap();
+    fs::write(dir.join("f.tsv.gz"), &gz).unwrap();
+    for (op, input) in [
+        ("set", ""),
+        ("set", "#c\n"),
+        ("append", ""),
+        ("append", "#c\n"),
+    ] {
+        let (code, _, err) = run_in(dir, &[op, "f.tsv.gz", "-"], input.as_bytes());
+        assert_eq!(code, 0, "{op} {input:?}: {err}");
+        assert_eq!(
+            fs::read(dir.join("f.tsv.gz")).unwrap(),
+            gz,
+            "{op} {input:?}"
+        );
+    }
+    assert_eq!(run_in(dir, &["set", "f.tsv.gz", "c", "3"], b"").0, 0);
+    assert_eq!(records(dir, &["keys", "f.tsv.gz"]).1, "a\nb\nc\n");
+}
+
+#[test]
 fn a_loose_rewrite_keeps_the_lines_it_keeps_as_they_are() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
@@ -789,6 +816,12 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
         "{err}"
     );
     assert!(fs::read(dir.join("e.tsv")).is_ok_and(|f| f.is_empty()) || !dir.join("e.tsv").exists());
+    // `</sep/>` holds an `e`: a reader splits the cell there before it would decode the token.
+    let (code, _, err) = records(dir, &["-d", "e", "set", "e.tsv", "k", "</sep/>"]);
+    assert!(
+        code == 1 && err.contains("holds the delimiter `e`"),
+        "{err}"
+    );
     assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
     assert_eq!(file(dir, "e.tsv"), "kehllo\n");
     // `-d '#'`: the key `#tag` is written `<sep>tag`, which reads back; the value is what fails.
@@ -957,6 +990,38 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
     );
     assert_eq!(file(dir, "n.tsv"), "a\t5\n");
     assert_eq!(records(dir, &["keys", "n.tsv"]).1, "a\n");
+}
+
+/// `setdefault` of a missing key in a loose file prints the row a reader then reads, as `get`
+/// does, as TSVZ.py 5.18's does: a cell without the whitespace at its end, blank cells filled by
+/// the `#_defaults_#` line in force, and no row (3) for a line of blank values, which a reader
+/// reads as a deletion (0.2.1 printed the cells given, padded with blanks, and exited 0).
+#[test]
+fn a_loose_setdefault_prints_the_row_a_reader_then_reads() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    fs::write(dir.join("f.tsv"), "k\tv\tw\n").unwrap();
+    let printed = |args: &[&str]| {
+        let (code, out, err) = records(dir, args);
+        assert!(err.is_empty(), "{args:?}: {err}");
+        (code, out)
+    };
+    assert_eq!(
+        printed(&["setdefault", "f.tsv", "n", "x "]),
+        (0, "n\tx\t\n".into())
+    );
+    assert_eq!(printed(&["setdefault", "f.tsv", "m", ""]), (3, "".into()));
+    assert_eq!(records(dir, &["has", "f.tsv", "m"]).0, 3);
+    fs::write(dir.join("g.tsv"), "#_defaults_#\tP\tQ\nk\tv\tw\n").unwrap();
+    assert_eq!(
+        printed(&["setdefault", "g.tsv", "z", "", "r"]),
+        (0, "z\tP\tr\n".into())
+    );
+    // A live key's row is printed as before.
+    assert_eq!(
+        printed(&["setdefault", "g.tsv", "k", "other"]),
+        (0, "k\tv\tw\n".into())
+    );
 }
 
 /// Bulk input to a loose file loses the NULs at a line's start, as a reader does (0.2.0 and the
@@ -1322,6 +1387,14 @@ fn a_loose_file_is_one_file_even_with_numbered_siblings() {
     assert_eq!(records(dir, &["set", "app.tsv", "c", "3"]).0, 0);
     assert_eq!(file(dir, "app.tsv"), "a\tnew\nc\t3\n");
     assert_eq!(file(dir, "app.tsv.1"), "a\told\nb\told\n");
+    // A loose file named with a number is one file to `scrub` and `clear` too (0.2.1 refused it as
+    // a part of a multi-part store, which a loose file never is).
+    fs::write(dir.join("app.tsv.2"), "#h\na\t1\nb\t2\na\t3\n").unwrap();
+    assert_eq!(records(dir, &["scrub", "app.tsv.2"]).0, 0);
+    assert_eq!(file(dir, "app.tsv.2"), "#h\na\t3\nb\t2\n");
+    assert_eq!(records(dir, &["clear", "app.tsv.1"]).0, 0);
+    assert_eq!(file(dir, "app.tsv.1"), "\n");
+    assert_eq!(file(dir, "app.tsv"), "a\tnew\nc\t3\n");
 }
 
 #[cfg(target_os = "linux")]

@@ -66,6 +66,10 @@ struct Queue {
     unsynced: Vec<(PathBuf, u64, File)>,
     /// A sync of a part left behind that failed, until a flush reports it.
     sync_error: Option<String>,
+    /// The first failure that lost a write acknowledged before it was made: a failed batch of
+    /// such writes, or a failed sync of them. Kept for good: every flush (a stop) and the end of
+    /// `serve` report it.
+    lost: Option<String>,
     /// Syncs of parts left behind under way, which a flush waits for.
     syncing: usize,
     closing: bool,
@@ -142,19 +146,32 @@ impl Batcher {
         }
     }
 
-    /// Wait until everything queued is written, then fsync what was not (§21.9.3).
+    /// Wait until everything queued is written, then fsync what was not (§21.9.3); an error when a
+    /// write acknowledged before it was made has been lost, now or before ([`Queue::lost`]).
     fn flush(&self) -> Result<(), String> {
         self.barrier();
         let mut q = lock(&self.queue);
         while q.syncing > 0 {
             q = self.changed.wait(q).unwrap_or_else(|e| e.into_inner());
         }
-        if let Some(e) = q.sync_error.take() {
-            return Err(e);
+        let synced = match q.sync_error.take() {
+            Some(e) => Err(e),
+            None => sync(&q.unsynced).map_err(|e| format!("fsync failed: {e}")),
+        };
+        if let Err(e) = &synced {
+            q.lost.get_or_insert_with(|| e.clone());
+        } else {
+            q.unsynced.clear();
         }
-        sync(&q.unsynced).map_err(|e| e.to_string())?;
-        q.unsynced.clear();
-        Ok(())
+        match &q.lost {
+            Some(lost) => Err(lost.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// The first failure that lost an acknowledged write ([`Queue::lost`]).
+    fn lost(&self) -> Option<String> {
+        lock(&self.queue).lost.clone()
     }
 
     /// The parts awaiting an fsync.
@@ -242,6 +259,13 @@ impl Batcher {
                             message: format!("a batch of {} writes failed: {message}", batch.len()),
                         });
                     }
+                    // A write answered before it was made is lost with its batch; one that waited
+                    // for its outcome was answered with this error.
+                    if batch.iter().any(|e| !e.waited) {
+                        q.lost.get_or_insert_with(|| {
+                            format!("writes answered before they were made were lost, in a batch that failed: {message}")
+                        });
+                    }
                     q.failing = Some(message);
                 }
             }
@@ -260,7 +284,9 @@ impl Batcher {
                 let mut q = lock(&self.queue);
                 q.syncing -= 1;
                 if let Err(e) = synced {
-                    q.sync_error.get_or_insert_with(|| e.to_string());
+                    let message = format!("fsync failed: {e}");
+                    q.lost.get_or_insert_with(|| message.clone());
+                    q.sync_error.get_or_insert(message);
                     if let Some(errors) = &self.errors {
                         errors(&Warning {
                             part: self.store.clone(),
@@ -274,13 +300,15 @@ impl Batcher {
         }
         let unsynced = std::mem::take(&mut lock(&self.queue).unsynced);
         if let Err(e) = sync(&unsynced) {
+            let message = format!("fsync failed: {e}");
             if let Some(errors) = &self.errors {
                 errors(&Warning {
                     part: self.store.clone(),
                     offset: None,
-                    message: format!("fsync failed: {e}"),
+                    message: message.clone(),
                 });
             }
+            lock(&self.queue).lost.get_or_insert(message);
         }
     }
 }
@@ -398,7 +426,8 @@ pub struct Engine {
 
 impl Engine {
     /// Serve the strict store at `path`, creating it when it is missing (§21.13.1). `log` gets
-    /// every warning, `errors` every failed batch and fsync, for `serve`'s standard error.
+    /// every warning, `errors` every failed batch and fsync and every row a `pop` took that was
+    /// not put back (the server's), for `serve`'s standard error.
     pub fn open(path: &Path, log: Option<WarnFn>, errors: Option<WarnFn>) -> Result<Engine, Error> {
         let format = name::format_of(path).ok_or_else(|| Error::BadPath(path.to_path_buf()))?;
         if !format.strict {
@@ -465,6 +494,17 @@ impl Engine {
         &self.path
     }
 
+    /// Report `message` as an error of this store, which `serve`'s `-q` does not hide.
+    pub(crate) fn error(&self, message: String) {
+        if let Some(errors) = &self.batcher.errors {
+            errors(&Warning {
+                part: self.path.clone(),
+                offset: None,
+                message,
+            });
+        }
+    }
+
     /// Run `f` on the state under the mutex; also return the warnings raised meanwhile.
     fn locked<R>(
         &self,
@@ -517,9 +557,11 @@ impl Engine {
     /// Encode `records` for the store and queue them; None when there is nothing to write.
     /// Its member size follows the markers as they stand where it will be appended: the files
     /// followed now, then the markers still queued. It is made durable when the files say
-    /// `#_write_ack_# disk`, and while a `#_write_ack_#` this handler queued is not yet followed,
-    /// whatever that says: a `memory` whose batch fails leaves the files saying `disk` (§21.9).
-    /// The request waits for a durable write, and for any when `written`.
+    /// `#_write_ack_# disk`, when the request sets `#_write_ack_#` itself, and while a
+    /// `#_write_ack_#` this handler queued is not yet followed, whatever that says: a `memory`
+    /// whose batch fails leaves the files saying `disk` (§21.9), and a `disk` applies to the
+    /// request's own writes after it. The request waits for a durable write, and for any when
+    /// `written`.
     fn submit(
         &self,
         st: &mut State,
@@ -567,7 +609,11 @@ impl Engine {
             .or(markers.map(|m| m.member_size))
             .unwrap_or(crate::replay::DEFAULT_MEMBER_SIZE);
         let payload = crate::write::encode(records, self.format)?;
-        let durable = sync || ack_queued || ack == Some("disk");
+        let own_ack = records
+            .iter()
+            .filter_map(crate::write::marker_effect)
+            .any(|(key, _)| key == "#_write_ack_#");
+        let durable = sync || ack_queued || own_ack || ack == Some("disk");
         let waited = durable || written;
         let seq = self.batcher.submit(payload, member_size, durable, waited);
         for (key, m) in records.iter().filter_map(crate::write::marker_effect) {
@@ -816,9 +862,16 @@ impl Engine {
         Engine::answer(result, said)
     }
 
-    /// Make every acknowledged write durable (`stop`, §21.9.3).
+    /// Make every acknowledged write durable (`stop`, §21.9.3): an error when one was lost, now or
+    /// before (a failed batch of writes answered before they were made, a failed sync).
     pub fn flush(&self) -> Result<(), Error> {
         self.batcher.flush().map_err(Error::Refused)
+    }
+
+    /// The first failure that lost a write acknowledged before it was made, a failed sync at
+    /// close included: what `serve` reports as it ends.
+    pub fn lost(&self) -> Option<String> {
+        self.batcher.lost()
     }
 
     /// Answer no more requests; write and fsync everything queued, and end the writer thread.
@@ -1156,7 +1209,10 @@ mod tests {
         };
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file).unwrap();
-        assert!(!submit(&ack("disk")).waited, "the store says memory");
+        assert!(
+            submit(&ack("disk")).waited,
+            "a request that sets it is durable itself"
+        );
         while !lock(&e.batcher.queue).entries.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(1)); // the writer takes it
         }
@@ -1166,6 +1222,42 @@ mod tests {
         drop(held);
         e.batcher.barrier();
         assert!(!submit(&data).waited, "written and followed: memory");
+    }
+
+    #[test]
+    fn a_request_that_sets_write_ack_is_durable_itself() {
+        // `set -` of `#_write_ack_#<TAB>disk` and `k<TAB>v`, in a store that says memory: the files
+        // say `disk` once it is written, so the request's own write is synced before it is answered
+        // (0.2.1 answered at once). One that sets `memory` too, as any `#_write_ack_#` queued is.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let submit = |records: &[Record]| {
+            let mut st = lock(&e.state);
+            // Not `written`: a write is waited for exactly when it is durable.
+            e.submit(&mut st, Instant::now(), records, false, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let data = || Record::Data {
+            key: "k".into(),
+            values: vec!["v".into()],
+        };
+        let ack = |value: &str| Record::Marker {
+            key: "#_write_ack_#".into(),
+            values: vec![value.into()],
+        };
+        assert!(!submit(&[data()]).waited, "the store says memory");
+        e.batcher.barrier();
+        assert!(!e.batcher.unsynced().is_empty());
+        assert!(submit(&[ack("memory"), data()]).waited, "its own memory");
+        e.batcher.barrier();
+        assert!(!submit(&[data()]).waited, "written and followed: memory");
+        e.batcher.barrier();
+        assert!(submit(&[ack("disk"), data()]).waited, "its own disk");
+        e.batcher.barrier();
+        assert!(e.batcher.unsynced().is_empty(), "synced with its batch");
     }
 
     #[test]
@@ -1470,6 +1562,31 @@ mod tests {
         assert_eq!(ask(&e, "--x-written\tset\td\t4").status, 0);
         let r = ask(&e, "len");
         assert!(r.diagnostics.is_empty(), "writes work again: {r:?}");
+    }
+
+    #[test]
+    fn a_flush_after_an_acknowledged_write_was_lost_fails_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "a\t1\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        // A directory where the part was: every append fails, even as root.
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        // A write that waits for its outcome is answered with the failure: nothing answered is
+        // lost, and a stop's flush succeeds.
+        assert_eq!(ask(&e, "--x-written\tset\tb\t2").status, 1);
+        assert!(e.flush().is_ok() && e.lost().is_none());
+        // One answered before it is made is lost with its batch: every flush says so from then on,
+        // also once writes work again (0.2.1's stop answered #0).
+        assert_eq!(ask(&e, "set\tc\t3").status, 0);
+        let lost = e.flush().unwrap_err().to_string();
+        assert!(lost.contains("were lost"), "{lost}");
+        fs::remove_dir(&p).unwrap();
+        fs::write(&p, "a\t1\n").unwrap();
+        assert_eq!(ask(&e, "--x-written\tset\td\t4").status, 0);
+        assert!(e.flush().is_err(), "kept for good");
+        assert_eq!(e.lost(), Some(lost));
     }
 
     #[test]

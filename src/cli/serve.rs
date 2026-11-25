@@ -24,7 +24,7 @@ pub(crate) fn serve(ctx: &mut Ctx) -> Result<i32, Error> {
         info,
         verbose: ctx.args.verbose,
     };
-    server::serve(&ctx.store, config)?;
+    server::serve_to_exit(&ctx.store, config)?;
     Ok(0)
 }
 

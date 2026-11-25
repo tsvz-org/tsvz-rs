@@ -101,7 +101,7 @@ pub(crate) fn sanitize(cell: &str, d: u8) -> Cow<'_, str> {
 /// whitespace at its end, then decoded). None when that is not `key` less some whitespace at its
 /// end, so that no row can have `key`: its line begins with `#` (a comment, but for a `#_defaults_#`
 /// line) or a NUL; it is only whitespace that its encoding leaves as it is (a reader trims that
-/// away; a tab or a line break encodes as `<sep>` or `<LF>`, and so is a key); it holds `</sep/>` or
+/// away; the delimiter or a line break encodes as `<sep>` or `<LF>`, and so is a key); it holds `</sep/>` or
 /// `</LF/>` (read back as `<sep>` and `<LF>`); or its encoding holds the delimiter (`-d e`: `<sep>`
 /// has an `e`). The rule for every key a loose command names, and, field by field, for what a loose
 /// write may write ([`reads_back`]).
@@ -147,15 +147,15 @@ pub(crate) fn cause(fields: &[&str], d: u8) -> String {
         if i == 0 && written.is_empty() {
             return format!("{what} {f:?} is empty or only whitespace, so a reader skips the line");
         }
-        if f.contains("</sep/>") || f.contains("</LF/>") {
-            return format!(
-                "{what} {f:?} holds `</sep/>` or `</LF/>`, which a reader reads as `<sep>` and `<LF>`"
-            );
-        }
         if sanitize(f, d).contains(d as char) {
             return format!(
                 "{what} {f:?} written as {:?} holds the delimiter `{dq}`, so a reader splits it there",
                 sanitize(f, d)
+            );
+        }
+        if f.contains("</sep/>") || f.contains("</LF/>") {
+            return format!(
+                "{what} {f:?} holds `</sep/>` or `</LF/>`, which a reader reads as `<sep>` and `<LF>`"
             );
         }
     }
@@ -187,6 +187,28 @@ pub(crate) fn reads_back<'l>(
 /// nothing: empty, a comment (it begins with `#`, but not with `#_defaults_#`), or one whose key is
 /// empty once decoded (only whitespace). `line` is the line without its `\n`.
 pub(crate) fn parse(line: &str, d: u8, terminated: bool) -> Option<Vec<Cow<'_, str>>> {
+    split(line, d, terminated).map(Split::cells)
+}
+
+/// A line as [`parse`] reads it, but for its cells after the key, which are decoded only when
+/// asked for ([`Split::cells`]): a read that does not want a row's cells counts them and tells
+/// whether they hold a value without decoding them.
+pub(crate) struct Split<'l> {
+    /// The key, decoded.
+    pub(crate) key: Cow<'l, str>,
+    /// The line, without what a reader drops at its ends.
+    line: &'l str,
+    d: u8,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many lines' cells this thread decoded ([`Split::cells`]), for a test.
+    pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The line `line` split as [`parse`] reads it; None for a line read as nothing.
+pub(crate) fn split(line: &str, d: u8, terminated: bool) -> Option<Split<'_>> {
     let mut line = line.trim_start_matches('\0');
     if !terminated {
         line = line.trim_end_matches('\0');
@@ -195,8 +217,36 @@ pub(crate) fn parse(line: &str, d: u8, terminated: bool) -> Option<Vec<Cow<'_, s
     if line.is_empty() || (line.starts_with('#') && !line.starts_with(DEFAULTS)) {
         return None;
     }
-    let cells: Vec<Cow<str>> = line.split(d as char).map(|c| unsanitize(c, d)).collect();
-    (!cells[0].is_empty()).then_some(cells)
+    let first = line.split(d as char).next().unwrap_or(line);
+    let key = unsanitize(first, d);
+    (!key.is_empty()).then_some(Split { key, line, d })
+}
+
+impl<'l> Split<'l> {
+    /// How many cells the line has, its key's included.
+    pub(crate) fn count(&self) -> usize {
+        1 + memchr::memchr_iter(self.d, self.line.as_bytes()).count()
+    }
+
+    /// Whether the cells after the key are none or all empty once decoded ([`valueless`]): a
+    /// field decodes to nothing exactly when it is only whitespace.
+    pub(crate) fn valueless(&self) -> bool {
+        self.line
+            .split(self.d as char)
+            .skip(1)
+            .all(|f| f.trim_end_matches(py_space).is_empty())
+    }
+
+    /// The line's cells, its key first, each decoded ([`parse`]).
+    pub(crate) fn cells(self) -> Vec<Cow<'l, str>> {
+        #[cfg(test)]
+        DECODED.with(|n| n.set(n.get() + 1));
+        let d = self.d;
+        self.line
+            .split(d as char)
+            .map(|c| unsanitize(c, d))
+            .collect()
+    }
 }
 
 /// Whether a line's cells after its key are none or all empty: a deletion, a reset of the
@@ -296,6 +346,8 @@ struct Pins {
     width_line: Option<usize>,
     after_first: Option<usize>,
     one: bool,
+    /// The column count, the cells of the first keyed line.
+    width: usize,
 }
 
 impl Pins {
@@ -308,6 +360,7 @@ impl Pins {
             if self.width_line.is_none() {
                 self.width_line = Some(i);
                 self.one = cells == 1;
+                self.width = cells;
             }
             if i > 0 && self.after_first.is_none() {
                 self.after_first = Some(i);
@@ -322,9 +375,10 @@ impl Pins {
     }
 }
 
-/// What the first read of a scrub keeps of a key: the line of a key seen once, or its lines so far.
+/// What the first read of a scrub keeps of a key: the line of a key seen once (and whether a strict
+/// reader takes it, [`ScrubPlan`]), or its lines so far.
 enum KeyLines {
-    Once(usize),
+    Once(usize, bool),
     More(Box<Run>),
 }
 
@@ -343,6 +397,8 @@ struct Run {
     pinned_after_first: bool,
     defaults_between: bool,
     last_raw: Option<Box<[u8]>>,
+    /// The last of those lines that a strict reader takes ([`ScrubPlan`]).
+    taken: Option<usize>,
 }
 
 impl Run {
@@ -351,6 +407,7 @@ impl Run {
         self.last_delete = Some((i, self.pinned));
         self.first = None;
         self.last_raw = None;
+        self.taken = None;
         self.pinned |= pinned;
     }
 }
@@ -365,7 +422,11 @@ impl Run {
 /// the same) nor a line that sets the column count (unless the two have as many cells). A reader
 /// (tsvz-rs, and TSVZ.py as its command line reads, given no header) reads the result as the file;
 /// line 1, and the first keyed line after it, stay for a TSVZ.py program that takes line 1 for its
-/// header.
+/// header. So does TSVZ.py's strict reader (`readTSV(strict=True)`, given no header), which skips
+/// a line that holds a value but is narrower than the column count: the last line of a key that it
+/// takes stays too, and the value line moves only when it is one it takes, or it takes none of the
+/// key's lines. (Not where a `#_defaults_#` line that holds a value is in force, and not always in
+/// the order of the keys it reads: docs/limitations.md.)
 pub(crate) struct ScrubPlan {
     d: u8,
     pins: Pins,
@@ -403,7 +464,7 @@ impl ScrubPlan {
         let mut put = HashMap::new();
         for key in std::mem::take(&mut self.keys).into_values() {
             let run = match key {
-                KeyLines::Once(first) => {
+                KeyLines::Once(first, _) => {
                     keep[first] = true;
                     continue;
                 }
@@ -419,9 +480,17 @@ impl ScrubPlan {
             let (last, last_fields) = run.last;
             keep[first] = true;
             keep[last] = true;
+            // The line a strict reader reads the key from, when that is not the last.
+            let taken = run.taken.filter(|&t| t != last);
+            if let Some(t) = taken {
+                keep[t] = true;
+            }
             let Some(raw) = run.last_raw else {
                 continue; // one line
             };
+            if taken.is_some() {
+                continue; // kept last: moved before `t`, it would lose to `t` for a reader of a key's last line
+            }
             if raw.last() != Some(&b'\n') {
                 continue; // an unterminated last line stays last: the end of a line is read otherwise
             }
@@ -452,6 +521,8 @@ impl Planner for ScrubPlan {
         if pinned {
             self.pinned_fields.push((i, f));
         }
+        // A strict reader skips a row narrower than the column count.
+        let taken = f + 1 >= self.pins.width;
         let (k, key) = kind(cells, self.pins.one);
         self.kinds.push(k);
         match k {
@@ -459,7 +530,7 @@ impl Planner for ScrubPlan {
             Kind::Row | Kind::Delete => {
                 let Some(lines) = self.keys.get_mut(&*key) else {
                     let lines = if k == Kind::Row {
-                        KeyLines::Once(i)
+                        KeyLines::Once(i, taken)
                     } else {
                         let mut run = Box::<Run>::default();
                         run.delete(i, pinned);
@@ -468,7 +539,7 @@ impl Planner for ScrubPlan {
                     self.keys.insert(key.into(), lines);
                     return;
                 };
-                if let KeyLines::Once(first) = *lines {
+                if let KeyLines::Once(first, first_taken) = *lines {
                     // the cells of its line matter only where it is pinned
                     let fields = self.pinned_fields.iter().find(|p| p.0 == first);
                     let fields = fields.map_or(0, |p| p.1);
@@ -476,6 +547,7 @@ impl Planner for ScrubPlan {
                         pinned: self.pins.pinned(first),
                         first: Some((first, fields)),
                         last: (first, fields),
+                        taken: first_taken.then_some(first),
                         ..Run::default()
                     }));
                 }
@@ -484,7 +556,12 @@ impl Planner for ScrubPlan {
                 };
                 if k == Kind::Delete {
                     run.delete(i, pinned);
-                } else if let Some((first, _)) = run.first {
+                    return;
+                }
+                if taken {
+                    run.taken = Some(i);
+                }
+                if let Some((first, _)) = run.first {
                     run.pinned_after_first |= pinned;
                     run.defaults_between = self.last_defaults.is_some_and(|l| l > first);
                     run.last = (i, f);
@@ -551,9 +628,12 @@ impl Planner for Writer {
 }
 
 /// What `clear` leaves of a loose file, gathered in one read: line 1 when it is a comment or
-/// empty (TSVZ.py writes an empty line where a file has no header), and, in a file of more than one
-/// column, the `#_defaults_#` lines that hold a value after the last one that holds none (which
-/// resets the defaults), so that rows written later read with the defaults they had before. They keep the file's column count too, which the first of them may not have: a
+/// empty, else an empty line in its place, as TSVZ.py writes where a file has no header (a program
+/// that takes line 1 for a header then takes no row or defaults line for it; TSVZ.py's `clear`
+/// writes it over a comment line 1 too, which tsvz-rs keeps: both read the two files alike); and,
+/// in a file of more than one column, the `#_defaults_#` lines that hold a value after the last
+/// one that holds none (which resets the defaults), so that rows written later read with the
+/// defaults they had before. They keep the file's column count too, which the first of them may not have: a
 /// `#_defaults_#` line that holds no value, at that count, goes before it (it sets the count, and
 /// changes nothing else). A one-column file keeps none: its first keyed line would be a defaults
 /// line of more cells, and a key alone, a row there, would be a deletion.
@@ -587,9 +667,7 @@ impl ClearPlan {
             }
             out.extend_from_slice(line);
         };
-        if let Some(h) = &self.header {
-            put(h);
-        }
+        put(self.header.as_deref().unwrap_or(b"\n"));
         if self.pins.one || self.in_force.is_empty() {
             return out;
         }
@@ -753,7 +831,7 @@ mod tests {
     /// order of the writer's, the first field that does not read back first).
     #[test]
     fn a_refusal_names_its_cause() {
-        let cases: [(&[&str], u8, &str); 12] = [
+        let cases: [(&[&str], u8, &str); 13] = [
             (&["#tag", "1"], b'\t', "begins with `#`"),
             (&["\0k", "1"], b'\t', "begins with a NUL"),
             (&[" ", "1"], b'\t', "is empty or only whitespace"),
@@ -761,6 +839,8 @@ mod tests {
             (&["k", "x</LF/>"], b'\t', "holds `</sep/>` or `</LF/>`"),
             (&["k", "hello"], b'e', "holds the delimiter `e`"),
             (&["#k", "hello"], b'e', "begins with `#`"),
+            // `</sep/>` holds an `e`: a reader splits it before it would decode it.
+            (&["k", "</sep/>"], b'e', "holds the delimiter `e`"),
             // A key that reads back, beside a value that does not: the value is named.
             (
                 &["#_defaults_#", "x</sep/>"],
@@ -952,6 +1032,21 @@ mod tests {
             ("#h\na\t1\nb\t2\na\tx\0", "#h\na\t1\nb\t2\na\tx\0"),
             ("#h\na\t1\nb\t2", "#h\na\t1\nb\t2"),
             ("#h\nb\t2\na\t1\nb\t3\na\t4", "#h\nb\t3\na\t1\na\t4"),
+            // A strict reader (TSVZ.py's `readTSV(strict=True)`) skips a line narrower than the
+            // column count, three here: `K` reads `[K, 1, 2]` to it, and so it stays (0.2.1 moved
+            // `K<TAB>9` into its place, and `K` was gone to that reader); a line it takes between a
+            // key's first and last stays; a last line it takes moves, as before.
+            (
+                "#h\nx\t0\t0\ny\t5\t5\nK\t1\t2\nK\t9\n",
+                "#h\nx\t0\t0\ny\t5\t5\nK\t1\t2\nK\t9\n",
+            ),
+            (
+                "#h\nx\t0\t0\nK\t1\nK\t2\t2\nz\t0\t0\nK\t3\nK\t4\n",
+                "#h\nx\t0\t0\nK\t1\nK\t2\t2\nz\t0\t0\nK\t4\n",
+            ),
+            ("#h\nx\t0\t0\nK\t1\nK\t2\t2\n", "#h\nx\t0\t0\nK\t2\t2\n"),
+            // It takes none of `K`'s lines: the last moves.
+            ("#h\nx\t0\t0\nK\t1\nK\t3\n", "#h\nx\t0\t0\nK\t3\n"),
         ] {
             assert_eq!(scrub(input), output, "{input:?}");
         }
@@ -1024,7 +1119,7 @@ mod tests {
         for (input, output) in [
             ("#h\n#_defaults_#\tP\na\t1\n", "#h\n#_defaults_#\tP\n"),
             ("\na\t1\n", "\n"),
-            ("a\t1\n#_defaults_#\tP\n", "#_defaults_#\tP\n"),
+            ("a\t1\n#_defaults_#\tP\n", "\n#_defaults_#\tP\n"),
             (
                 "#h\r\na\t1\r\n#_defaults_#\tP\r\n",
                 "#h\r\n#_defaults_#\tP\r\n",
@@ -1039,23 +1134,28 @@ mod tests {
             // a blank one of the file's.
             (
                 "a\t1\n#_defaults_#\tP\tQ\tS\n",
-                "#_defaults_#\t\n#_defaults_#\tP\tQ\tS\n",
+                "\n#_defaults_#\t\n#_defaults_#\tP\tQ\tS\n",
             ),
             (
                 "a\t1\t2\t3\n#_defaults_#\tP\tQ\n",
-                "#_defaults_#\t\t\t\n#_defaults_#\tP\tQ\n",
+                "\n#_defaults_#\t\t\t\n#_defaults_#\tP\tQ\n",
             ),
             (
                 "#h\na\t1\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n",
                 "#h\n#_defaults_#\t\n#_defaults_#\tP\tQ\n#_defaults_#\t\t\tR\n",
             ),
             // A one-column file keeps none: a defaults line of more cells would make it two.
-            ("a\n#_defaults_#\tP\n#_defaults_#\n", ""),
+            ("a\n#_defaults_#\tP\n#_defaults_#\n", "\n"),
             ("#h\na\n#_defaults_#\tP\tQ\n", "#h\n"),
             // With a byte-order mark, line 1 is a row to TSVZ.py.
-            ("\u{feff}#_defaults_#\tP\na\t1\n", ""),
+            ("\u{feff}#_defaults_#\tP\na\t1\n", "\n"),
             // A line 1 of only NULs is empty to TSVZ.py: kept as the empty line it writes.
             ("\0\na\t1\n", "\0\n"),
+            // A line 1 that is a row (or a defaults line) goes, an empty line in its place, as
+            // TSVZ.py's clear writes one: a program that takes line 1 for a header takes that.
+            ("a\t1\nb\t2\n", "\n"),
+            ("#_defaults_#\tP\na\t1\n", "\n#_defaults_#\tP\n"),
+            ("", "\n"),
         ] {
             assert_eq!(cleared(input), output, "{input:?}");
         }

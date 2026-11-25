@@ -186,11 +186,32 @@ pub(crate) fn waiters_on(path: &std::path::Path) -> usize {
     WAITING.lock().unwrap().iter().filter(|w| **w == id).count()
 }
 
+/// Tests that start a child process hold this for writing while it lives ([`forking`]); a test
+/// that takes a lock and then expects that dropping it lets the lock go holds it for reading
+/// ([`quiet`]). A child holds a copy of every descriptor of the process until it exits (or
+/// execs), and a lock goes with its open file description: one dropped meanwhile would still be
+/// held, for a few milliseconds.
+#[cfg(test)]
+static FORKING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Held by a test while it starts a child process and waits for it.
+#[cfg(test)]
+pub(crate) fn forking() -> std::sync::RwLockWriteGuard<'static, ()> {
+    FORKING.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Held by a test that expects a dropped lock to be let go of at once: no child is alive meanwhile.
+#[cfg(test)]
+pub(crate) fn quiet() -> std::sync::RwLockReadGuard<'static, ()> {
+    FORKING.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Whether another process would find `path` locked now (a child process tries to lock it): for
 /// tests. Panics when the child cannot open the file, which says nothing about its lock.
 #[cfg(test)]
 pub(crate) fn locked_elsewhere(path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
+    let _alone = forking();
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: the child only calls async-signal-safe functions (open, fcntl, _exit).
     let pid = unsafe { libc::fork() };
