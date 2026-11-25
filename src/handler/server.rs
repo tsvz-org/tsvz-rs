@@ -1097,23 +1097,19 @@ mod tests {
         // Nothing written since: put back, as a notice only.
         give_back(&engine, &taken("a"), &info);
         assert_eq!(ask("get\ta").lines, ["a\t1"]);
-        assert!(
-            lock(&notices)[0].ends_with("; it was put back"),
-            "{:?}",
-            lock(&notices)
-        );
-        assert!(lock(&errors).is_empty(), "{:?}", lock(&errors));
+        // (Copies, not guards: a failing assertion that locks again, to say what it saw, would wait
+        // for itself.)
+        let notes = lock(&notices).clone();
+        assert!(notes[0].ends_with("; it was put back"), "{notes:?}");
+        let said = lock(&errors).clone();
+        assert!(said.is_empty(), "{said:?}");
         // A row written since stays: the row taken is printed, and not said to be put back.
         let second = taken("b");
         assert_eq!(ask("set\tb\t9").status, 0);
         give_back(&engine, &second, &info);
         assert_eq!(ask("get\tb").lines, ["b\t9"]);
-        assert_eq!(
-            lock(&notices).len(),
-            1,
-            "no second notice: {:?}",
-            lock(&notices)
-        );
+        let notes = lock(&notices).clone();
+        assert_eq!(notes.len(), 1, "no second notice: {notes:?}");
         let said = lock(&errors).clone();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
@@ -1129,7 +1125,8 @@ mod tests {
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[1].contains("it could not be put back ("), "{said:?}");
         assert!(said[1].ends_with("): c\t3"), "{said:?}");
-        assert_eq!(lock(&notices).len(), 1);
+        let notes = lock(&notices).clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
     }
 
     #[test]
