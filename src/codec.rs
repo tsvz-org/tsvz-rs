@@ -226,8 +226,13 @@ impl Decoder {
         out: &mut Vec<u8>,
         room: usize,
     ) -> Result<(usize, bool), ()> {
-        let start = out.len();
-        let full = |out: &Vec<u8>| out.len() - start >= room;
+        // Whether `out` has grown by `room` (gzip keeps its own count, the only codec of a build
+        // without features).
+        #[cfg(any(feature = "bzip2", feature = "xz", feature = "zstd"))]
+        let full = {
+            let start = out.len();
+            move |out: &Vec<u8>| out.len() - start >= room
+        };
         match self {
             Decoder::Gzip(g) => g.feed(input, out, room),
             #[cfg(feature = "bzip2")]
