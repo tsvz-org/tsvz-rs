@@ -811,8 +811,12 @@ fn stop_within(store: &Path, wait: Duration) -> Result<(), Error> {
             Some(why) => Err(refused(format!("the handler stopped, but {why}"))),
         }
     } else {
+        // A stop whose flush took most of the wait can be answered with a lost write late, and the
+        // handler need longer than what is left: what it answered is said too (0.2.1 failed with
+        // it at once).
+        let said = answered.map_or_else(String::new, |why| format!("; {why}"));
         Err(refused(format!(
-            "the handler (pid {}) has not stopped within {} s",
+            "the handler (pid {}) has not stopped within {} s{said}",
             info.pid,
             wait.as_secs()
         )))
@@ -994,6 +998,34 @@ mod tests {
         let handler = std::thread::spawn(move || answer_stop(&listener));
         let e = stop_within(&store, Duration::from_millis(500)).unwrap_err();
         assert!(e.to_string().contains("has not stopped within"), "{e}");
+        drop(handler.join());
+    }
+
+    #[test]
+    fn a_stop_that_runs_out_its_wait_says_what_the_handler_answered() {
+        // A handler that lost a write it acknowledged answers #1, and is still there when the
+        // stop's wait ends (the flush took most of it): the stop says what it answered, as
+        // 0.2.1's "stop failed: ..." did, not only that the handler is still there.
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.tsvz");
+        let (listener, _held) = stand_in(dir.path(), &store);
+        let handler = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&conn).read_line(&mut line).unwrap();
+            let lost = Response::failed(1, "writes answered before they were made were lost");
+            conn.write_all(&lost.encode()).unwrap();
+            conn // never gone: its pointer file stays, locked
+        });
+        let said = stop_within(&store, Duration::from_millis(500))
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("has not stopped within"), "{said}");
+        assert!(
+            said.ends_with("; writes answered before they were made were lost"),
+            "{said}"
+        );
         drop(handler.join());
     }
 
