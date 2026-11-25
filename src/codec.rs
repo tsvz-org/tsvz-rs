@@ -487,6 +487,23 @@ impl Source for std::fs::File {
     }
 }
 
+/// The first `len` bytes of `src`, as a source of their own: past them it ends.
+pub(crate) struct Prefix<'a, S: ?Sized> {
+    pub(crate) src: &'a S,
+    pub(crate) len: u64,
+}
+
+impl<S: Source + ?Sized> Source for Prefix<'_, S> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let left = self.len.saturating_sub(offset);
+        let n = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        if n == 0 {
+            return Ok(0);
+        }
+        self.src.read_at(&mut buf[..n], offset)
+    }
+}
+
 /// How many compressed bytes are read at a time: what `decode_alone` feeds a decoder in one call.
 const PAGE: usize = 1 << 16;
 

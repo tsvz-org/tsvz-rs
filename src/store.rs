@@ -55,9 +55,11 @@ pub struct Options {
     /// (§19.10.4).
     pub(crate) every_part: bool,
     /// Read a loose file only as far as its first keyed line, which sets its column count
-    /// ([`Store::one_column`]). A compressed file's member is still decoded to its check before
+    /// ([`Store::one_column`]), and no further than its first `head` bytes as stored: a decision
+    /// made from that line then rests on bytes a writer's check of the file covers
+    /// ([`crate::write::Seen`]). A compressed file's member is still decoded to its check before
     /// its lines are used (§16.6), holding no more of it than a member of the default size.
-    pub(crate) head: bool,
+    pub(crate) head: Option<u64>,
 }
 
 /// One part as `parts` lists it (§20.2).
@@ -660,7 +662,7 @@ impl Store {
             if !format.strict {
                 replay.lines = options.lines.clone();
             }
-            replay.head = options.head && !format.strict;
+            replay.head = options.head.is_some() && !format.strict;
             // A loose rewrite works on the lines it keeps and reads no row: no key is wanted.
             let no_rows = Scope::Keys(Vec::new());
             let scope = if options.lines.is_some() && !format.strict {
@@ -784,7 +786,9 @@ impl Store {
         judge: Option<&mut SnapshotLines>,
     ) -> Result<(), Error> {
         let file = File::open(&part.path).map_err(|e| Error::io(&part.path, e))?;
-        let mut reader: &File = &file;
+        // A head read takes the file's first bytes only; any other read, all of it.
+        let within = self.options.head.filter(|_| self.replay.head);
+        let mut reader = Read::take(&file, within.unwrap_or(u64::MAX));
         let meta = file.metadata().map_err(|e| Error::io(&part.path, e))?;
         if meta.is_dir() {
             return Err(Error::io(
@@ -812,7 +816,11 @@ impl Store {
         let mut framer = Framer::new();
         match part.codec {
             Some(codec) => {
-                codec::read_items(codec, &file, keep, &mut |item| match item {
+                let src = codec::Prefix {
+                    src: &file,
+                    len: within.unwrap_or(u64::MAX),
+                };
+                codec::read_items(codec, &src, keep, &mut |item| match item {
                     Item::Data(out) => framer.push(&out, &mut |l| feed.line(l)),
                     Item::CutShort { offset, out } => {
                         feed.damage();

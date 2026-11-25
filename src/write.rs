@@ -276,6 +276,12 @@ impl Seen {
         )
     }
 
+    /// How long the file was: the bytes the check of [`Seen::grew`] covers.
+    #[cfg(feature = "cli")]
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Whether `file` is the file seen, no shorter, with the bytes it ended in.
     fn grew(&self, file: &File) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;

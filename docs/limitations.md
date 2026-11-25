@@ -165,30 +165,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
   not asked.
 
-### A loose delete that loses a race backs the file up again
-- Kind: deferred
-- What the operator sees: a loose `delete` that rewrites a damaged file, and whose rewrite is overtaken by another
-  writer's append, makes another `.damaged-<time>` copy on its next attempt and says the damage twice. 0.2.0 does the
-  same.
-- Why: the backup is made before each attempt's rewrite.
-- Revisit when: 0.2.2. The plan: make the backup once, when an attempt is about to commit its rewrite.
-- Noted: 2026-11-23, in the 0.2.1 final review; a deferral under the user's standing rule that deferrals are noted,
-  not asked.
-
-### A loose delete's guard does not cover a first keyed line appended after the file was read
-- Kind: deferred
-- What the operator sees: a second opinion's reading of the code, not reproduced. An empty (or comment-only) loose
-  file; `tsvz delete f.tsv k` takes the file's size and last bytes (nothing); another process appends `a<TAB>1`; the
-  delete's head read sees two columns; a `clear` (which rewrites the file in place, the same inode) empties it again;
-  under the lock the file is as it was first seen (same inode, no shorter, the same empty end), so `k` is appended and
-  `f.tsv` now holds one row, `k`. 0.2.0 appended after any clear, a wider window.
-- Why: the decision (the column count) rests on the bytes up to the first keyed line, which here lie past the size the
-  guard covers.
-- Revisit when: 0.2.2. The plan: append only when the head read's first keyed line ends within the size seen (else
-  read again), or read the head again under the lock.
-- Noted: 2026-11-23, in the 0.2.1 re-review of the final-review fix round (E); a deferral under the user's standing
-  rule that deferrals are noted, not asked.
-
 ### `setdefault` on a loose file prints the row as it was asked for, not as a reader then reads it
 - Kind: deferred
 - What the operator sees: `setdefault KEY VALUE ...` on a loose file that lacks KEY appends the line and prints the
