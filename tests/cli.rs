@@ -789,6 +789,12 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
         "{err}"
     );
     assert!(fs::read(dir.join("e.tsv")).is_ok_and(|f| f.is_empty()) || !dir.join("e.tsv").exists());
+    // `</sep/>` holds an `e`: a reader splits the cell there before it would decode the token.
+    let (code, _, err) = records(dir, &["-d", "e", "set", "e.tsv", "k", "</sep/>"]);
+    assert!(
+        code == 1 && err.contains("holds the delimiter `e`"),
+        "{err}"
+    );
     assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
     assert_eq!(file(dir, "e.tsv"), "kehllo\n");
     // `-d '#'`: the key `#tag` is written `<sep>tag`, which reads back; the value is what fails.

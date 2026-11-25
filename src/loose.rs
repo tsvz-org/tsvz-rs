@@ -147,15 +147,15 @@ pub(crate) fn cause(fields: &[&str], d: u8) -> String {
         if i == 0 && written.is_empty() {
             return format!("{what} {f:?} is empty or only whitespace, so a reader skips the line");
         }
-        if f.contains("</sep/>") || f.contains("</LF/>") {
-            return format!(
-                "{what} {f:?} holds `</sep/>` or `</LF/>`, which a reader reads as `<sep>` and `<LF>`"
-            );
-        }
         if sanitize(f, d).contains(d as char) {
             return format!(
                 "{what} {f:?} written as {:?} holds the delimiter `{dq}`, so a reader splits it there",
                 sanitize(f, d)
+            );
+        }
+        if f.contains("</sep/>") || f.contains("</LF/>") {
+            return format!(
+                "{what} {f:?} holds `</sep/>` or `</LF/>`, which a reader reads as `<sep>` and `<LF>`"
             );
         }
     }
@@ -753,7 +753,7 @@ mod tests {
     /// order of the writer's, the first field that does not read back first).
     #[test]
     fn a_refusal_names_its_cause() {
-        let cases: [(&[&str], u8, &str); 12] = [
+        let cases: [(&[&str], u8, &str); 13] = [
             (&["#tag", "1"], b'\t', "begins with `#`"),
             (&["\0k", "1"], b'\t', "begins with a NUL"),
             (&[" ", "1"], b'\t', "is empty or only whitespace"),
@@ -761,6 +761,8 @@ mod tests {
             (&["k", "x</LF/>"], b'\t', "holds `</sep/>` or `</LF/>`"),
             (&["k", "hello"], b'e', "holds the delimiter `e`"),
             (&["#k", "hello"], b'e', "begins with `#`"),
+            // `</sep/>` holds an `e`: a reader splits it before it would decode it.
+            (&["k", "</sep/>"], b'e', "holds the delimiter `e`"),
             // A key that reads back, beside a value that does not: the value is named.
             (
                 &["#_defaults_#", "x</sep/>"],
