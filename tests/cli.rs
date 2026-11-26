@@ -479,11 +479,10 @@ fn a_one_column_loose_file_holds_keys_alone() {
     assert_eq!(records(dir, &["set", "hosts.tsv", "h4"]).0, 0);
     assert_eq!(records(dir, &["scrub", "hosts.tsv"]).0, 0);
     assert_eq!(file(dir, "hosts.tsv"), "#hosts\nh3\nh4\n");
-    // A missing file is made, and tsvz-rs holds nothing in it (TSVZ.py writes one empty line; the
-    // two read alike): in a file with no keyed line yet, a key alone would make it one column,
-    // and a row.
+    // A missing file is made with the empty line 1 TSVZ.py writes, and nothing else: in a file with
+    // no keyed line yet, a key alone would make it one column, and a row.
     assert_eq!(records(dir, &["delete", "new.tsv", "k"]).0, 0);
-    assert_eq!(file(dir, "new.tsv"), "");
+    assert_eq!(file(dir, "new.tsv"), "\n");
     assert_eq!(records(dir, &["keys", "new.tsv"]).1, "");
 }
 
@@ -823,7 +822,7 @@ fn a_loose_set_that_could_not_be_read_back_is_refused() {
         "{err}"
     );
     assert_eq!(records(dir, &["-d", "e", "set", "e.tsv", "k", "hllo"]).0, 0);
-    assert_eq!(file(dir, "e.tsv"), "kehllo\n");
+    assert_eq!(file(dir, "e.tsv"), "\nkehllo\n");
     // `-d '#'`: the key `#tag` is written `<sep>tag`, which reads back; the value is what fails.
     fs::write(dir.join("h.tsv"), "k#v\n").unwrap();
     let (code, _, err) = records(dir, &["-d", "#", "set", "h.tsv", "#tag", "x</sep/>"]);
@@ -988,7 +987,7 @@ fn a_loose_write_names_its_cells_as_a_reader_does() {
         records(dir, &["setdefault", "n.tsv", "a ", "5"]),
         (0, "a\t5\n".into(), "".into())
     );
-    assert_eq!(file(dir, "n.tsv"), "a\t5\n");
+    assert_eq!(file(dir, "n.tsv"), "\na\t5\n");
     assert_eq!(records(dir, &["keys", "n.tsv"]).1, "a\n");
 }
 
@@ -1037,7 +1036,7 @@ fn bulk_input_to_a_loose_file_drops_the_nuls_at_the_start_of_a_line() {
         b"a\t1\n\0c\t2\n\0\0\nb\t3\n",
     );
     assert_eq!((code, err.as_str()), (0, ""));
-    assert_eq!(file(dir, "b.tsv"), "a\t1\nc\t2\nb\t3\n");
+    assert_eq!(file(dir, "b.tsv"), "\na\t1\nc\t2\nb\t3\n");
     assert_eq!(records(dir, &["keys", "b.tsv"]).1, "a\nc\nb\n");
     // A key alone: the tombstone of the key a reader reads.
     let (code, _, err) = run_in(
@@ -1047,7 +1046,7 @@ fn bulk_input_to_a_loose_file_drops_the_nuls_at_the_start_of_a_line() {
     );
     assert_eq!((code, err.as_str()), (0, ""));
     assert_eq!(records(dir, &["keys", "b.tsv"]).1, "c\nb\n");
-    assert_eq!(file(dir, "b.tsv"), "a\t1\nc\t2\nb\t3\na\n");
+    assert_eq!(file(dir, "b.tsv"), "\na\t1\nc\t2\nb\t3\na\n");
 }
 
 /// Peak RSS in KiB of `tsvz ARGS` run in `dir`, read with wait4 so no other child counts.

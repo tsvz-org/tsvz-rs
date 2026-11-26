@@ -108,13 +108,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   strict probe's generator then draws defaults, resets and narrow rows.
 - Noted: 2026-11-23, in the 0.2.1 final review; narrowed in 0.2.2 (2026-11-25, its final review found this case);
   the order of the keys added the same day, in the re-read of 0.2.2's first fix round.
-
-### A loose file that tsvz-rs creates has no empty line 1
-- Kind: deferred
-- What the operator sees: `set`, `append` or `setdefault` on a missing loose file writes the row as line 1, and
-  `delete` leaves the file empty; TSVZ.py writes an empty line 1 first, and so does tsvz-rs's `clear` (0.2.2). A
-  TSVZ.py program that reads the file with a header takes the first row for it. Both command lines read the file
-  alike. 0.2.1 the same.
-- Why: the writer creates a loose file empty.
-- Revisit when: 0.2.4. The plan: a loose file is created with the empty line 1 TSVZ.py writes.
-- Noted: 2026-11-25, in the 0.2.2 final review.

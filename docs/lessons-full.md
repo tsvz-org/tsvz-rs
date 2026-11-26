@@ -367,3 +367,14 @@ entries go last, in the same commit as the change:
 - Lesson: leave the clean-up of what a killed process made to whoever next finds it dead by the kernel's word (its
   lock let go of), and remove only what that process's own layout makes and the system shows unused (a refused
   connection), since the record that names it is a file others can write.
+
+## 2026-11-25 A loose file tsvz-rs creates begins with the empty line 1 TSVZ.py writes
+- Changed: `set`, `append`, `setdefault` and `delete` on a missing loose file create it with an empty line 1 (a
+  newline; compressed, inside the first member), as TSVZ.py creates one; 0.2.3 wrote the first row as line 1, and
+  `delete` left the file empty. A file that exists, empty, gets none, as in TSVZ.py.
+- Why we had to change: a TSVZ.py program that reads the file with a header took its first row for the header
+  (0.2.2's final review, F6).
+- Original design was wrong because: 0.2.2 wrote TSVZ.py's line 1 where a `clear` makes it, and left the other place
+  that makes line 1, the writer's first append to a file it creates, as it was.
+- Lesson: when you copy how another program writes a position (line 1), copy it at every path that makes that
+  position: a rewrite and the first write to a new file both do.
