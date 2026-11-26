@@ -90,3 +90,25 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write) and
   in 0.2.4 (the put-back during a stop, on the files); a deferral under the user's standing rule that deferrals
   are noted, not asked.
+
+### A stop's put-back of a cut-off `pop` is made on the files, beside the engine
+- Kind: deferred (0.2.5)
+- What the operator sees: nothing different from a put-back made while serving: a `pop` or `popitem` whose answer a
+  stop cuts off has its row put back with `setdefault` (which keeps a row written for its key since) before `tsvz
+  stop` returns. The stop makes it by a write path of its own, on the files, after the engine is closed
+  (`Engine::put_back`: a read of the files and an append, synced, one put-back at a time under the writer thread's
+  mutex), where a put-back while serving goes through the engine's queue. Two findings of 0.2.4's rounds were in
+  that path (a put-back made before the writer's last batch overwrote an acknowledged write: 13 of 3,000 forced
+  stops; two put-backs of one key both appended: 55 of 64), both fixed there; the path stays a part with an
+  interleaving of its own.
+- Why: `finish` closes the engine before it settles the pops' answers, so a cut-off pop's put-back finds the
+  engine closed. Closing it later needs the stop's order changed (its tests, the two forced-stop harnesses and a
+  review again), which is a change of its own, not a patch of the round that found the second finding.
+- The plan (0.2.5): `finish` closes the engine only after the connection threads have ended, with `begin` refusing
+  every request after the first cut (what the early close does today: a spared connection begins nothing new). A
+  cut-off pop's put-back then goes through the engine, under its state mutex and in its queue, as it does while
+  serving. The files path (about 35 lines), `close`'s wait for a second caller and the one-at-a-time lock go, and
+  the stop's last write is still the queue's, synced by `close`.
+- Revisit when: 0.2.5.
+- Noted: 2026-11-25, in 0.2.4's re-read (the step back after the second finding in the part); a deferral under the
+  user's standing rule that deferrals are noted, not asked.

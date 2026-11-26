@@ -121,11 +121,12 @@ Stores need nothing; the library's documented API does not change.
   line that holds a value, the order of its keys, and what a read given a header read); a key
   that they read from other lines than the command line does keeps those lines, so a scrubbed
   file can be a few lines longer than 0.2.3 left it.
-- Through a handler: a `pop` whose answer a stop cuts off (its client did not read it) gets its
-  row put back on the files before `tsvz stop` returns and `serve` ends; on macOS that cut now happens (0.2.3's stop waited
-  for good for a client that did not read its answer); while writes fail, a request the handler
-  cannot parse is warned of it too; a `serve` that takes over from a handler that was killed
-  removes the socket directory it left.
+- Through a handler: a `pop` whose answer a stop cuts off (one too large for the socket's
+  buffer, which its client did not read) gets its row put back on the files before `tsvz stop`
+  returns and `serve` ends; on macOS that cut now happens (0.2.3's stop waited for good for a
+  client that did not read its answer); while writes fail, a request the handler cannot parse is
+  warned of it too; a `serve` that takes over from a handler that was killed removes the socket
+  directory it left.
 
 ## Upgrading to 0.2.3 from 0.2.2
 
