@@ -1054,6 +1054,99 @@ fn a_row_taken_and_not_printed_is_not_put_back_on_the_files_beside_a_handler_tha
     assert_eq!(fs::read_to_string(&s).unwrap(), "a\t1\nb\t2\na\n");
 }
 
+/// A shim for `LD_PRELOAD`: an open of a path that ends in `.serve` creates the file `HANG_MARK`
+/// names, then waits for a signal, as an open on a hard-mounted file system whose server is down
+/// waits (a signal whose default action ends the process ends it; a blocked one does not).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HANG_ON_THE_POINTER_FILE: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static void hang(const char *path) {
+    size_t n = strlen(path);
+    const char *mark = getenv("HANG_MARK");
+    if (mark && n >= 6 && strcmp(path + n - 6, ".serve") == 0) {
+        close(creat(mark, 0600));
+        for (;;) pause();
+    }
+}
+#define HOOK(name) int name(const char *path, int flags, ...) { \
+    static int (*real)(const char *, int, ...); \
+    if (!real) real = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, #name); \
+    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap); \
+    hang(path); \
+    return real(path, flags, mode); \
+}
+HOOK(open)
+HOOK(open64)
+"#;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_serve_whose_first_open_of_the_pointer_file_hangs_still_ends_on_a_signal() {
+    // No signal is blocked before the pointer file is taken, on the command line's path too: a
+    // `serve` whose first access to it hangs ends on SIGTERM (0.2.2's second fix round blocked
+    // them in the command line, and the whole suite passed). Built with `cc`, which the crate's own
+    // C dependencies need as well; std opens files through glibc's `open64`.
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (c, so) = (dir.path().join("hang.c"), dir.path().join("hang.so"));
+    fs::write(&c, HANG_ON_THE_POINTER_FILE).unwrap();
+    let built = Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .args([&so, &c])
+        .arg("-ldl")
+        .output()
+        .expect("cc");
+    assert!(built.status.success(), "{}", text(&built.stderr));
+    let s = store(dir.path(), "a\t1\n");
+    let mark = dir.path().join("hanging");
+    let stderr = dir.path().join("serve-stderr");
+    let child = tsvz()
+        .arg("serve")
+        .arg(&s)
+        .env("LD_PRELOAD", &so)
+        .env("HANG_MARK", &mark)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut served = Served { child, stderr }; // killed, should the test fail
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mark.exists() {
+        if let Some(status) = served.child.try_wait().unwrap() {
+            panic!("serve exited {status}: {}", served.stderr());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve never opened its pointer file through open or open64"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    served.signal(libc::SIGTERM);
+    // A process that takes the signal ends within milliseconds; 5 s is for a busy host.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = served.child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        status.map(|s| s.signal()),
+        Some(Some(libc::SIGTERM)),
+        "SIGTERM was blocked while the first open hung"
+    );
+}
+
 #[test]
 fn a_second_serve_exits_1_and_the_first_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
