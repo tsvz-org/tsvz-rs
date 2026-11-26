@@ -331,3 +331,15 @@ entries go last, in the same commit as the change:
 - Lesson: when a request can change the rule that applies to the writes around it, take the stricter reading where
   the spec is silent (§21.9.2 is silent; TSVZ.py decides from the markers it last read, and tsvz-rs departs from it
   here): a sync costs time, a write lost after its answer costs the promise.
+
+## 2026-11-25 A request the handler cannot parse is warned of failing writes too
+- Changed: while a handler's writes are failing, an answer with status 2 (a request it cannot parse: an unknown option
+  or operation, the wrong arguments, `setdefault` of a marker key) carries the `#!` warning that writes acknowledged
+  before they were written may be lost, as every other answer but `stop`'s does, and as TSVZ.py's do. 0.2.3 gave
+  those none.
+- Why we had to change: a client that sends a request the handler refuses is told nothing of the writes it lost,
+  where TSVZ.py's handler tells it (0.2.2's last re-read).
+- Original design was wrong because: the warning was added where a parsed request is answered (`Engine::handle`),
+  and a request that fails to parse is answered before that, in the connection's loop.
+- Lesson: a word that every answer must carry is added where every answer is made, not where most of them are: an
+  answer made on a path of its own (a refusal before the work) is the one that goes without it.

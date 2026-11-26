@@ -320,6 +320,45 @@ fn a_quiet_handler_still_reports_writes_that_fail() {
 }
 
 #[test]
+fn while_writes_fail_every_answer_says_so_one_to_a_request_it_cannot_parse_too() {
+    // Every answer but `stop`'s carries the warning that acknowledged writes may be lost, as
+    // TSVZ.py's do: also one with status 2, for a request the handler cannot parse (0.2.3 gave
+    // those none).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "a\t1\n");
+    let _served = Served::start(&s, &[]);
+    fs::remove_file(&s).unwrap();
+    fs::create_dir(&s).unwrap(); // every append fails, even as root
+    let mut conn = connect(&s).unwrap();
+    assert_eq!(send(&mut conn, b"--x-written\tset\tb\t2\n").status, 1);
+    for bad in [
+        &b"frobnicate\n"[..],
+        b"--bogus\tlen\n",
+        b"len\tx\n",
+        b"setdefault\t#_defaults_#\tx\n",
+    ] {
+        let r = send(&mut conn, bad);
+        assert_eq!(r.status, 2, "{r:?}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.contains("writes are failing") && d.contains("may be lost")),
+            "{}: {r:?}",
+            text(bad)
+        );
+    }
+    fs::remove_dir(&s).unwrap();
+    fs::write(&s, "a\t1\n").unwrap();
+    assert_eq!(send(&mut conn, b"--x-written\tset\tc\t3\n").status, 0);
+    let r = send(&mut conn, b"frobnicate\n");
+    assert_eq!(
+        (r.status, r.diagnostics.len()),
+        (2, 0),
+        "writes work: {r:?}"
+    );
+}
+
+#[test]
 fn a_routed_pop_whose_row_cannot_be_printed_puts_it_back() {
     // The handler deletes the row before the command prints it: a row that cannot be printed
     // (here to a socket nobody reads) is put back, not lost.
@@ -586,7 +625,9 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
         // Not read before the stop: not taken. Only where the wait above was a time (macOS, which
         // also drops a request queued on the connection at the stop).
         other => {
-            assert!(!cfg!(target_os = "linux"), "the pop was queued: {other:?}");
+            #[cfg(target_os = "linux")]
+            panic!("the pop was queued: {other:?}");
+            #[cfg(not(target_os = "linux"))]
             assert!(
                 left.get("a").is_some(),
                 "deleted and never answered: {other:?}"

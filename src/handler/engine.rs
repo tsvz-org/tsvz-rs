@@ -630,7 +630,20 @@ impl Engine {
     /// (§21.10.3).
     pub fn handle(&self, req: &Request, bulk: Option<&[String]>) -> Response {
         let arrived = Instant::now();
-        let mut response = self.dispatch(req, bulk, arrived);
+        self.warned(self.dispatch(req, bulk, arrived))
+    }
+
+    /// The answer to a request that cannot be parsed (`message`, from [`protocol::parse`]):
+    /// status 2 (§21.10.1).
+    ///
+    /// [`protocol::parse`]: crate::handler::protocol::parse
+    pub(crate) fn refuse(&self, message: &str) -> Response {
+        self.warned(Response::failed(2, message))
+    }
+
+    /// `response`, with a warning while writes are failing that writes acknowledged before they
+    /// were written may be lost: every answer but `stop`'s carries it, as TSVZ.py's do.
+    fn warned(&self, mut response: Response) -> Response {
         if let Some(why) = self.batcher.failing() {
             response.diagnostics.push(format!(
                 "{}: writes are failing ({why}); writes acknowledged before they were written may be lost",

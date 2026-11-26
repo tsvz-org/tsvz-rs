@@ -684,7 +684,7 @@ fn answer(
                 return;
             }
             Ok(r) => engine.handle(r, bulk.as_deref()),
-            Err(message) => Response::failed(2, message.clone()),
+            Err(message) => engine.refuse(message),
         };
         if verbose {
             let op = request.as_ref().map_or("?", |r| r.op.as_str());
