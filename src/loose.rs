@@ -516,23 +516,45 @@ impl Life {
     }
 }
 
-/// A key's lives where its readers did otherwise with one of its lines: reader `r`'s is
-/// `lives[of[r]]`, reader 0's the first; readers that did the same with every line of the key
-/// share one.
+/// A key's lives where its readers did otherwise with one of its lines: reader `r`'s is the
+/// `of[r]`th, reader 0's the first; readers that did the same with every line of the key share
+/// one. Two (nearly every such key: the strict readers' and the others') are held here, more in a
+/// box of their own.
 struct Apart {
     of: [u8; N],
-    lives: Box<[Life]>,
+    two: [Life; 2],
+    more: Option<Box<[Life]>>,
 }
 
 impl Apart {
+    fn new(of: [u8; N], lives: &[Life]) -> Apart {
+        match lives {
+            [a, b] => Apart {
+                of,
+                two: [*a, *b],
+                more: None,
+            },
+            _ => Apart {
+                of,
+                two: [Life::NONE; 2],
+                more: Some(lives.into()),
+            },
+        }
+    }
+
+    /// The lives, each once.
+    fn lives(&self) -> &[Life] {
+        self.more.as_deref().unwrap_or(&self.two)
+    }
+
     /// Reader `r` applied line `i` as `applied[r]` says; whether one held a row of the key already.
     fn apply(&mut self, applied: &[Applied; N], i: usize) -> bool {
-        let (of, lives, n, again) = shared(&self.of, &self.lives, applied, i);
-        if n == self.lives.len() {
-            self.lives.copy_from_slice(&lives[..n]); // the same readers share each
-        } else {
-            self.of = of;
-            self.lives = lives[..n].into();
+        let (of, lives, n, again) = shared(&self.of, self.lives(), applied, i);
+        match &mut self.more {
+            // As many lives as before: the same readers share each.
+            None if n == 2 => self.two.copy_from_slice(&lives[..2]),
+            Some(more) if more.len() == n => more.copy_from_slice(&lives[..n]),
+            _ => *self = Apart::new(of, &lives[..n]),
         }
         again
     }
@@ -624,10 +646,7 @@ impl Key {
         }
         let (of, lives, n, again) = shared(&[0; N], &[life], applied, i);
         let mut lines = Lines {
-            lives: Apart {
-                of,
-                lives: lives[..n].into(),
-            },
+            lives: Apart::new(of, &lives[..n]),
             last_raw,
         };
         if again {
@@ -723,7 +742,7 @@ impl ScrubPlan {
                     continue;
                 }
                 Key::Same(lines) => (std::slice::from_ref(&lines.lives), lines.last_raw.take()),
-                Key::Apart(lines) => (&lines.lives.lives[..], lines.last_raw.take()),
+                Key::Apart(lines) => (lines.lives.lives(), lines.last_raw.take()),
             };
             let mut first = usize::MAX;
             for (a, l) in lives.iter().filter_map(Life::rows) {
