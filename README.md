@@ -47,9 +47,9 @@ compressed file too (TSVZ.py's joins the compressed one's). A rewrite writes eac
 line it keeps as the file has it, but for three things: the key a one-column `delete` puts where the
 line that set the column count went, and the empty line 1 and blank `#_defaults_#` line a `clear`
 may write before the defaults it keeps. `scrub` keeps the lines a read depends on, for both command lines and
-for TSVZ.py's library reads, strict or not, given no header or one (a key's last line may take the place of its
-first where each of them reads the key from those two lines), and `clear` the `#_defaults_#` lines in
-force ([docs/silent-choices.md](docs/silent-choices.md)).
+for TSVZ.py's library reads, strict or not, given no header or one, but one that counts one column where the
+command line counts more (a key's last line may take the place of its first where each of them reads the key from
+those two lines), and `clear` the `#_defaults_#` lines in force ([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
 
@@ -115,10 +115,11 @@ Stores need nothing; the library's documented API does not change.
 - Loose files: one that `set`, `append`, `setdefault` or `delete` creates begins with an empty
   line 1, as TSVZ.py's do (0.2.3 wrote the first row there, which a TSVZ.py program that reads a
   header took for one). `scrub` keeps what TSVZ.py's strict library read, and its reads given a
-  header, read: their rows and the order of their keys (0.2.3 could change the strict read's rows
-  under a `#_defaults_#` line that holds a value, the order of its keys, and what a read given a
-  header read); a key that they read from other lines than the command line does keeps those
-  lines, so a scrubbed file can be a few lines longer than 0.2.3 left it.
+  header (but one that counts one column where the command line counts more), read: their rows
+  and the order of their keys (0.2.3 could change the strict read's rows under a `#_defaults_#`
+  line that holds a value, the order of its keys, and what a read given a header read); a key
+  that they read from other lines than the command line does keeps those lines, so a scrubbed
+  file can be a few lines longer than 0.2.3 left it.
 - Through a handler: a `pop` whose answer a stop cuts off (its client did not read it) gets its
   row put back on the files before `serve` ends; on macOS that cut now happens (0.2.3's stop waited
   for good for a client that did not read its answer); while writes fail, a request the handler
