@@ -14,10 +14,17 @@ With --loose, each seed builds a loose file instead (`.tsv .csv .psv .nsv`, some
 keys and cells with whitespace at their end, `<sep>` `<LF>` `</sep/>` `</LF/>` tokens,
 `#_defaults_#` lines, comments, keys of only whitespace, CRs, NULs, a byte-order mark, invalid
 UTF-8, rows wider and narrower than the column count, one-column files and an unterminated last
-line. tsvz-rs reads them by TSVZ.py's rules (§20.2.4 leaves the data semantics to the
-implementation), so the reads must agree byte for byte; then a copy is changed by tsvz-rs (a
-`delete` of a key it holds, a `set` of a new one) and TSVZ.py must read the copy as the original
-with that change, as tsvz-rs reads it. With --scrub as well, the copy is scrubbed instead.
+line. Half the seeds draw for the readers' state instead: line 1 a comment, empty, a header row or
+a row, rows narrower and wider than the column count, keys alone, `#_defaults_#` lines that hold a
+value (narrower ones too) and resets. tsvz-rs reads them by TSVZ.py's rules (§20.2.4 leaves the
+data semantics to the implementation), so the reads must agree byte for byte; then a copy is
+changed by tsvz-rs (a `delete` of a key it holds, a `set` of a new one) and TSVZ.py must read the
+copy as the original with that change, as tsvz-rs reads it. With --scrub as well, the copy is
+scrubbed instead, and TSVZ.py's library reads, loaded in this process, must read it as the
+original too (strict or not, given no header or the header line 1 holds, or lenient given
+another), as must TSVZ.py's command line given line 1 for its `--x-header`. A reader given a
+header that counts one column where the command line counts more is not compared: the scrub does
+not follow it.
 
 With --scrub, each seed's store is also scrubbed by tsvz-rs, in place for one part and by a
 snapshot of the parts before the active one for several (§19.2), on a copy: TSVZ.py, and
@@ -34,7 +41,10 @@ Exit status: 0 when every seed agrees, 1 when one does not (its files are kept).
 """
 import argparse
 import bz2
+import contextlib
 import gzip
+import importlib.util
+import io
 import lzma
 import os
 import random
@@ -212,6 +222,176 @@ def make_loose(rng, directory):
 
 LOOSE_OPS = [['read'], ['len'], ['keys'], ['get', 'a', 'zz', 'a  ', ' ', 'b', 'k\t1', '#_defaults_#']]
 
+STATE_KEYS = ['a', 'b', 'c', 'd', 'e', 'Name']
+STATE_VALUES = ['0', '1', '2', '9', 'x', '', '']
+STATE_DEFAULTS = ['P', 'Q', '', '']
+
+
+def make_loose_state(rng, directory):
+    """A loose file drawn for the state its readers keep (the column count, the `#_defaults_#` in force, line 1
+    as a header): line 1 a comment, empty, a header row of the column count or another, a row, a `#_defaults_#`
+    line or a key alone; rows narrower and wider than the column count, keys alone and with empty cells,
+    `#_defaults_#` lines that hold a value (narrower ones too) and resets; messier ones with blanks at a
+    cell's end, NULs, CRs, a byte-order mark and an unterminated last line; some compressed."""
+    d = rng.choice(['\t', '\t', '\t', '\t', '\t', ',', ',', '\0'])
+    width = rng.choice([1, 2, 3, 3, 3, 4])
+    keys = STATE_KEYS[:rng.choice([2, 3, 4, 5, 6])]
+    messy = rng.random() < 0.3
+
+    def cells(n, values):
+        return [rng.choice(values) for _ in range(n)]
+
+    lines = []
+    first = rng.choice(['comment', 'blank', 'header', 'header', 'header-other', 'data', 'data', 'defaults', 'bare',
+                        'none'])
+    if first == 'comment':
+        lines.append(rng.choice(['#h', '#Name' + d + 'v']))
+    elif first == 'blank':
+        lines.append('')
+    elif first == 'header':
+        lines.append(d.join(['Name'] + ['v%d' % i for i in range(1, width)]))
+    elif first == 'header-other':
+        lines.append(d.join(['Name'] + ['v%d' % i for i in range(1, max(1, width + rng.choice([-1, 1, 2])))]))
+    elif first == 'defaults':
+        lines.append(d.join(['#_defaults_#'] + cells(max(1, width - 1), ['P', 'Q', ''])))
+    elif first == 'bare':
+        lines.append(rng.choice(keys))
+    for _ in range(rng.randint(1, 30)):
+        r = rng.random()
+        key = rng.choice(keys)
+        if r < 0.04:
+            lines.append(rng.choice(['#c', '#']))
+        elif r < 0.07:
+            lines.append('')
+        elif r < 0.12:
+            lines.append('#_defaults_#' + rng.choice(['', '', d, d * (width - 1) if width > 1 else '']))
+        elif r < 0.20:
+            n = max(1, rng.choice([1, 2, width - 1, width - 1, width - 1, width, width - 2]))
+            lines.append(d.join(['#_defaults_#'] + cells(n, STATE_DEFAULTS)))
+        elif r < 0.28:
+            lines.append(key)
+        elif r < 0.31:
+            lines.append(key + d * rng.choice([1, max(1, width - 1)]))
+        elif r < 0.33 and width == 1:
+            lines.append(d.join([key] + cells(rng.choice([1, 2]), STATE_VALUES)))
+        else:
+            n = max(1, rng.choice([1, 2, width, width, width, width, width - 1, width + 1, width + 2]))
+            if width == 1 and rng.random() < 0.7:
+                n = 1
+            lines.append(d.join([key] + cells(n - 1, STATE_VALUES)))
+    if messy:
+        def mess(line):
+            if line and not line.startswith('#') and rng.random() < 0.15:
+                split = line.split(d)
+                i = rng.randrange(len(split))
+                split[i] += rng.choice([' ', '  ', '\u3000'])
+                line = d.join(split)
+            if rng.random() < 0.04:
+                line = '\0' + line
+            if rng.random() < 0.12:
+                line += '\r'
+            return line
+        lines = [mess(line) for line in lines]
+    text = '\n'.join(lines)
+    if rng.random() < 0.8:
+        text += '\n'
+    elif messy and rng.random() < 0.3:
+        text += '\0'
+    data = text.encode('utf-8')
+    if messy and rng.random() < 0.1:
+        data = b'\xef\xbb\xbf' + data
+    name = 's.' + {',': 'csv', '\0': 'nsv'}.get(d, 'tsv')
+    if rng.random() < 0.25:
+        suffix = rng.choice(sorted(CODECS))
+        name, data = name + '.' + suffix, CODECS[suffix](data)
+    store = os.path.join(directory, name)
+    with open(store, 'wb') as f:
+        f.write(data)
+    return store, d
+
+
+def load_library(path):
+    """TSVZ.py at `path` as a module, for its library reads."""
+    spec = importlib.util.spec_from_file_location('tsvz_py_library', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def library_read(library, store, d, strict, header):
+    """A TSVZ.py library read of `store` (`readTabularFile`): its keys and rows in order, or the exception it raised."""
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(said), contextlib.redirect_stderr(said):
+            rows = library.readTabularFile(store, strict=strict, delimiter=d, header=header, teeLogger=None)
+    except Exception as e:
+        return ['raised', type(e).__name__]
+    return [[key, list(row)] for key, row in rows.items()]
+
+
+def keyed_cells(text, d):
+    """Per line of `text`, its cells as a reader counts them, or None for a line read as nothing (`_processLine`:
+    without the NULs at its start, and at the end of an unterminated last line, and the CRs at its end; a comment,
+    an empty line or a key of only whitespace is nothing)."""
+    out = []
+    lines = text.split('\n')
+    if lines[-1] == '':
+        lines.pop()  # (the file ends with a newline)
+    for i, line in enumerate(lines):
+        line = line.lstrip('\0')
+        if i == len(lines) - 1 and not text.endswith('\n'):
+            line = line.rstrip('\0')
+        line = line.rstrip('\r')
+        if not line or (line.startswith('#') and not line.startswith('#_defaults_#')) or not line.split(d)[0].rstrip():
+            out.append(None)
+        else:
+            out.append(len(line.split(d)))
+    return out
+
+
+def unfollowed(text, d):
+    """The header readers a loose scrub does not follow in `text` (src/loose.rs, `ScrubPlan`): one that counts one
+    column where the command line counts more. A reader given the header line 1 holds counts line 1's cells; one
+    given another counts the first keyed line after line 1; the command line counts the first keyed line."""
+    cells = keyed_cells(text, d)
+    line_cells = [c for c in cells if c is not None]
+    if not line_cells or line_cells[0] == 1:
+        return set()
+    out = set()
+    if 1 + text.split('\n', 1)[0].count(d) == 1:
+        out |= {'header', 'header strict', '--x-header'}
+    after = [c for c in cells[1:] if c is not None]
+    if after and after[0] == 1:
+        out.add('other header')
+    return out
+
+
+def library_reads(library, python, store, changed, d, text):
+    """Problems where TSVZ.py's library reads, or its command line given line 1 for its `--x-header`, read the scrubbed
+    copy `changed` otherwise than the original `store` (both TSVZ.py): strict or not, given no header or the header
+    line 1 holds, and lenient given another (a strict one raises there)."""
+    line1 = text.split('\n', 1)[0]
+    header = [cell.rstrip() for cell in line1.split(d)]
+    off = unfollowed(text, d)
+    readers = [('lenient', False, ''), ('strict', True, ''), ('other header', False, ['zz-no', 'such', 'header'])]
+    if any(header):
+        readers += [('header', False, header), ('header strict', True, header)]
+    problems = []
+    for name, strict, given in readers:
+        if name in off:
+            continue
+        before, after = (library_read(library, path, d, strict, given) for path in (store, changed))
+        if before != after:
+            problems.append('  scrub, then TSVZ.py library read (%s): before %r\n    after %r' % (name, before[:20],
+                                                                                              after[:20]))
+    given = d.join(header)
+    if any(header) and '--x-header' not in off and '\\' not in given and '\0' not in given:
+        x = python + ['--x-header', given]
+        before, after = ask(x, store, ['read']), ask(x, changed, ['read'])
+        if before != after:
+            problems.append('  scrub, then TSVZ.py --x-header read: before %r\n    after %r' % (before, after))
+    return problems
+
 
 def decoded(store):
     """What the compressed `store` decodes to; None for a plain file, or one that does not decode."""
@@ -227,10 +407,11 @@ def decoded(store):
         return None
 
 
-def changed_reads(rust, python, store, delimiter, directory, how):
+def changed_reads(rust, python, store, delimiter, directory, how, library=None):
     """Problems where a copy of a loose file that tsvz-rs changed by `how` (a delete of a key it
     holds, a set of a new one, a scrub) is read otherwise by TSVZ.py than the original with that
-    change, or otherwise by the two tools."""
+    change, or otherwise by the two tools; for a scrub, also by TSVZ.py's library reads
+    (`library`, TSVZ.py loaded as a module)."""
     copy = directory + '-changed'
     shutil.copytree(directory, copy)
     try:
@@ -298,6 +479,11 @@ def changed_reads(rust, python, store, delimiter, directory, how):
             a, b = ask(rust, changed, o), ask(python, changed, o)
             if a != b:
                 problems.append('  %s, then %s: tsvz-rs %s %r\n    TSVZ.py %s %r' % (' '.join(op), ' '.join(o), a[0], a[1][:300], b[0], b[1][:300]))
+        if how == 'scrub' and library is not None:
+            if not compressed:
+                with open(store, 'rb') as f:
+                    text = f.read()
+            problems += library_reads(library, python, store, changed, delimiter, text.decode('utf-8', 'replace'))
         return problems
     finally:
         shutil.rmtree(copy, ignore_errors=True)
@@ -447,6 +633,7 @@ def main():
     if args.handler:
         python.append('--x-direct')  # the files, not the handler that serves them
     keep = args.keep or None
+    library = load_library(args.tsvz) if args.loose and args.scrub else None
     failed = 0
     refused = {}
     ops = [['read'], ['len'], ['keys'], ['verify'], ['parts'], ['get', 'a', 'zz', 'tr  ', '#x', ' sp'],
@@ -456,14 +643,14 @@ def main():
         directory = tempfile.mkdtemp(prefix='seed%d-' % seed)
         try:
             if args.loose:
-                store, delimiter = make_loose(rng, directory)
+                store, delimiter = (make_loose if rng.random() < 0.5 else make_loose_state)(rng, directory)
                 problems = []
                 for op in LOOSE_OPS:
                     a, b = ask(rust, store, op), ask(python, store, op)
                     if a != b:
                         problems.append('  %s: tsvz-rs %s %r\n  %s  TSVZ.py %s %r' % (' '.join(op), a[0], a[1][:300], ' ' * len(' '.join(op)), b[0], b[1][:300]))
                 for how in (['scrub'] if args.scrub else ['delete', 'set']):
-                    problems += changed_reads(rust, python, store, delimiter, directory, how)
+                    problems += changed_reads(rust, python, store, delimiter, directory, how, library)
                 if problems:
                     failed += 1
                     if keep is None:
