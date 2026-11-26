@@ -256,6 +256,7 @@ pub(crate) fn valueless(cells: &[Cow<'_, str>]) -> bool {
 }
 
 /// What a line is to a reader, in a file whose column count is one or not (`one`).
+#[cfg(feature = "cli")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Read as nothing: empty, a comment, or an empty key.
@@ -269,6 +270,7 @@ enum Kind {
 }
 
 /// A line's kind and key, from its cells ([`parse`]).
+#[cfg(feature = "cli")]
 fn kind(cells: Option<Vec<Cow<'_, str>>>, one: bool) -> (Kind, Cow<'_, str>) {
     let Some(mut cells) = cells else {
         return (Kind::Skip, Cow::Borrowed(""));
@@ -514,97 +516,150 @@ impl Life {
     }
 }
 
-/// A key to the readers: one life each, readers that did the same with every line of the key
-/// sharing one, so that while all did (nearly every key) there is one.
-enum Lives {
-    Same(Life),
-    /// Reader `r`'s life is `lives[of[r]]`; reader 0's is the first.
-    Apart {
-        of: [u8; N],
-        lives: Box<[Life]>,
-    },
+/// A key's lives where its readers did otherwise with one of its lines: reader `r`'s is
+/// `lives[of[r]]`, reader 0's the first; readers that did the same with every line of the key
+/// share one.
+struct Apart {
+    of: [u8; N],
+    lives: Box<[Life]>,
 }
 
-impl Lives {
-    /// The lives, each once.
-    fn all(&self) -> &[Life] {
-        match self {
-            Lives::Same(life) => std::slice::from_ref(life),
-            Lives::Apart { lives, .. } => lives,
-        }
-    }
-
+impl Apart {
     /// Reader `r` applied line `i` as `applied[r]` says; whether one held a row of the key already.
     fn apply(&mut self, applied: &[Applied; N], i: usize) -> bool {
-        let of = match self {
-            Lives::Same(life) if applied.iter().all(|a| *a == applied[0]) => {
-                return life.apply(applied[0], i);
-            }
-            Lives::Same(_) => [0; N],
-            Lives::Apart { of, .. } => *of,
-        };
-        // Readers that shared a life go on sharing one where they do the same with this line.
-        let mut shared = [(0, Applied::No); N];
-        let mut lives = [Life::NONE; N];
-        let mut new_of = [0; N];
-        let mut n = 0;
-        for ((&was, &a), slot) in of.iter().zip(applied).zip(&mut new_of) {
-            *slot = match shared[..n].iter().position(|s| *s == (was, a)) {
-                Some(c) => c as u8,
-                None => {
-                    shared[n] = (was, a);
-                    lives[n] = self.all()[usize::from(was)];
-                    n += 1;
-                    n as u8 - 1
-                }
-            };
-        }
-        let mut again = false;
-        for (life, (_, a)) in lives.iter_mut().zip(shared).take(n) {
-            again |= life.apply(a, i);
-        }
-        match self {
-            // As many lives as before: the same readers share each.
-            Lives::Apart { lives: was, .. } if was.len() == n => was.copy_from_slice(&lives[..n]),
-            _ => {
-                *self = Lives::Apart {
-                    of: new_of,
-                    lives: lives[..n].into(),
-                }
-            }
+        let (of, lives, n, again) = shared(&self.of, &self.lives, applied, i);
+        if n == self.lives.len() {
+            self.lives.copy_from_slice(&lives[..n]); // the same readers share each
+        } else {
+            self.of = of;
+            self.lives = lives[..n].into();
         }
         again
     }
 }
 
-/// What the first read keeps of a key: the line of a key that every reader read as a row and that
-/// has no other line (most keys of a file of keys written once), or its [`Lines`].
-enum Key {
-    Row(usize),
-    More(Box<Lines>),
+/// The lives `lives` of the readers (reader `r`'s is `lives[of[r]]`) once reader `r` applied line
+/// `i` as `applied[r]` says: readers that shared a life go on sharing one where they do the same
+/// with the line. The readers' lives, the lives, how many, and whether one held a row of the key
+/// already.
+fn shared(
+    of: &[u8; N],
+    lives: &[Life],
+    applied: &[Applied; N],
+    i: usize,
+) -> ([u8; N], [Life; N], usize, bool) {
+    let mut kinds = [(0, Applied::No); N];
+    let mut now = [Life::NONE; N];
+    let mut now_of = [0; N];
+    let mut n = 0;
+    for ((&was, &a), slot) in of.iter().zip(applied).zip(&mut now_of) {
+        *slot = match kinds[..n].iter().position(|k| *k == (was, a)) {
+            Some(c) => c as u8,
+            None => {
+                kinds[n] = (was, a);
+                now[n] = lives[usize::from(was)];
+                n += 1;
+                n as u8 - 1
+            }
+        };
+    }
+    let mut again = false;
+    for (life, (_, a)) in now.iter_mut().zip(kinds).take(n) {
+        again |= life.apply(a, i);
+    }
+    (now_of, now, n, again)
 }
 
-/// A key's lives, and the last line a reader read as a row of the key again, as the file has it.
-struct Lines {
-    lives: Lives,
+/// What the first read keeps of a key: the line of a key that every reader read as a row and that
+/// has no other line yet (most keys of a file of keys written once); else its lives, one while
+/// every reader did the same with each line of the key (nearly every key), with the last line a
+/// reader read as a row of the key again, as the file has it.
+enum Key {
+    Row(usize),
+    Same(Box<Lines<Life>>),
+    Apart(Box<Lines<Apart>>),
+}
+
+struct Lines<L> {
+    lives: L,
     last_raw: Option<Box<[u8]>>,
 }
 
+impl<L> Lines<L> {
+    /// A reader read `raw` as a row of the key again: the last such line.
+    fn again(&mut self, raw: &[u8]) {
+        match &mut self.last_raw {
+            Some(last) if last.len() == raw.len() => last.copy_from_slice(raw),
+            last => *last = Some(raw.into()),
+        }
+    }
+}
+
 impl Key {
-    fn lines(&mut self) -> &mut Lines {
-        if let Key::Row(first) = *self {
-            *self = Key::More(Box::new(Lines {
-                lives: Lives::Same(Life {
+    /// A key whose first line is line `i`, which reader `r` applied as `applied[r]` says.
+    fn new(applied: &[Applied; N], i: usize, raw: &[u8]) -> Key {
+        if applied.iter().all(|a| *a == Applied::Row) {
+            return Key::Row(i);
+        }
+        Key::of(Life::NONE, None, applied, i, raw)
+    }
+
+    /// The key of one life, `life`, once reader `r` applied line `i`, `raw`, as `applied[r]` says.
+    fn of(
+        life: Life,
+        last_raw: Option<Box<[u8]>>,
+        applied: &[Applied; N],
+        i: usize,
+        raw: &[u8],
+    ) -> Key {
+        if applied.iter().all(|a| *a == applied[0]) {
+            let mut lines = Lines {
+                lives: life,
+                last_raw,
+            };
+            if lines.lives.apply(applied[0], i) {
+                lines.again(raw);
+            }
+            return Key::Same(Box::new(lines));
+        }
+        let (of, lives, n, again) = shared(&[0; N], &[life], applied, i);
+        let mut lines = Lines {
+            lives: Apart {
+                of,
+                lives: lives[..n].into(),
+            },
+            last_raw,
+        };
+        if again {
+            lines.again(raw);
+        }
+        Key::Apart(Box::new(lines))
+    }
+
+    /// The key once reader `r` applied line `i`, `raw`, as `applied[r]` says.
+    fn apply(self, applied: &[Applied; N], i: usize, raw: &[u8]) -> Key {
+        match self {
+            Key::Row(first) => {
+                let life = Life {
                     first,
                     last: first,
                     ..Life::NONE
-                }),
-                last_raw: None,
-            }));
-        }
-        match self {
-            Key::More(lines) => lines,
-            Key::Row(_) => unreachable!("made above"),
+                };
+                Key::of(life, None, applied, i, raw)
+            }
+            Key::Same(mut lines) if applied.iter().all(|a| *a == applied[0]) => {
+                if lines.lives.apply(applied[0], i) {
+                    lines.again(raw);
+                }
+                Key::Same(lines)
+            }
+            Key::Same(lines) => Key::of(lines.lives, lines.last_raw, applied, i, raw),
+            Key::Apart(mut lines) => {
+                if lines.lives.apply(applied, i) {
+                    lines.again(raw);
+                }
+                Key::Apart(lines)
+            }
         }
     }
 }
@@ -661,15 +716,15 @@ impl ScrubPlan {
     pub(crate) fn finish(&mut self) -> Kept {
         let mut keep = std::mem::take(&mut self.keep);
         let mut put = HashMap::new();
-        for (name, key) in std::mem::take(&mut self.keys) {
-            let Lines { lives, last_raw } = match key {
+        for (name, mut key) in std::mem::take(&mut self.keys) {
+            let (lives, last_raw) = match &mut key {
                 Key::Row(i) => {
-                    keep[i] = true;
+                    keep[*i] = true;
                     continue;
                 }
-                Key::More(lines) => *lines,
+                Key::Same(lines) => (std::slice::from_ref(&lines.lives), lines.last_raw.take()),
+                Key::Apart(lines) => (&lines.lives.lives[..], lines.last_raw.take()),
             };
-            let lives = lives.all();
             let mut first = usize::MAX;
             for (a, l) in lives.iter().filter_map(Life::rows) {
                 keep[a] = true;
@@ -752,25 +807,11 @@ impl Planner for ScrubPlan {
             self.defaults.push(i);
         }
         self.keep.push(pinned || s.defaults);
-        let Some(key) = self.keys.get_mut(&*line.key) else {
-            let key = if applied.iter().all(|a| *a == Applied::Row) {
-                Key::Row(i)
-            } else {
-                let mut lives = Lives::Same(Life::NONE);
-                lives.apply(&applied, i);
-                Key::More(Box::new(Lines {
-                    lives,
-                    last_raw: None,
-                }))
-            };
-            self.keys.insert(line.key.as_ref().into(), key);
-            return;
-        };
-        let lines = key.lines();
-        if lines.lives.apply(&applied, i) {
-            match &mut lines.last_raw {
-                Some(last) if last.len() == raw.len() => last.copy_from_slice(raw),
-                last => *last = Some(raw.into()),
+        match self.keys.get_mut(&*line.key) {
+            Some(key) => *key = std::mem::replace(key, Key::Row(0)).apply(&applied, i, raw),
+            None => {
+                let key = Key::new(&applied, i, raw);
+                self.keys.insert(line.key.as_ref().into(), key);
             }
         }
     }
