@@ -878,10 +878,11 @@ impl Engine {
     /// Put back the row a `pop` or `popitem` took, whose answer could not be written: `req` is the
     /// `setdefault` of it, which keeps a row written for its key since. Through the engine while it
     /// serves; once it is closed, on the files, as any other writer of them, and synced: the
-    /// stop's last write, made once the writer has written its queue and ended ([`Engine::close`]
+    /// stop's last write, made once the writer has written its queue and ended ([`Engine::end`]
     /// waits for that), so that the files are read as the queue left them: a read made before the
     /// queue's last batch and an append after it would overwrite a write the handler had
-    /// acknowledged.
+    /// acknowledged; and one put-back at a time ([`Engine::end`] returns what holds the others
+    /// back), so that each reads what the one before it wrote.
     pub(crate) fn put_back(&self, req: &Request) -> Response {
         let response = self.handle(req, None);
         // Not put back, and the engine is closed: it was closed before the request, which it
@@ -889,11 +890,11 @@ impl Engine {
         if response.status == 0 || !lock(&self.state).closed {
             return response;
         }
-        self.close();
         // One put-back on the files at a time, each reading what the one before it wrote: two
         // pops of one key whose answers a stop cut off both found the key gone, and both
-        // appended.
-        let _alone = lock(&self.thread);
+        // appended. The writer thread's mutex, which nothing else holds once the writer has
+        // ended, is held from that end on, with no moment between the two.
+        let _alone = self.end();
         let (key, values) = (&req.args[0], &req.args[1..]);
         let options = Options {
             scope: Scope::Keys(vec![key.clone()]),
@@ -945,6 +946,12 @@ impl Engine {
     /// returns once the writer has ended, for a second caller too: that one waits for the first's
     /// join, which is why the thread's mutex is held across it.
     pub fn close(&self) {
+        drop(self.end());
+    }
+
+    /// [`Engine::close`], returning the writer thread's mutex, held: its caller is the only one
+    /// to write once the writer has ended, until it lets the guard go.
+    fn end(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
         lock(&self.state).closed = true;
         lock(&self.batcher.queue).closing = true;
         self.batcher.changed.notify_all();
@@ -952,6 +959,7 @@ impl Engine {
         if let Some(thread) = thread.take() {
             let _ = thread.join();
         }
+        thread
     }
 }
 

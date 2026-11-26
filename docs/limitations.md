@@ -107,8 +107,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - The plan (0.2.5): `finish` closes the engine only after the connection threads have ended, with `begin` refusing
   every request after the first cut (what the early close does today: a spared connection begins nothing new). A
   cut-off pop's put-back then goes through the engine, under its state mutex and in its queue, as it does while
-  serving. The files path (about 35 lines), `close`'s wait for a second caller and the one-at-a-time lock go, and
-  the stop's last write is still the queue's, synced by `close`.
+  serving. The files path (about 35 lines), `close`'s wait for a second caller and the hold that makes the
+  put-backs one at a time (`Engine::end`) go, and the stop's last write is still the queue's, synced by `close`.
 - Revisit when: 0.2.5.
 - Noted: 2026-11-25, in 0.2.4's re-read (the step back after the second finding in the part); a deferral under the
   user's standing rule that deferrals are noted, not asked.
