@@ -717,7 +717,10 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
     assert_eq!(served.wait(), 0, "{}", served.stderr());
     let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
     match popped {
-        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
+        Ok(Some(row)) => {
+            assert_eq!(row, ["a", "1"]);
+            assert!(left.get("a").is_none(), "answered, and still in the files");
+        }
         // Not read before the stop: not taken. Only where the wait above was a time (macOS, which
         // also drops a request queued on the connection at the stop).
         other => {
@@ -910,11 +913,21 @@ fn a_pop_that_finds_a_handler_stopping_never_takes_the_row_its_pop_took() {
     assert_ne!(other.status.code(), Some(0), "{}", text(&other.stderr));
     let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
     match popped {
-        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
-        other => assert!(
-            left.get("a").is_some(),
-            "deleted and never answered: {other:?}"
-        ),
+        Ok(Some(row)) => {
+            assert_eq!(row, ["a", "1"]);
+            assert!(left.get("a").is_none(), "answered, and still in the files");
+        }
+        // Not read before the stop: not taken. Only where the wait above was a time (macOS, which
+        // also drops a request queued on the connection at the stop).
+        other => {
+            #[cfg(target_os = "linux")]
+            panic!("the pop was queued: {other:?}");
+            #[cfg(not(target_os = "linux"))]
+            assert!(
+                left.get("a").is_some(),
+                "deleted and never answered: {other:?}"
+            );
+        }
     }
 }
 
