@@ -95,12 +95,12 @@ fn loose_rows(path: &Path, rows: u64, keys: u64) -> u64 {
     text
 }
 
-/// A loose scrub reads the file twice: the first read keeps a kind for each line and each key's
-/// last line, the second writes the lines kept as it reads them, so memory follows the keys, with
-/// the file held once by the in-place rewrite (to put it back should the write fail). 0.2.0 held
-/// every line, each in a buffer of its own: on 400,000 lines of 1,000 keys (23 MiB), its test
-/// build peaked 69 MiB above a `len` of a one-row file, and 0.2.1's 25 MiB above it (2026-11-23);
-/// the test allows one and a half times the file.
+/// A loose scrub reads the file twice: the first read keeps whether each line stays and what each
+/// reader read of each key, the second writes the lines kept as it reads them, so memory follows
+/// the keys, with the file held once by the in-place rewrite (to put it back should the write
+/// fail). 0.2.0 held every line, each in a buffer of its own: on 400,000 lines of 1,000 keys (23
+/// MiB), its test build peaked 69 MiB above a `len` of a one-row file, and 0.2.1's 25 MiB above it
+/// (2026-11-23); the test allows one and a half times the file.
 #[test]
 fn a_loose_scrub_holds_the_file_once_and_what_its_keys_keep() {
     let d = tempfile::tempdir().unwrap();

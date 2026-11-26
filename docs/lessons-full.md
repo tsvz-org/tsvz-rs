@@ -282,7 +282,7 @@ entries go last, in the same commit as the change:
 - Lesson: to show what a write made, read it back through the reader every other command uses; a computed copy is a
   second rule.
 
-## 2026-11-25 A loose scrub keeps what TSVZ.py's strict reader reads
+## 2026-11-25 A loose scrub keeps the last line TSVZ.py's strict reader takes
 - Changed: a loose `scrub` keeps the last line of each key that TSVZ.py's strict reader takes (it skips a line
   that holds a value but is narrower than the column count), and moves a key's last line into its first line's
   place only where that reader takes the last line, or none of the key's lines, where no `#_defaults_#` line holds
@@ -393,3 +393,21 @@ entries go last, in the same commit as the change:
 - Lesson: to cut off a socket whose read side you have already shut, shut its write side on its own: macOS refuses a
   shutdown of both then (ENOTCONN) and leaves the write side open, so a write blocked on a peer that does not read
   stays blocked.
+
+## 2026-11-25 A loose scrub runs each reader's own rule
+- Changed: a loose `scrub` plans by five readers (both command lines; TSVZ.py's strict library read; the lenient
+  and strict ones given the header line 1 holds, and a lenient one given another), each running TSVZ.py's
+  `_processLine` decisions with its own column count and `#_defaults_#` state. A line stays where one of them needs
+  it, in its place; a key's last line takes its first line's place only where every reader that reads a row of the
+  key reads its first and last row from those two lines. This replaces 0.2.3's per-line flags: a width test for
+  the strict reader, and line 1 and the first keyed line after it pinned for header readers.
+- Why we had to change: the flags were found wrong five times (0.2.1's rounds, 0.2.2's #12 and F5, the order of the
+  keys in 0.2.2's re-read, and header readers in this version's design check). On 100,000 random files 0.2.3
+  changed the strict reader's reading of 1,536 and a header reader's of up to 9,645 of 85,274; the reader table
+  changed none of 200,000, and a file whose keys are each written twice still halves.
+- Original design was wrong because: each flag stood for a reader by one property of a line (its width, its
+  place), while the reader decides from its own state (its column count, the defaults in force), so each flag was
+  right on the files it was tried on and wrong on the next shape.
+- Lesson: when a rewrite must keep several readers' readings, run each reader's own decision over the lines, its
+  state included, and keep a line where any of them needs it; a flag that stands for a reader is a second rule,
+  and the step back after repeated findings asks what the flags approximate.

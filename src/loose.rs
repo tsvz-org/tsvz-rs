@@ -1248,6 +1248,26 @@ mod tests {
             ),
             // It reads none of `K`'s lines: the last moves.
             ("#h\nx\t0\t0\nK\t1\nK\t3\n", "#h\nx\t0\t0\nK\t3\n"),
+            // Its first row of `K` comes after `M`'s, and the command line's before: moved up,
+            // `K<TAB>2<TAB>2` would change the strict reader's order of the keys.
+            (
+                "x\t0\t0\ny\t0\t0\nK\t1\nM\t1\t1\nK\t2\t2\n",
+                "x\t0\t0\ny\t0\t0\nK\t1\nM\t1\t1\nK\t2\t2\n",
+            ),
+            // Every `#_defaults_#` line stays where it is, also in a one-column file, where a bare
+            // one is a row of its own key: the last does not take the first one's place.
+            (
+                "x\n#_defaults_#\ny\n#_defaults_# \n",
+                "x\n#_defaults_#\ny\n#_defaults_# \n",
+            ),
+            // A reader given a header that line 1 holds counts one column here, from `#h`, and
+            // the command line two: that reader is not followed, so `j1` and `j2` keep no row
+            // (followed, it would keep every line, reading keys alone as rows). `j1`'s deletion
+            // stays, undoing the line that sets the column count.
+            (
+                "#h\nj1\tp\nj2\tp\nj1\nj3\tp\nj2\n",
+                "#h\nj1\tp\nj1\nj3\tp\n",
+            ),
             // Where a `#_defaults_#` line that holds a value is in force, it takes a narrower line,
             // padded: `K<TAB>9` stays, which it reads as `[K, 9, Q]` (0.2.3 dropped it).
             (
@@ -1496,6 +1516,10 @@ mod tests {
             nul("#h\0v\n\0a\0\x31\n\0\0a\0\x32\n"),
             "#h\0v\n\0\0a\0\x32\n"
         );
+        // Line 1 stays as it is: a reader given its header counts its cells, two here with the NUL
+        // at its start, where the command line counts one (`K`), and `K` at line 1's place would
+        // make TSVZ.py's strict reader given that header raise (a header mismatch).
+        assert_eq!(nul("\0K\nx\0v\nK\n"), "\0K\nx\0v\nK\n");
         // With another delimiter a NUL after a key's first byte is part of it: `a<NUL>` is a key
         // of its own.
         assert_eq!(scrub("#h\n#c\na\0\t1\na\t2\na\t3\n"), "#h\na\0\t1\na\t3\n");
