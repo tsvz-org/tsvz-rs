@@ -542,7 +542,7 @@ pub fn take(store: &Path) -> Result<Held, Take> {
 /// Remove the socket that the handler of the stale pointer file `old` left (a handler that is
 /// killed removes nothing), and the directory made for it, if then empty. Only a socket of this
 /// user's, on this host, named `s` in a directory named `tsvz-…` (both tools make their sockets
-/// so) that nobody listens on (a connection to it is refused): whatever else a pointer file names
+/// so), that refuses a connection (nobody listens on it): whatever else a pointer file names
 /// stays, a handler's that still serves too (a copy of its store's directory holds its pointer).
 fn remove_left(old: &File) {
     let mut data = Vec::new();

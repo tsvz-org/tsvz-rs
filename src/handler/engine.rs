@@ -881,7 +881,8 @@ impl Engine {
     /// as any other writer of them, and synced: the stop's last write.
     pub(crate) fn put_back(&self, req: &Request) -> Response {
         let response = self.handle(req, None);
-        // Closed before the request (or after it failed: the files are then tried once more).
+        // Not put back, and the engine is closed: it was closed before the request, which it
+        // refused, or the request failed before it was (the files are then tried once more).
         if response.status == 0 || !lock(&self.state).closed {
             return response;
         }

@@ -376,9 +376,8 @@ impl Writer {
 
     /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2): a loose file
     /// begins with an empty line 1 (a newline), as TSVZ.py creates one, also when `records` is
-    /// empty. A compressed
-    /// batch is written in members of the writer's member size, also when it sets
-    /// `#_member_size_#` itself (§16.7 is a SHOULD): the writer's size does not follow the
+    /// empty. A compressed batch is written in members of the writer's member size, also when it
+    /// sets `#_member_size_#` itself (§16.7 is a SHOULD): the writer's size does not follow the
     /// marker (the handler passes it on to its next batch with [`Writer::append_at`]).
     pub fn append(&mut self, records: &[Record]) -> Result<(), Error> {
         let payload = encode(records, self.format)?;
