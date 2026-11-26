@@ -374,9 +374,10 @@ impl Writer {
         self.format
     }
 
-    /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2). A compressed
-    /// batch is written in members of the writer's member size, also when it sets
-    /// `#_member_size_#` itself (§16.7 is a SHOULD): the writer's size does not follow the
+    /// Append `records` as one batch (§18.2), creating a missing store (§20.2.2): a loose file
+    /// begins with an empty line 1 (a newline), as TSVZ.py creates one, also when `records` is
+    /// empty. A compressed batch is written in members of the writer's member size, also when it
+    /// sets `#_member_size_#` itself (§16.7 is a SHOULD): the writer's size does not follow the
     /// marker (the handler passes it on to its next batch with [`Writer::append_at`]).
     pub fn append(&mut self, records: &[Record]) -> Result<(), Error> {
         let payload = encode(records, self.format)?;
@@ -450,26 +451,33 @@ impl Writer {
             };
             let path = part.path.as_path();
             let io = |e: io::Error| Error::io(path, e);
-            // A compressed loose file that holds something gets a newline first: its decoded text
-            // may not end with one (TSVZ.py reads such a last line as a row), and an empty line is
-            // read as nothing; an append of nothing writes nothing (0.2.1 did not, 0.2.2's first
-            // build added a member of a newline to each). Encoded for the length seen now, and
-            // again under the lock in the rare case that it was empty and is no longer, or the
-            // other way round.
+            // A newline first, read as nothing, in a loose file: one that this append creates
+            // begins with the empty line 1 TSVZ.py writes (a program that reads the file with a
+            // header takes line 1 for it), also when nothing else is appended (0.2.3 wrote the
+            // first row there); a compressed one that holds something gets one too, since its
+            // decoded text may not end with one (TSVZ.py reads such a last line as a row), but
+            // an append of nothing to it writes nothing (0.2.1 did not, 0.2.2's first build added
+            // a member of a newline to each). Encoded for the length seen now, and again under the
+            // lock in the rare case that it was empty and is no longer, or the other way round.
             let leads = |held: bool| {
-                held && !payload.is_empty() && !self.format.strict && part.codec.is_some()
+                !self.format.strict
+                    && if held {
+                        !payload.is_empty() && part.codec.is_some()
+                    } else {
+                        create
+                    }
             };
             let held = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
             let encode = |lead: bool| -> Result<Cow<[u8]>, Error> {
-                let Some(codec) = part.codec else {
-                    return Ok(payload.into());
-                };
-                let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
                 let text: Cow<[u8]> = if lead {
                     [&b"\n"[..], payload].concat().into()
                 } else {
                     payload.into()
                 };
+                let Some(codec) = part.codec else {
+                    return Ok(text);
+                };
+                let size = usize::try_from(member_size).unwrap_or(usize::MAX).max(1);
                 codec::encode_members(codec, &text, size)
                     .map(Cow::Owned)
                     .ok_or_else(|| Error::UnsupportedCodec {
@@ -517,11 +525,10 @@ impl Writer {
                     }
                 }
                 let mut bytes = Cow::Borrowed(&encoded[..]);
+                if leads(held) != leads(before.size > 0) {
+                    bytes = encode(leads(before.size > 0))?;
+                }
                 let start = match part.codec {
-                    Some(_) if leads(held) != leads(before.size > 0) => {
-                        bytes = encode(leads(before.size > 0))?;
-                        before.size
-                    }
                     Some(_) => before.size,
                     None if self.format.strict => {
                         cut = self.cut_torn_tail(&file, path).map_err(io)?;
@@ -754,7 +761,7 @@ mod tests {
             .unwrap()
             .append_payload(b"#_snapshot_#\n")
             .unwrap();
-        assert_eq!(std::fs::read_to_string(&loose).unwrap(), "#_snapshot_#\n");
+        assert_eq!(std::fs::read_to_string(&loose).unwrap(), "\n#_snapshot_#\n");
     }
 
     #[test]
@@ -1420,8 +1427,9 @@ mod tests {
             read(&p),
             [("a", "1"), ("b", "2"), ("c", "3")].map(|(k, v)| (k.to_string(), vec![v.to_string()]))
         );
-        // A file that holds nothing gets none: its first line is the row.
+        // A file that exists and holds nothing gets none: its first line is the row.
         let q = dir.path().join("e.tsv.gz");
+        fs::write(&q, "").unwrap();
         Writer::open(&q).unwrap().append(&[row("c", "3")]).unwrap();
         assert_eq!(text(&q), "c\t3\n");
         Writer::open(&q).unwrap().append(&[row("d", "4")]).unwrap();
@@ -1452,16 +1460,54 @@ mod tests {
     }
 
     #[test]
+    fn a_loose_file_the_writer_creates_begins_with_an_empty_line_1() {
+        // As TSVZ.py creates one: a program that reads it with a header takes line 1 for it (0.2.3
+        // wrote the first row there). Also for an append of nothing (a delete of a missing file),
+        // and compressed: line 1 is in the decoded text. A file that exists and holds no byte gets
+        // none, as in TSVZ.py (`clear` writes its line 1 either way); nor does a strict store.
+        let dir = tempfile::tempdir().unwrap();
+        let row = [Record::from_args("k", &["v".into()])];
+        let text = |p: &Path| {
+            let bytes = fs::read(p).unwrap();
+            if p.extension() != Some("gz".as_ref()) {
+                return bytes;
+            }
+            let mut out = Vec::new();
+            let mut decoded = flate2::read::MultiGzDecoder::new(&bytes[..]);
+            std::io::Read::read_to_end(&mut decoded, &mut out).unwrap();
+            out
+        };
+        for name in ["a.tsv", "a.tsv.gz", "e.tsv", "e.tsv.gz"] {
+            let p = dir.path().join(name);
+            let records: &[Record] = if name.starts_with('a') { &row } else { &[] };
+            Writer::open(&p).unwrap().append(records).unwrap();
+            let want: &[u8] = if records.is_empty() {
+                b"\n"
+            } else {
+                b"\nk\tv\n"
+            };
+            assert_eq!(text(&p), want, "{name}");
+        }
+        let empty = dir.path().join("x.tsv");
+        fs::write(&empty, "").unwrap();
+        Writer::open(&empty).unwrap().append(&row).unwrap();
+        assert_eq!(fs::read(&empty).unwrap(), b"k\tv\n");
+        let strict = dir.path().join("s.tsvz");
+        Writer::open(&strict).unwrap().append(&row).unwrap();
+        assert_eq!(fs::read(&strict).unwrap(), b"k\tv\n");
+    }
+
+    #[test]
     fn loose_writer_with_a_delimiter() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsv");
         let mut w = Writer::open(&p).unwrap().delimiter(Some(b';'));
         w.append(&[Record::from_args("k", &["a\tb".into()])])
             .unwrap();
-        assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\n");
+        assert_eq!(fs::read(&p).unwrap(), b"\nk;a\tb\n");
         w.append(&[Record::from_args("k", &["x;y".into()])])
             .unwrap();
-        assert_eq!(fs::read(&p).unwrap(), b"k;a\tb\nk;x<sep>y\n");
+        assert_eq!(fs::read(&p).unwrap(), b"\nk;a\tb\nk;x<sep>y\n");
     }
 
     #[test]

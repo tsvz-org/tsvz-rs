@@ -46,10 +46,11 @@ no failure. An append ends an unterminated last line first, in a
 compressed file too (TSVZ.py's joins the compressed one's). A rewrite writes each
 line it keeps as the file has it, but for three things: the key a one-column `delete` puts where the
 line that set the column count went, and the empty line 1 and blank `#_defaults_#` line a `clear`
-may write before the defaults it keeps. `scrub` keeps the lines a read depends on (a key's last line may take the
-place of its first, where the command lines' reading stays; [docs/limitations.md](docs/limitations.md) has where
-TSVZ.py's strict reader's does not), and `clear` the `#_defaults_#` lines in
-force ([docs/silent-choices.md](docs/silent-choices.md)).
+may write before the defaults it keeps. `scrub` keeps the lines a read of the whole file depends on, for both
+command lines and for TSVZ.py's library reads that take their column count and defaults from the file, strict
+or not, given no header or one, but one that counts one column where the command line counts more (a key's
+last line may take the place of its first where each of them reads the key from those two lines), and `clear`
+the `#_defaults_#` lines in force ([docs/silent-choices.md](docs/silent-choices.md)).
 
 ## Handler
 
@@ -72,7 +73,7 @@ Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
 (SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
 file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
-handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.4,
+handler with a signal or let `--x-idle-timeout` do it (deferred until TSVZ.py's next version,
 [docs/limitations.md](docs/limitations.md)).
 
 ## Library
@@ -108,6 +109,25 @@ share a store: their file locks exclude each other. Where the specification leav
 tsvz-rs does what TSVZ.py does, except where [docs/silent-choices.md](docs/silent-choices.md), which
 lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
+## Upgrading to 0.2.4 from 0.2.3
+
+Stores need nothing; the library's documented API does not change.
+
+- Loose files: one that `set`, `append`, `setdefault` or `delete` creates begins with an empty
+  line 1, as TSVZ.py's do (0.2.3 wrote the first row there, which a TSVZ.py program that reads a
+  header took for one). `scrub` keeps what TSVZ.py's strict library read, and its reads given a
+  header (but one that counts one column where the command line counts more), read: their rows
+  and the order of their keys (0.2.3 could change the strict read's rows under a `#_defaults_#`
+  line that holds a value, the order of its keys, and what a read given a header read); a key
+  that they read from other lines than the command line does keeps those lines, so a scrubbed
+  file can be a few lines longer than 0.2.3 left it.
+- Through a handler: a `pop` whose answer a stop cuts off (one too large for the socket's
+  buffer, which its client did not read) gets its row put back on the files before `tsvz stop`
+  returns and `serve` ends; on macOS that cut now happens (0.2.3's stop waited for good for a
+  client that did not read its answer); while writes fail, a request the handler cannot parse is
+  warned of it too; a `serve` that takes over from a handler that was killed removes the socket
+  directory it left.
+
 ## Upgrading to 0.2.3 from 0.2.2
 
 Nothing changes in behaviour, stores or the library's API. 0.2.2 did not build for the musl targets
@@ -122,8 +142,8 @@ Stores need nothing; the library's documented API does not change.
   row `get` then reads (none, exit 3, where the line it wrote is a deletion); `clear` writes an
   empty line 1 where line 1 was no comment, as TSVZ.py's does (TSVZ.py's also replaces a comment
   line 1, which tsvz-rs keeps); `scrub` keeps the rows TSVZ.py's strict reader reads too (not always
-  their order), where no `#_defaults_#` line holds a value ([docs/limitations.md](docs/limitations.md)); `scrub` and
-  `clear` take a file named `app.tsv.1` as one file. Reads that
+  their order), where no `#_defaults_#` line holds a value (0.2.4 keeps their order, and their rows under
+  such a line); `scrub` and `clear` take a file named `app.tsv.1` as one file. Reads that
   want few rows (`get`, `len`, `keys`) take less CPU, and a row holds only its own cells.
 - Through a handler: `tsvz stop` of a handler killed after it answered, or that closed one connection
   for want of a thread, ends at once (it waited 30 s); a stop that finds an acknowledged write lost answers 1

@@ -429,12 +429,13 @@ fn run(store: &Path, config: Config, restore: bool) -> Result<(), Error> {
         threads.extend(thread);
         reap(&mut threads);
     }
-    // Every queued write is written: the pointer file goes first, so that a command that finds the
-    // listener closed finds no handler (`tsvz stop` waits for this).
+    // Every queued write is written and every put-back made (`finish` waited for the connections'
+    // threads): the pointer file goes first, so that a command that finds the listener closed
+    // finds no handler (`tsvz stop` waits for this).
     held.release();
     drop(listener); // the clients still in its queue find their connection closed
     let _ = std::fs::remove_dir_all(&dir);
-    // The stop cut every connection off: their threads end.
+    // Their threads have ended: joined.
     for thread in threads.into_iter().chain(finisher) {
         let _ = thread.join();
     }
@@ -483,7 +484,12 @@ pub const FINISH: Duration = Duration::from_secs(5);
 /// deleted once its answer is made, so the answer is its only copy. Then the engine closes:
 /// requests not yet begun are refused, and every queued write is written and synced (§21.9.3), as
 /// long as that takes: the stop waited for it before as well. The pops' answers are given
-/// [`FINISH`] more to be written, then the rest is cut off.
+/// [`FINISH`] more to be written, then the rest is cut off: a row whose answer is cut off is put
+/// back on the files by its connection's thread ([`give_back`]). `finished` is set only once every
+/// connection's thread has ended, so that the pointer file goes after the put-backs, and a
+/// `tsvz stop` that returns, or a new `serve` that starts, finds them written. That wait has no
+/// bound beyond the writes' own: a cut connection's thread ends at once, but for the one write
+/// of a put-back.
 fn finish(shared: &Shared, engine: &Engine) {
     for conn in lock(&shared.open).values() {
         let _ = conn.stream.shutdown(std::net::Shutdown::Read);
@@ -493,6 +499,10 @@ fn finish(shared: &Shared, engine: &Engine) {
     engine.close();
     settle(shared, HashMap::is_empty);
     cut(shared, false);
+    // Counted as each is accepted and none is accepted once stopping: this ends.
+    while lock(&shared.activity).0 > 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     shared.finished.store(true, Ordering::SeqCst);
     shared.wake();
 }
@@ -506,13 +516,16 @@ fn settle(shared: &Shared, done: impl Fn(&HashMap<u64, Conn>) -> bool) {
 }
 
 /// Cut off every open connection, but with `spare_owing` those a pop is in. A connection cut off
-/// begins no other request ([`begin`]).
+/// begins no other request ([`begin`]). Each side is shut on its own: macOS refuses to shut both
+/// once the read side is shut, as [`finish`] shuts it (ENOTCONN), and then leaves an answer that
+/// waits for a client that does not read waiting (0.2.3's stop waited there for good).
 fn cut(shared: &Shared, spare_owing: bool) {
     lock(&shared.open).retain(|_, conn| {
         if spare_owing && conn.owes {
             return true;
         }
-        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+        let _ = conn.stream.shutdown(std::net::Shutdown::Read);
+        let _ = conn.stream.shutdown(std::net::Shutdown::Write);
         false
     });
 }
@@ -684,7 +697,7 @@ fn answer(
                 return;
             }
             Ok(r) => engine.handle(r, bulk.as_deref()),
-            Err(message) => Response::failed(2, message.clone()),
+            Err(message) => engine.refuse(message),
         };
         if verbose {
             let op = request.as_ref().map_or("?", |r| r.op.as_str());
@@ -704,17 +717,19 @@ fn answer(
 }
 
 /// Put back the row a `pop` or `popitem` took, when its answer, the row's only copy, could not be
-/// written (its client hung up, or gave up waiting): `setdefault` of the row, which keeps a row
-/// written for its key since, as the command line puts back a row it could not print. Said on
-/// `serve`'s standard error: that it was put back as a notice (`-q` hides it), and the row taken
-/// as an error when it is not in its place (a row written since stays, the handler is stopping),
-/// which `-q` shows: else the row is in no file and in no log.
+/// written (its client hung up, gave up waiting, or was cut off by a stop): `setdefault` of the
+/// row, which keeps a row written for its key since, as the command line puts back a row it could
+/// not print; on the files once a stop has closed the engine ([`Engine::put_back`]), which the stop
+/// waits for ([`finish`]: this thread has ended before the pointer file goes). Said on `serve`'s
+/// standard error: that it was put back as a notice (`-q` hides it), and the row taken as an error
+/// when it is not in its place (a row written since stays; the files could not be written), which
+/// `-q` shows: else the row is in no file and in no log.
 fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
     let Some(row) = response.lines.first() else {
         return;
     };
     let line = protocol::setdefault_line(&protocol::decode_fields(row));
-    let back = protocol::parse(&line).map(|request| engine.handle(&request, None));
+    let back = protocol::parse(&line).map(|request| engine.put_back(&request));
     let said = "the answer to a pop could not be written (its client went away)";
     match back {
         Ok(r) if r.status == 0 && r.lines.first() == Some(row) => {
@@ -736,7 +751,7 @@ fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
 /// How long `tsvz stop` waits, from its request, for the handler to be gone. Once it has
 /// answered, a handler stops (`finish`): at most [`FINISH`] for the requests in flight,
 /// their writes, and [`FINISH`] more for the pops' answers; the 20 s beyond those two windows are
-/// room for the writes and syncs of a slow disk. Measured on a local disk, two overlapping stops a
+/// room for the writes and syncs of a slow disk, and the put-backs. Measured on a local disk, two overlapping stops a
 /// round under 24 command lines: 300 stops took at most 0.15 s (median 0.06 s) with
 /// `#_write_ack_# memory`, and 300 at most 0.14 s (median 0.05 s) with `disk`.
 pub const STOP_WAIT: Duration = Duration::from_secs(2 * FINISH.as_secs() + 20);
@@ -1161,7 +1176,8 @@ mod tests {
     fn a_pop_s_row_is_put_back_or_printed_by_what_became_of_it() {
         // The row taken is said to have been put back only when its key reads it again; else it
         // is printed as an error (which `-q` does not hide), with the row its key reads: a row
-        // written since stays, and a handler that is stopping puts back nothing.
+        // written since stays. Once a stop has closed the engine, it is put back on the files
+        // (0.2.3 put back nothing then), and printed when they cannot be written.
         use crate::Warning;
         let dir = tempfile::tempdir().unwrap();
         let notices = Arc::new(Mutex::new(Vec::new()));
@@ -1170,7 +1186,7 @@ mod tests {
         let info: InfoFn = Arc::new(move |m: &str| lock(&n).push(m.to_string()));
         let on_error: crate::WarnFn = Arc::new(move |w: &Warning| lock(&e).push(w.message.clone()));
         let path = dir.path().join("s.tsvz");
-        std::fs::write(&path, "a\t1\nb\t2\nc\t3\n").unwrap();
+        std::fs::write(&path, "a\t1\nb\t2\nc\t3\nd\t4\n").unwrap();
         let engine = Engine::open(&path, None, Some(on_error)).unwrap();
         let ask = |line: &str| engine.handle(&protocol::parse(line).unwrap(), None);
         let taken = |key: &str| {
@@ -1201,16 +1217,25 @@ mod tests {
             "{said:?}"
         );
         assert!(said[0].ends_with("the row taken was: b\t2"), "{said:?}");
-        // A handler that is stopping puts nothing back: the row is printed.
-        let third = taken("c");
+        // A closed engine (a stop has written its queue): put back on the files, synced.
+        let (third, fourth) = (taken("c"), taken("d"));
         engine.close();
         give_back(&engine, &third, &info);
+        let notes = lock(&notices).clone();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].ends_with("; it was put back"), "{notes:?}");
+        let left = crate::Store::open(&path, crate::Options::default()).unwrap();
+        assert_eq!(left.get("c").map(|r| r.to_vec()), Some(vec!["3".into()]));
+        assert!(left.get("d").is_none());
+        // Files that cannot be written (a directory where the store was): the row is printed.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        give_back(&engine, &fourth, &info);
         let said = lock(&errors).clone();
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[1].contains("it could not be put back ("), "{said:?}");
-        assert!(said[1].ends_with("): c\t3"), "{said:?}");
-        let notes = lock(&notices).clone();
-        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(said[1].ends_with("): d\t4"), "{said:?}");
+        assert_eq!(lock(&notices).len(), 2);
     }
 
     #[test]

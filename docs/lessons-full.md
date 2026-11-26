@@ -282,7 +282,7 @@ entries go last, in the same commit as the change:
 - Lesson: to show what a write made, read it back through the reader every other command uses; a computed copy is a
   second rule.
 
-## 2026-11-25 A loose scrub keeps what TSVZ.py's strict reader reads
+## 2026-11-25 A loose scrub keeps the last line TSVZ.py's strict reader takes
 - Changed: a loose `scrub` keeps the last line of each key that TSVZ.py's strict reader takes (it skips a line
   that holds a value but is narrower than the column count), and moves a key's last line into its first line's
   place only where that reader takes the last line, or none of the key's lines, where no `#_defaults_#` line holds
@@ -331,3 +331,92 @@ entries go last, in the same commit as the change:
 - Lesson: when a request can change the rule that applies to the writes around it, take the stricter reading where
   the spec is silent (§21.9.2 is silent; TSVZ.py decides from the markers it last read, and tsvz-rs departs from it
   here): a sync costs time, a write lost after its answer costs the promise.
+
+## 2026-11-25 A request the handler cannot parse is warned of failing writes too
+- Changed: while a handler's writes are failing, an answer with status 2 (a request it cannot parse: an unknown option
+  or operation, the wrong arguments, `setdefault` of a marker key) carries the `#!` warning that writes acknowledged
+  before they were written may be lost, as every other answer but `stop`'s does, and as TSVZ.py's do. 0.2.3 gave
+  those none.
+- Why we had to change: a client that sends a request the handler refuses is told nothing of the writes it lost,
+  where TSVZ.py's handler tells it (0.2.2's last re-read).
+- Original design was wrong because: the warning was added where a parsed request is answered (`Engine::handle`),
+  and a request that fails to parse is answered before that, in the connection's loop.
+- Lesson: a word that every answer must carry is added where every answer is made, not where most of them are: an
+  answer made on a path of its own (a refusal before the work) is the one that goes without it.
+
+## 2026-11-25 A stopping handler puts a popped row back on the files
+- Changed: when a pop's answer cannot be written once a stop has closed the engine (a client that does not read it
+  is cut off after the stop's second window; one that hung up), the handler puts the row back with `setdefault` on
+  the files, as any other writer, synced, and `serve` ends after it. 0.2.2 and 0.2.3 printed the row on `serve`'s
+  standard error and left it deleted.
+- Why we had to change: the answer the stop cut off was the row's only copy (0.2.2's final review, the third window
+  of the pop's lost row).
+- Original design was wrong because: the put-back went through the engine alone, and the stop closes the engine
+  before it waits for the pops' answers, so the put-backs the stop itself causes had no writer left.
+- Found wrong at the final review: the first build made the put-back as soon as the engine was marked closed,
+  before its writer had written the queue (a read of the files before the queue's last batch and an append after it
+  overwrote a write the handler had acknowledged: 13 of 3,000 forced stops), and removed the pointer file before the
+  put-backs were made (a `tsvz stop` that returned, or a new `serve`, found them not yet written). `Engine::close` now
+  returns only once the writer has ended, for every caller, and the stop ends after the last connection's thread.
+  And at its re-read: two put-backs of one key, made at once after the stop's writer had ended, both read the key
+  gone and both appended (55 of 64 forced stops); they are made one at a time.
+- Lesson: when a shutdown can cause the failure that a repair handles, leave the repair a way to write after the
+  shutdown's own writer has ended (a flag that says closed is not that: wait for the end), as any other writer of the
+  files would, and end the shutdown after the repair, not before; and make the repairs one at a time, each reading
+  what the one before it wrote.
+
+## 2026-11-25 A serve that takes over from a killed handler removes the socket it left
+- Changed: a `serve` that takes over a pointer file no process holds (its handler was killed) removes the socket the
+  file names, and then the directory made for it if empty, when the pointer file and the socket are this user's, on
+  this host, named `s` in a `tsvz-` directory, and nobody listens on it (a connection to it is refused). 0.2.3 left
+  both for good, under `$XDG_RUNTIME_DIR` or the temporary directory.
+- Why we had to change: each handler that was killed left a directory behind (0.2.2's build).
+- Original design was wrong because: the clean-up was in the handler's own stop, and a killed process runs none; the
+  one that learns the handler is gone is the next one to take over its pointer file.
+- Lesson: leave the clean-up of what a killed process made to whoever next finds it dead by the kernel's word (its
+  lock let go of), and remove only what that process's own layout makes and the system shows unused (a refused
+  connection), since the record that names it can be a file someone else put there.
+
+## 2026-11-25 A loose file tsvz-rs creates begins with the empty line 1 TSVZ.py writes
+- Changed: `set`, `append`, `setdefault` and `delete` on a missing loose file create it with an empty line 1 (a
+  newline; compressed, inside the first member), as TSVZ.py creates one; 0.2.3 wrote the first row as line 1, and
+  `delete` left the file empty. A file that exists and holds no byte gets none, as in TSVZ.py.
+- Why we had to change: a TSVZ.py program that reads the file with a header took its first row for the header
+  (0.2.2's final review, F6).
+- Original design was wrong because: 0.2.2 wrote TSVZ.py's line 1 where a `clear` makes it, and left the other place
+  that makes line 1, the writer's first append to a file it creates, as it was.
+- Lesson: when you copy how another program writes a position (line 1), copy it at every path that makes that
+  position: a rewrite and the first write to a new file both do.
+
+## 2026-11-25 A stop shuts a connection's write side on its own
+- Changed: when a stop cuts a connection off, it shuts its read side and then its write side, each on its own.
+  0.2.3 shut both at once, which on macOS failed (ENOTCONN) once the stop had shut the read side at its start, and
+  left the write side open: an answer waiting for a client that did not read it (a large `read`, a `pop` of a large
+  row) kept waiting, and `serve` waited for that connection's thread for good, after it had removed its pointer
+  file. Linux shuts both either way.
+- Why we had to change: found by this version's test of a pop whose answer a stop cuts off, which hung on macOS;
+  measured there: `shutdown(SHUT_RD)`, then `shutdown(SHUT_RDWR)` from another thread fails with ENOTCONN and the
+  blocked write stays blocked; `SHUT_WR` instead ends it with EPIPE.
+- Original design was wrong because: it took "shut both" to mean the same on every system, and every test of the cut
+  on macOS had a client that read or closed.
+- Lesson: to cut off a socket whose read side you have already shut, shut its write side on its own: macOS refuses a
+  shutdown of both then (ENOTCONN) and leaves the write side open, so a write blocked on a peer that does not read
+  stays blocked.
+
+## 2026-11-25 A loose scrub runs each reader's own rule
+- Changed: a loose `scrub` plans by five readers (both command lines; TSVZ.py's strict library read; the lenient
+  and strict ones given the header line 1 holds, and a lenient one given another), each running TSVZ.py's
+  `_processLine` decisions with its own column count and `#_defaults_#` state. A line stays where one of them needs
+  it, in its place; a key's last line takes its first line's place only where every reader that reads a row of the
+  key reads its first and last row from those two lines. This replaces 0.2.3's per-line flags: a width test for
+  the strict reader, and line 1 and the first keyed line after it pinned for header readers.
+- Why we had to change: the flags were found wrong five times (0.2.1's rounds, 0.2.2's #12 and F5, the order of the
+  keys in 0.2.2's re-read, and header readers in this version's design check). On 100,000 random files 0.2.3
+  changed the strict reader's reading of 1,536 and a header reader's of up to 9,645 of 85,274; the reader table
+  changed none of 200,000, and a file whose keys are each written twice still halves.
+- Original design was wrong because: each flag stood for a reader by one property of a line (its width, its
+  place), while the reader decides from its own state (its column count, the defaults in force), so each flag was
+  right on the files it was tried on and wrong on the next shape.
+- Lesson: when a rewrite must keep several readers' readings, run each reader's own decision over the lines, its
+  state included, and keep a line where any of them needs it; a flag that stands for a reader is a second rule,
+  and the step back after repeated findings asks what the flags approximate.

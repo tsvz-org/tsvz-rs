@@ -59,101 +59,56 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   a mandatory SMB byte-range lock over the file, so another process's read of it fails with EACCES; the append's
   lock (whole-file on Linux in tsvz-rs, byte 1 in TSVZ.py, the layout of §18.6) is made mandatory the same way.
   Measured on Samba 4.17 with 7.0, 6.1 and 4.18 clients (2026-11-23).
-- Revisit when: 0.2.4, together with TSVZ.py (moved from 0.2.2: TSVZ 5.19 is paused at the user's ask, and tsvz-rs
-  alone cannot take the new lock, below). The plan, measured on all three kernels: a handler holds a write
-  lock (an open file description lock) on one byte far past the pointer file's content (offset 2^62), where no
-  reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a second handler is
-  refused. Both tools must change together: on a local file system `flock` and such a lock do not exclude each
-  other, so a handler of one tool that took the new lock would not exclude a handler of the other that takes
-  `flock`. TSVZ.py's lookup must also catch an error of the read. The append lock's range is a spec matter (§18.6)
+- Revisit when: TSVZ 5.19 resumes, together with TSVZ.py (moved from 0.2.2 and from 0.2.4: TSVZ 5.19 is paused at
+  the user's ask, and tsvz-rs alone cannot take the new lock, below). The plan, measured on all three kernels: a
+  handler holds a write lock (an open file description lock) on one byte far past the pointer file's content
+  (offset 2^62), where no reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a
+  second handler is refused. Both tools must change together: on a local file system `flock` and such a lock do
+  not exclude each other, so a handler of one tool that took the new lock would not exclude a handler of the other
+  that takes `flock`. TSVZ.py's lookup must also catch an error of the read. The append lock's range is a spec matter (§18.6)
   and goes to the TSVZ session; with a reachable handler the command line reads through its socket and never meets
   it.
 - Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; moved to 0.2.3 on
-  2026-11-25, and to 0.2.4 the same day (0.2.3 is the musl build fix alone); a deferral under the user's standing rule that deferrals are noted, not asked.
+  2026-11-25, to 0.2.4 the same day (0.2.3 is the musl build fix alone), and out of 0.2.4 the same day (0.2.4
+  takes the deferrals tsvz-rs can settle alone); a deferral under the user's standing rule that deferrals are
+  noted, not asked.
 
 ### A routed `pop` or `popitem` can lose its row when its answer does not arrive
 - Kind: deferred
-- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. Three windows
+- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. Two windows
   are left. (1) The handler's process dies (killed, out of memory) after the deletion is written and before the
   answer is: the row is gone and the command exits 1 (`lost the handler`), naming no row. (2) The answer is
-  written and never read (the command is killed in between): the row is gone. (3) The answer cannot be written
-  while the handler stops (the client left, or does not read a large answer): the row is not put back, and is
-  printed on `serve`'s standard error. When the answer cannot be written while the handler serves (the client hung
-  up, or gave up waiting), the handler puts the row back (0.2.2; 0.2.1 lost it), unless a row was written for its
-  key since, which stays (the row taken is then printed on `serve`'s standard error).
+  written and never read (the command is killed in between): the row is gone. When the answer cannot be written
+  (the client hung up, gave up waiting, or did not read an answer too large for the socket's buffer before a stop cut it off), the handler puts the row
+  back (0.2.2 while it serves, 0.2.4 also while it stops, on the files; 0.2.1 lost it), unless a row was written
+  for its key since, which stays (the row taken is then printed on `serve`'s standard error).
 - Why: the pop is delete, then answer; a written answer is all the handler can see.
-- Revisit when: 0.2.4, with the TSVZ session. (3): when the engine is closed, the connection thread makes the
-  `setdefault` on the files, and `serve` joins it before it returns; the stop's order stays. (1) and (2): a client
-  acknowledgement for `pop` and `popitem` (§21.7, beside §21.9), which both tools' handlers and clients take up
-  together, with the deletion written after the acknowledgement (a handler that dies before it then leaves the row;
-  one that dies after it and before the deletion leaves a row that was delivered); or accept (1) and (2) as a
-  known limitation (the user's OK).
-- Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write); a
-  deferral under the user's standing rule that deferrals are noted, not asked.
+- Revisit when: TSVZ 5.19 resumes, with the TSVZ session: a client acknowledgement for `pop` and `popitem` (§21.7,
+  beside §21.9), which both tools' handlers and clients take up together, with the deletion written after the
+  acknowledgement (a handler that dies before it then leaves the row; one that dies after it and before the
+  deletion leaves a row that was delivered); or accept (1) and (2) as a known limitation (the user's OK).
+- Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write) and
+  in 0.2.4 (the put-back during a stop, on the files); a deferral under the user's standing rule that deferrals
+  are noted, not asked.
 
-### A scrub of a loose file can change what a strict TSVZ.py reader reads: a row under `#_defaults_#` that hold a value, or the order of its keys
-- Kind: deferred
-- What the operator sees: TSVZ.py's strict read of the library (`readTSV(strict=True)`) drops a line that holds a
-  value but is narrower than the column count; while a `#_defaults_#` line that holds a value is in force, it takes
-  such a line, padded. A loose `scrub` keeps the lines that reader takes by their width alone (0.2.2), so the lines
-  `#h`, `x 0 0`, `K 1 2`, `#_defaults_# P Q`, `K 9`, `#_defaults_#`, `K 8` (tab-separated) lose `K 9`: that reader
-  read `K` as `[K, 9, Q]` before and reads `[K, 1, 2]` after. Without such a line its rows stay, but not always
-  their order: `x 0 0`, `L`, `L 2`, `M 9 9 1`, `L 8 1` gives keys x, M, L before and x, L, M after. Both tools'
-  command lines read each file alike before and after. 0.2.1 does both (and changed more rows).
-- Why: the scrub's plan does not follow the strict reader's own defaults (that reader also drops a narrower
-  `#_defaults_#` line when none is in force), nor the order in which it first meets a key.
-- Revisit when: 0.2.4. The plan starts with a design question, not a patch (this part has been found wrong four
-  times, each time for a reader the plan approximates by flags): should the scrub run each reader's own rule over
-  the lines (the command line's, and the strict branch of `_processLine` with its own defaults state) as a small
-  state machine, and keep a line unless every reader's reading stays, in place of the per-line flags? And is moving
-  a key's last line into its first line's place worth its state at all, against keeping the lines in place? The
-  strict probe's generator then draws defaults, resets and narrow rows.
-- Noted: 2026-11-23, in the 0.2.1 final review; narrowed in 0.2.2 (2026-11-25, its final review found this case);
-  the order of the keys added the same day, in the re-read of 0.2.2's first fix round.
-
-### A loose file that tsvz-rs creates has no empty line 1
-- Kind: deferred
-- What the operator sees: `set`, `append` or `setdefault` on a missing loose file writes the row as line 1, and
-  `delete` leaves the file empty; TSVZ.py writes an empty line 1 first, and so does tsvz-rs's `clear` (0.2.2). A
-  TSVZ.py program that reads the file with a header takes the first row for it. Both command lines read the file
-  alike. 0.2.1 the same.
-- Why: the writer creates a loose file empty.
-- Revisit when: 0.2.4. The plan: a loose file is created with the empty line 1 TSVZ.py writes.
-- Noted: 2026-11-25, in the 0.2.2 final review.
-
-### While writes fail, a handler's status-2 answer carries no warning
-- Kind: deferred
-- What the operator sees: while a handler's writes are failing, an answer with status 2 (a request it cannot
-  parse: an unknown option or operation, the wrong number of arguments, `setdefault` of a marker key) carries no
-  `#!` warning that acknowledged writes may be lost. Every other answer but `stop`'s does, and TSVZ.py's handler
-  puts it on status-2 answers too. 0.2.1 the same.
-- Why: the warning is added where a parsed request is answered, and a request that fails to parse is answered
-  before that.
-- Revisit when: 0.2.4: the handler adds the warning to a status-2 answer too, as TSVZ.py's does, and the
-  exception in docs/silent-choices.md goes.
-- Noted: 2026-11-25, in the re-read of 0.2.2's third fix round.
-
-### A handler that is killed leaves its socket directory
-- Kind: deferred
-- What the operator sees: `tsvz serve` ended by SIGKILL leaves `tsvz-XXXXXX/s` under `$XDG_RUNTIME_DIR` or the
-  temporary directory (and its pointer file, which the next `serve` takes over). 0.2.1 the same.
-- Why: nothing runs when a process is killed.
-- Revisit when: 0.2.4. The plan: a `serve` that takes over a pointer file no process holds removes the socket that
-  file names and `rmdir`s its directory.
-- Noted: 2026-11-25, in the 0.2.2 build.
-
-### Two handler tests can fail on a loaded machine
-- Kind: deferred
-- What the operator sees: nothing from these tests (the handler is right; a program whose child holds a client's
-  connection open meets window (2) of "A routed `pop` or `popitem` can lose its row when its answer does not
-  arrive", above). `a_pop_whose_client_went_away_before_its_answer_puts_its_row_back`
-  and `a_pop_whose_client_went_away_after_its_key_was_written_prints_the_row_taken_even_with_q` (tests/handler.rs)
-  wait 10 s for `serve` to say that a pop's answer could not be written, and fail when it does not. On a host at a
-  load average of about 200 (32 test threads) 8 of 20 runs of `cargo test --test handler` failed in 0.2.3, and 9 of
-  30 runs at 0.2.2's commit; with one test thread, or with one test alone, none did.
-- Why: the test closes its client socket with `drop`, while a child that another test thread is starting (between
-  its fork and its exec) holds a copy of the descriptor: the socket stays open, the handler's write of the answer
-  succeeds, and nothing is put back. The handler does what it should.
-- Revisit when: 0.2.4. The plan: the two tests call `shutdown(Both)` on the connection before they drop it (none of
-  20 runs failed with that change, under the same load).
-- Noted: 2026-11-25, in 0.2.3's first run on the minimum Rust version.
+### A stop's put-back of a cut-off `pop` is made on the files, beside the engine
+- Kind: deferred (0.2.5)
+- What the operator sees: nothing different from a put-back made while serving: a `pop` or `popitem` whose answer a
+  stop cuts off has its row put back with `setdefault` (which keeps a row written for its key since) before `tsvz
+  stop` returns. The stop makes it by a write path of its own, on the files, after the engine is closed
+  (`Engine::put_back`: a read of the files and an append, synced, one put-back at a time under the writer thread's
+  mutex), where a put-back while serving goes through the engine's queue. Two findings of 0.2.4's rounds were in
+  that path (a put-back made before the writer's last batch overwrote an acknowledged write: 13 of 3,000 forced
+  stops; two put-backs of one key both appended: 55 of 64), both fixed there; the path stays a part with an
+  interleaving of its own.
+- Why: `finish` closes the engine before it settles the pops' answers, so a cut-off pop's put-back finds the
+  engine closed. Closing it later needs the stop's order changed (its tests, the two forced-stop harnesses and a
+  review again), which is a change of its own, not a patch of the round that found the second finding.
+- The plan (0.2.5): `finish` closes the engine only after the connection threads have ended, with `begin` refusing
+  every request after the first cut (what the early close does today: a spared connection begins nothing new). A
+  cut-off pop's put-back then goes through the engine, under its state mutex and in its queue, as it does while
+  serving. The files path (about 35 lines), `close`'s wait for a second caller and the hold that makes the
+  put-backs one at a time (`Engine::end`) go, and the stop's last write is still the queue's, synced by `close`.
+- Revisit when: 0.2.5.
+- Noted: 2026-11-25, in 0.2.4's re-read (the step back after the second finding in the part); a deferral under the
+  user's standing rule that deferrals are noted, not asked.

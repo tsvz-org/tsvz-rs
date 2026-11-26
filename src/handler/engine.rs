@@ -630,7 +630,20 @@ impl Engine {
     /// (§21.10.3).
     pub fn handle(&self, req: &Request, bulk: Option<&[String]>) -> Response {
         let arrived = Instant::now();
-        let mut response = self.dispatch(req, bulk, arrived);
+        self.warned(self.dispatch(req, bulk, arrived))
+    }
+
+    /// The answer to a request that cannot be parsed (`message`, from [`protocol::parse`]):
+    /// status 2 (§21.10.1).
+    ///
+    /// [`protocol::parse`]: crate::handler::protocol::parse
+    pub(crate) fn refuse(&self, message: &str) -> Response {
+        self.warned(Response::failed(2, message))
+    }
+
+    /// `response`, with a warning while writes are failing that writes acknowledged before they
+    /// were written may be lost: every answer but `stop`'s carries it, as TSVZ.py's do.
+    fn warned(&self, mut response: Response) -> Response {
         if let Some(why) = self.batcher.failing() {
             response.diagnostics.push(format!(
                 "{}: writes are failing ({why}); writes acknowledged before they were written may be lost",
@@ -862,6 +875,61 @@ impl Engine {
         Engine::answer(result, said)
     }
 
+    /// Put back the row a `pop` or `popitem` took, whose answer could not be written: `req` is the
+    /// `setdefault` of it, which keeps a row written for its key since. Through the engine while it
+    /// serves; once it is closed, on the files, as any other writer of them, and synced: the
+    /// stop's last write, made once the writer has written its queue and ended ([`Engine::end`]
+    /// waits for that), so that the files are read as the queue left them: a read made before the
+    /// queue's last batch and an append after it would overwrite a write the handler had
+    /// acknowledged; and one put-back at a time ([`Engine::end`] returns what holds the others
+    /// back), so that each reads what the one before it wrote.
+    pub(crate) fn put_back(&self, req: &Request) -> Response {
+        let response = self.handle(req, None);
+        // Not put back, and the engine is closed: it was closed before the request, which it
+        // refused, or the request failed before it was (the files are then tried once more).
+        if response.status == 0 || !lock(&self.state).closed {
+            return response;
+        }
+        // One put-back on the files at a time, each reading what the one before it wrote: two
+        // pops of one key whose answers a stop cut off both found the key gone, and both
+        // appended. The writer thread's mutex, which nothing else holds once the writer has
+        // ended, is held from that end on, with no moment between the two.
+        let _alone = self.end();
+        let (key, values) = (&req.args[0], &req.args[1..]);
+        let options = Options {
+            scope: Scope::Keys(vec![key.clone()]),
+            ..Engine::options(&Arc::default(), &self.log)
+        };
+        let put = || {
+            let store = match Store::open(&self.path, options) {
+                Ok(store) => Some(store),
+                Err(Error::Missing(_)) => None,
+                Err(e) => return Err(e),
+            };
+            Ok(
+                match ops::setdefault(store.as_ref(), self.format, key, values) {
+                    Plan::Show { key, cells } => Engine::row(&key, &cells),
+                    Plan::Put {
+                        key,
+                        cells,
+                        record,
+                        member_size,
+                    } => {
+                        Writer::open(&self.path)?
+                            .warnings(self.log.clone())
+                            .member_size(member_size as usize)
+                            .fsync(true)
+                            .append(std::slice::from_ref(&record))?;
+                        Engine::row(&key, &cells)
+                    }
+                    // (setdefault exits only for a store it could not read whole)
+                    Plan::Exit(_) | Plan::Take { .. } => Response::failed(1, INCOMPLETE),
+                },
+            )
+        };
+        Engine::answer(put(), Vec::new())
+    }
+
     /// Make every acknowledged write durable (`stop`, §21.9.3): an error when one was lost, now or
     /// before (a failed batch of writes answered before they were made, a failed sync).
     pub fn flush(&self) -> Result<(), Error> {
@@ -874,14 +942,24 @@ impl Engine {
         self.batcher.lost()
     }
 
-    /// Answer no more requests; write and fsync everything queued, and end the writer thread.
+    /// Answer no more requests; write and fsync everything queued, and end the writer thread. It
+    /// returns once the writer has ended, for a second caller too: that one waits for the first's
+    /// join, which is why the thread's mutex is held across it.
     pub fn close(&self) {
+        drop(self.end());
+    }
+
+    /// [`Engine::close`], returning the writer thread's mutex, held: its caller is the only one
+    /// to write once the writer has ended, until it lets the guard go.
+    fn end(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
         lock(&self.state).closed = true;
         lock(&self.batcher.queue).closing = true;
         self.batcher.changed.notify_all();
-        if let Some(thread) = lock(&self.thread).take() {
+        let mut thread = lock(&self.thread);
+        if let Some(thread) = thread.take() {
             let _ = thread.join();
         }
+        thread
     }
 }
 
@@ -1677,6 +1755,96 @@ mod tests {
         assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 100);
         let r = ask(&e, "len");
         assert_eq!(r.status, 1, "a closed engine answers no more: {r:?}");
+    }
+
+    #[test]
+    fn a_put_back_made_while_a_stop_still_writes_its_queue_waits_for_the_writer() {
+        // A stop closes the engine before its writer has written the queue (here the part's lock,
+        // held by the test, stalls it): a put-back on the files made then read them before the
+        // queue's last batch and appended after it, and so overwrote a write the handler had
+        // acknowledged (0.2.4's final review: 13 of 3,000 forced stops). It decides from the
+        // files as the writer left them: the row written since stays, and nothing is appended.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "b\t2\n").unwrap();
+        let e = Arc::new(engine(dir.path(), "s.tsvz"));
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
+        // Acknowledged from memory, and queued: the writer has it and waits for the lock.
+        assert_eq!(ask(&e, "set\tk\tnew").status, 0);
+        let within = |secs, what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + std::time::Duration::from_secs(secs);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        within(10, "the writer never waited", &|| {
+            crate::lock::waiters_on(&p) == 1
+        });
+        let closer = {
+            let e = e.clone();
+            std::thread::spawn(move || e.close())
+        };
+        within(10, "the engine was never closed", &|| lock(&e.state).closed);
+        let putter = {
+            let e = e.clone();
+            let back = parse("setdefault\tk\told").unwrap();
+            std::thread::spawn(move || e.put_back(&back))
+        };
+        // A put-back that does not wait for the writer reads the files now (no `k`) and waits for
+        // the lock as the writer does; one that waits has nothing to show, and gets as long as
+        // it takes a thread that is not starved to reach the lock (1 s).
+        let end = Instant::now() + std::time::Duration::from_secs(1);
+        while crate::lock::waiters_on(&p) < 2 && Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(held);
+        closer.join().unwrap();
+        let back = putter.join().unwrap();
+        assert_eq!((back.status, back.lines), (0, lines(&["k\tnew"])));
+        assert_eq!(fs::read_to_string(&p).unwrap(), "b\t2\nk\tnew\n");
+    }
+
+    #[test]
+    fn two_put_backs_of_one_key_on_the_files_are_made_one_at_a_time() {
+        // Two pops of one key whose answers a stop cut off both put their row back on the closed
+        // engine's files: each read the key gone and both appended, the later row won, and both
+        // said it was put back (0.2.4's re-read: 55 of 64 forced stops). Here the part's lock is
+        // held, so that two put-backs that are not made one at a time both read the files (no
+        // `k`) and both wait for the lock, and a pair that is made one at a time has one waiting
+        // for the other, which gets as long as it takes a thread that is not starved to reach
+        // the lock (1 s): the second then reads the first's row, writes nothing, and says it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "b\t2\n").unwrap();
+        let e = Arc::new(engine(dir.path(), "s.tsvz"));
+        e.close();
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
+        let putters: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|v| {
+                let e = e.clone();
+                let back = parse(&format!("setdefault\tk\t{v}")).unwrap();
+                std::thread::spawn(move || e.put_back(&back))
+            })
+            .collect();
+        let end = Instant::now() + std::time::Duration::from_secs(1);
+        while crate::lock::waiters_on(&p) < 2 && Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(held);
+        let answers: Vec<_> = putters
+            .into_iter()
+            .map(|t| t.join().unwrap().lines)
+            .collect();
+        let text = fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("\nk\t").count(), 1, "{text:?}");
+        assert_eq!(
+            answers[0], answers[1],
+            "both read the row the first put back"
+        );
     }
 
     #[test]
