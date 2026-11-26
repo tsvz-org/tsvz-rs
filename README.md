@@ -72,7 +72,7 @@ Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
 (SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
 file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
-handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.3,
+handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.4,
 [docs/limitations.md](docs/limitations.md)).
 
 ## Library
@@ -107,6 +107,11 @@ against TSVZ.py on random stores, with and without its handler. Rust and Python 
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does, except where [docs/silent-choices.md](docs/silent-choices.md), which
 lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.3 from 0.2.2
+
+Nothing changes in behaviour, stores or the library's API. 0.2.2 did not build for the musl targets
+(its release has no Linux binaries, and `cargo install tsvz` fails on Alpine); 0.2.3 builds for them.
 
 ## Upgrading to 0.2.2 from 0.2.1
 
