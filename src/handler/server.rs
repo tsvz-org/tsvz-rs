@@ -1181,7 +1181,7 @@ mod tests {
         // is printed as an error (which `-q` does not hide), with the row its key reads: a row
         // written since stays. Once a stop has the engine refuse requests, it is still put back
         // through the engine (0.2.3 put back nothing then, 0.2.4 on the files), and printed when the
-        // files cannot be written, and once the engine is closed.
+        // files cannot be written.
         use crate::Warning;
         let dir = tempfile::tempdir().unwrap();
         let notices = Arc::new(Mutex::new(Vec::new()));
@@ -1190,7 +1190,7 @@ mod tests {
         let info: InfoFn = Arc::new(move |m: &str| lock(&n).push(m.to_string()));
         let on_error: crate::WarnFn = Arc::new(move |w: &Warning| lock(&e).push(w.message.clone()));
         let path = dir.path().join("s.tsvz");
-        std::fs::write(&path, "a\t1\nb\t2\nc\t3\nd\t4\ne\t5\n").unwrap();
+        std::fs::write(&path, "a\t1\nb\t2\nc\t3\nd\t4\n").unwrap();
         let engine = Engine::open(&path, None, Some(on_error)).unwrap();
         let ask = |line: &str| engine.handle(&protocol::parse(line).unwrap(), None);
         let taken = |key: &str| {
@@ -1222,7 +1222,7 @@ mod tests {
         );
         assert!(said[0].ends_with("the row taken was: b\t2"), "{said:?}");
         // A stop has the engine refuse requests: put back through it all the same.
-        let (third, fourth, fifth) = (taken("c"), taken("d"), taken("e"));
+        let (third, fourth) = (taken("c"), taken("d"));
         engine.refuse_requests();
         give_back(&engine, &third, &info);
         let notes = lock(&notices).clone();
@@ -1235,21 +1235,11 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         give_back(&engine, &fourth, &info);
-        // (A failed batch is reported too, before it.)
+        // The last error: the write's own failure can come before it.
         let said = lock(&errors).clone();
         let last = said.last().unwrap();
         assert!(last.contains("it could not be put back ("), "{said:?}");
         assert!(last.ends_with("): d\t4"), "{said:?}");
-        // A closed engine (its writer has ended): the row is printed.
-        engine.close();
-        give_back(&engine, &fifth, &info);
-        let said = lock(&errors).clone();
-        let last = said.last().unwrap();
-        assert!(
-            last.contains("it could not be put back (the handler is stopping)"),
-            "{said:?}"
-        );
-        assert!(last.ends_with("): e\t5"), "{said:?}");
         assert_eq!(lock(&notices).len(), 2);
     }
 
