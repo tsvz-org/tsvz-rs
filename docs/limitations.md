@@ -144,7 +144,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### Two handler tests can fail on a loaded machine
 - Kind: deferred
-- What the operator sees: nothing; it is the tests. `a_pop_whose_client_went_away_before_its_answer_puts_its_row_back`
+- What the operator sees: nothing from these tests (the handler is right; a program whose child holds a client's
+  connection open meets window (2) of "A routed `pop` or `popitem` can lose its row when its answer does not
+  arrive", above). `a_pop_whose_client_went_away_before_its_answer_puts_its_row_back`
   and `a_pop_whose_client_went_away_after_its_key_was_written_prints_the_row_taken_even_with_q` (tests/handler.rs)
   wait 10 s for `serve` to say that a pop's answer could not be written, and fail when it does not. On a host at a
   load average of about 200 (32 test threads) 8 of 20 runs of `cargo test --test handler` failed in 0.2.3, and 9 of
