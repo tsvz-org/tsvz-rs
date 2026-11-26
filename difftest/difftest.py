@@ -229,8 +229,9 @@ STATE_DEFAULTS = ['P', 'Q', '', '']
 
 def make_loose_state(rng, directory):
     """A loose file drawn for the state its readers keep (the column count, the `#_defaults_#` in force, line 1
-    as a header): line 1 a comment, empty, a header row of the column count or another, a row, a `#_defaults_#`
-    line or a key alone; rows narrower and wider than the column count, keys alone and with empty cells,
+    as a header): line 1 a comment, empty, a header row of the column count or another, a `#_defaults_#` line or a
+    key alone, or (3 draws in 10) none of those, so that the first line the rest of the file draws is line 1, a
+    row in most seeds; rows narrower and wider than the column count, keys alone and with empty cells,
     `#_defaults_#` lines that hold a value (narrower ones too) and resets; messier ones with blanks at a
     cell's end, NULs, CRs, a byte-order mark and an unterminated last line; some compressed."""
     d = rng.choice(['\t', '\t', '\t', '\t', '\t', ',', ',', '\0'])
@@ -319,7 +320,8 @@ def load_library(path):
 
 
 def library_read(library, store, d, strict, header):
-    """A TSVZ.py library read of `store` (`readTabularFile`): its keys and rows in order, or the exception it raised."""
+    """A TSVZ.py library read of `store` (`readTabularFile`): its keys and rows in order, or `['raised', the name of
+    the exception's type]`."""
     said = io.StringIO()
     try:
         with contextlib.redirect_stdout(said), contextlib.redirect_stderr(said):
@@ -384,8 +386,10 @@ def library_reads(library, python, store, changed, d, text):
         if before != after:
             problems.append('  scrub, then TSVZ.py library read (%s): before %r\n    after %r' % (name, before[:20],
                                                                                               after[:20]))
-    given = d.join(header)
-    if any(header) and '--x-header' not in off and '\\' not in given and '\0' not in given:
+    # TSVZ.py's command line takes the byte-order mark off line 1 and not off the header it is given, so a header
+    # with the mark on its first cell never matches line 1, and the read would be the one given no header.
+    given = d.join(header).lstrip('\ufeff')
+    if any(given.split(d)) and '--x-header' not in off and '\\' not in given and '\0' not in given:
         x = python + ['--x-header', given]
         before, after = ask(x, store, ['read']), ask(x, changed, ['read'])
         if before != after:
