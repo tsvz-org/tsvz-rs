@@ -111,9 +111,7 @@ lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/R
 
 ## Upgrading to 0.2.5 from 0.2.4
 
-Nothing changes in stores or the library's API, nor in what a stop does: a `pop` whose answer a
-stop cuts off still has its row put back before `tsvz stop` returns, now through the handler's
-own writer, as while it serves, instead of on the files beside it.
+Nothing to do: stores, the library's documented API and what a stop does are as in 0.2.4.
 
 ## Upgrading to 0.2.4 from 0.2.3
 

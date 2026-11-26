@@ -81,12 +81,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   written and never read (the command is killed in between): the row is gone. When the answer cannot be written
   (the client hung up, gave up waiting, or did not read an answer too large for the socket's buffer before a stop cut it off), the handler puts the row
   back (0.2.2 while it serves, 0.2.4 also while it stops; 0.2.1 lost it), unless a row was written
-  for its key since, which stays (the row taken is then printed on `serve`'s standard error).
+  for its key since, which stays (the row taken is then printed on `serve`'s standard error). A `delete` or
+  `clear` of the key acknowledged between the take and the put-back is not kept: the row comes back.
 - Why: the pop is delete, then answer; a written answer is all the handler can see.
 - Revisit when: TSVZ 5.19 resumes, with the TSVZ session: a client acknowledgement for `pop` and `popitem` (§21.7,
   beside §21.9), which both tools' handlers and clients take up together, with the deletion written after the
   acknowledgement (a handler that dies before it then leaves the row; one that dies after it and before the
-  deletion leaves a row that was delivered); or accept (1) and (2) as a known limitation (the user's OK).
+  deletion leaves a row that was delivered, and no put-back is left to undo a `delete` made meanwhile); or accept
+  (1) and (2) as a known limitation (the user's OK).
 - Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write) and
   in 0.2.4 (the put-back during a stop, on the files; through the engine since 0.2.5); a deferral under the user's
   standing rule that deferrals are noted, not asked.
