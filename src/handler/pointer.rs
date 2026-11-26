@@ -540,11 +540,26 @@ pub fn take(store: &Path) -> Result<Held, Take> {
 }
 
 /// Remove the socket that the handler of the stale pointer file `old` left (a handler that is
-/// killed removes nothing), and the directory made for it, if then empty. Only a socket of this
-/// user's, on this host, named `s` in a directory named `tsvz-…` (both tools make their sockets
-/// so), that refuses a connection (nobody listens on it): whatever else a pointer file names
-/// stays, a handler's that still serves too (a copy of its store's directory holds its pointer).
+/// killed removes nothing), and the directory made for it, if then empty. Only when the pointer
+/// file is this user's (a handler's own always is; one that anyone who can write the store's
+/// directory may have put there names nothing of ours), and then only a socket of this user's, on
+/// this host, named `s` in a directory named `tsvz-…` (both tools make their sockets so), that
+/// refuses a connection (nobody listens on it): whatever else a pointer file names stays, a
+/// handler's that still serves too (a copy of its store's directory holds its pointer).
 fn remove_left(old: &File) {
+    // SAFETY: geteuid only reads the process's user id.
+    let me = unsafe { libc::geteuid() };
+    if let Ok(meta) = old.metadata() {
+        remove_left_of(old, meta.uid(), me);
+    }
+}
+
+/// [`remove_left`] for a pointer file owned by `owner`, run by the user `me`: split off so that a
+/// test can give the owner (a second user cannot be had in one).
+fn remove_left_of(old: &File, owner: u32, me: u32) {
+    if owner != me {
+        return;
+    }
     let mut data = Vec::new();
     if Read::by_ref(&mut &*old)
         .take(SIZE_LIMIT + 1)
@@ -566,8 +581,6 @@ fn remove_left(old: &File) {
         return;
     };
     use std::os::unix::ffi::OsStrExt;
-    // SAFETY: geteuid only reads the process's user id.
-    let me = unsafe { libc::geteuid() };
     let ours = *host == hostname()
         && socket.file_name() == Some("s".as_ref())
         && dir
@@ -792,6 +805,31 @@ mod tests {
         let far = left("tsvz-far001");
         taken(format!("unix:{}", far.join("s").display()), "elsewhere");
         assert!(far.join("s").exists());
+    }
+
+    #[test]
+    fn a_dead_socket_named_by_a_pointer_file_of_another_user_stays() {
+        // The pointer file is one that anyone who can write the store's directory may plant (a
+        // sticky /tmp, a group directory), naming a dead socket of the victim's: acting on it
+        // would unlink by a path that can be swapped meanwhile. Only the user's own pointer files
+        // are acted on. A second user cannot be had in a test, so the owner is given.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let left = dir.path().join("tsvz-a1B2c3");
+        fs::create_dir(&left).unwrap();
+        drop(UnixListener::bind(left.join("s")).unwrap());
+        plant(
+            &s,
+            &text(&format!("unix:{}", left.join("s").display()), &hostname()),
+            0o600,
+        );
+        let old = open_pointer(&path_of(&s)).unwrap();
+        // SAFETY: geteuid only reads the process's user id.
+        let me = unsafe { libc::geteuid() };
+        remove_left_of(&old, me ^ 1, me);
+        assert!(left.join("s").exists(), "another user's pointer file");
+        remove_left_of(&old, me, me);
+        assert!(!left.exists(), "this user's own: socket and directory go");
     }
 
     #[test]
