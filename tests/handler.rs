@@ -587,6 +587,40 @@ fn wait_for_a_writer_on(part: &Path) {
     std::thread::sleep(Duration::from_millis(200));
 }
 
+#[test]
+fn a_pop_whose_answer_a_stop_cuts_off_gets_its_row_put_back_on_the_files() {
+    // A stop gives a pop's answer FINISH to be read, then cuts its connection off: the stop has
+    // closed the engine by then, so the handler puts the row back on the files, as any other
+    // writer, before `serve` ends (0.2.3 printed the row on standard error and left it deleted).
+    let dir = tempfile::tempdir().unwrap();
+    // More than a socket's buffer holds (about 200 KiB on Linux, 8 KiB on macOS): the answer waits.
+    let big = "v".repeat(4 << 20);
+    let s = store(dir.path(), &format!("a\t{big}\nb\t2\n"));
+    let mut served = Served::start(&s, &[]);
+    let mut conn = connect(&s).unwrap();
+    conn.write_all(b"pop\ta\n").unwrap();
+    // The tombstone is written before the answer, which this client never reads.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read(&s).unwrap().ends_with(b"\na\n") {
+        assert!(
+            Instant::now() < deadline,
+            "the pop's tombstone was never written"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    served.signal(libc::SIGTERM);
+    assert_eq!(served.wait(), 0, "{}", served.stderr());
+    let said = served.stderr();
+    assert!(
+        said.contains("could not be written") && said.contains("it was put back"),
+        "{said}"
+    );
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    assert_eq!(left.get("a").map(|r| r.to_vec()), Some(vec![big]));
+    assert!(left.get("b").is_some());
+    drop(conn);
+}
+
 /// Wait until the handler has begun to stop (it says why on its standard error).
 fn wait_until_stopping(served: &Served) {
     let deadline = Instant::now() + Duration::from_secs(10);

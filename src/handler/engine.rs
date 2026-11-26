@@ -875,6 +875,51 @@ impl Engine {
         Engine::answer(result, said)
     }
 
+    /// Put back the row a `pop` or `popitem` took, whose answer could not be written: `req` is the
+    /// `setdefault` of it, which keeps a row written for its key since. Through the engine while it
+    /// serves; once it is closed (a stop has written its queue and ended its writer), on the files,
+    /// as any other writer of them, and synced: the stop's last write.
+    pub(crate) fn put_back(&self, req: &Request) -> Response {
+        let response = self.handle(req, None);
+        // Closed before the request (or after it failed: the files are then tried once more).
+        if response.status == 0 || !lock(&self.state).closed {
+            return response;
+        }
+        let (key, values) = (&req.args[0], &req.args[1..]);
+        let options = Options {
+            scope: Scope::Keys(vec![key.clone()]),
+            ..Engine::options(&Arc::default(), &self.log)
+        };
+        let put = || {
+            let store = match Store::open(&self.path, options) {
+                Ok(store) => Some(store),
+                Err(Error::Missing(_)) => None,
+                Err(e) => return Err(e),
+            };
+            Ok(
+                match ops::setdefault(store.as_ref(), self.format, key, values) {
+                    Plan::Show { key, cells } => Engine::row(&key, &cells),
+                    Plan::Put {
+                        key,
+                        cells,
+                        record,
+                        member_size,
+                    } => {
+                        Writer::open(&self.path)?
+                            .warnings(self.log.clone())
+                            .member_size(member_size as usize)
+                            .fsync(true)
+                            .append(std::slice::from_ref(&record))?;
+                        Engine::row(&key, &cells)
+                    }
+                    // (setdefault exits only for a store it could not read whole)
+                    Plan::Exit(_) | Plan::Take { .. } => Response::failed(1, INCOMPLETE),
+                },
+            )
+        };
+        Engine::answer(put(), Vec::new())
+    }
+
     /// Make every acknowledged write durable (`stop`, §21.9.3): an error when one was lost, now or
     /// before (a failed batch of writes answered before they were made, a failed sync).
     pub fn flush(&self) -> Result<(), Error> {

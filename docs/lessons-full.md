@@ -343,3 +343,15 @@ entries go last, in the same commit as the change:
   and a request that fails to parse is answered before that, in the connection's loop.
 - Lesson: a word that every answer must carry is added where every answer is made, not where most of them are: an
   answer made on a path of its own (a refusal before the work) is the one that goes without it.
+
+## 2026-11-25 A stopping handler puts a popped row back on the files
+- Changed: when a pop's answer cannot be written once a stop has closed the engine (a client that does not read it
+  is cut off after the stop's second window; one that hung up), the handler puts the row back with `setdefault` on
+  the files, as any other writer, synced, and `serve` ends after it. 0.2.2 and 0.2.3 printed the row on `serve`'s
+  standard error and left it deleted.
+- Why we had to change: the answer the stop cut off was the row's only copy (0.2.2's final review, the third window
+  of the pop's lost row).
+- Original design was wrong because: the put-back went through the engine alone, and the stop closes the engine
+  before it waits for the pops' answers, so the put-backs the stop itself causes had no writer left.
+- Lesson: when a shutdown can cause the failure that a repair handles, leave the repair a way to write after the
+  shutdown's own writer has closed (as any other writer of the files would), and end the shutdown after it.

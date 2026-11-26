@@ -73,23 +73,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A routed `pop` or `popitem` can lose its row when its answer does not arrive
 - Kind: deferred
-- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. Three windows
+- What the operator sees: the handler deletes the row, then writes its answer, the row's only copy. Two windows
   are left. (1) The handler's process dies (killed, out of memory) after the deletion is written and before the
   answer is: the row is gone and the command exits 1 (`lost the handler`), naming no row. (2) The answer is
-  written and never read (the command is killed in between): the row is gone. (3) The answer cannot be written
-  while the handler stops (the client left, or does not read a large answer): the row is not put back, and is
-  printed on `serve`'s standard error. When the answer cannot be written while the handler serves (the client hung
-  up, or gave up waiting), the handler puts the row back (0.2.2; 0.2.1 lost it), unless a row was written for its
-  key since, which stays (the row taken is then printed on `serve`'s standard error).
+  written and never read (the command is killed in between): the row is gone. When the answer cannot be written
+  (the client hung up, gave up waiting, or did not read it before a stop cut it off), the handler puts the row
+  back (0.2.2 while it serves, 0.2.4 also while it stops, on the files; 0.2.1 lost it), unless a row was written
+  for its key since, which stays (the row taken is then printed on `serve`'s standard error).
 - Why: the pop is delete, then answer; a written answer is all the handler can see.
-- Revisit when: 0.2.4, with the TSVZ session. (3): when the engine is closed, the connection thread makes the
-  `setdefault` on the files, and `serve` joins it before it returns; the stop's order stays. (1) and (2): a client
-  acknowledgement for `pop` and `popitem` (§21.7, beside §21.9), which both tools' handlers and clients take up
-  together, with the deletion written after the acknowledgement (a handler that dies before it then leaves the row;
-  one that dies after it and before the deletion leaves a row that was delivered); or accept (1) and (2) as a
-  known limitation (the user's OK).
-- Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write); a
-  deferral under the user's standing rule that deferrals are noted, not asked.
+- Revisit when: TSVZ 5.19 resumes, with the TSVZ session: a client acknowledgement for `pop` and `popitem` (§21.7,
+  beside §21.9), which both tools' handlers and clients take up together, with the deletion written after the
+  acknowledgement (a handler that dies before it then leaves the row; one that dies after it and before the
+  deletion leaves a row that was delivered); or accept (1) and (2) as a known limitation (the user's OK).
+- Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write) and
+  in 0.2.4 (the put-back during a stop, on the files); a deferral under the user's standing rule that deferrals
+  are noted, not asked.
 
 ### A scrub of a loose file can change what a strict TSVZ.py reader reads: a row under `#_defaults_#` that hold a value, or the order of its keys
 - Kind: deferred
