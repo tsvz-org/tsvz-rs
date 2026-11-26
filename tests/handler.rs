@@ -562,11 +562,18 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
 /// fixed time). Linux lists it in /proc/locks (`->`: a lock waited for, on the file's inode); macOS
 /// has no such list, and there the test waits 200 ms, as these tests did before.
 fn wait_for_a_writer_on(part: &Path) {
+    // 10 s: how long `Served::start` gives a process to start.
+    wait_for_a_writer_within(part, Duration::from_secs(10), Duration::from_millis(200));
+}
+
+/// [`wait_for_a_writer_on`] for a writer that comes later: `within` is how long Linux waits for
+/// it, `otherwise` the time macOS, with no list to look in, sleeps.
+fn wait_for_a_writer_within(part: &Path, within: Duration, otherwise: Duration) {
     #[cfg(target_os = "linux")]
     {
+        let _ = otherwise;
         let inode = format!(":{} ", fs::metadata(part).unwrap().ino());
-        // 10 s: how long `Served::start` gives a process to start.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + within;
         loop {
             let locks = fs::read_to_string("/proc/locks").unwrap();
             if locks
@@ -585,8 +592,8 @@ fn wait_for_a_writer_on(part: &Path) {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = part; // no list to find its writer in
-        std::thread::sleep(Duration::from_millis(200));
+        let _ = (part, within); // no list to find its writer in
+        std::thread::sleep(otherwise);
     }
 }
 
@@ -602,15 +609,7 @@ fn a_pop_whose_answer_a_stop_cuts_off_gets_its_row_put_back_on_the_files() {
     let mut served = Served::start(&s, &[]);
     let mut conn = connect(&s).unwrap();
     conn.write_all(b"pop\ta\n").unwrap();
-    // The tombstone is written before the answer, which this client never reads.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !fs::read(&s).unwrap().ends_with(b"\na\n") {
-        assert!(
-            Instant::now() < deadline,
-            "the pop's tombstone was never written"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_for_the_tombstone_of_a(&s); // written before the answer, which this client never reads
     served.signal(libc::SIGTERM);
     assert_eq!(served.wait(), 0, "{}", served.stderr());
     let said = served.stderr();
@@ -621,6 +620,66 @@ fn a_pop_whose_answer_a_stop_cuts_off_gets_its_row_put_back_on_the_files() {
     let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
     assert_eq!(left.get("a").map(|r| r.to_vec()), Some(vec![big]));
     assert!(left.get("b").is_some());
+    drop(conn);
+}
+
+/// Wait until the file of the store `s` ends with the tombstone of `a`.
+fn wait_for_the_tombstone_of_a(s: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read(s).unwrap().ends_with(b"\na\n") {
+        assert!(
+            Instant::now() < deadline,
+            "the pop's tombstone was never written"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_stop_returns_only_once_the_row_of_a_pop_it_cut_off_is_put_back() {
+    // The pointer file goes after the put-backs, and `tsvz stop` waits for it: here the put-back
+    // waits for the part's lock, held by the test, and the stop must wait with it (0.2.4's
+    // build removed the pointer file first, so `tsvz stop` returned, and a new `serve` could
+    // start, with the put-back still to be written: the row, or a write acknowledged since, could
+    // be lost or overwritten).
+    let dir = tempfile::tempdir().unwrap();
+    let big = "v".repeat(4 << 20); // more than a socket's buffer holds: the answer waits
+    let s = store(dir.path(), &format!("a\t{big}\nb\t2\n"));
+    let mut served = Served::start(&s, &[]);
+    let mut conn = connect(&s).unwrap();
+    conn.write_all(b"pop\ta\n").unwrap();
+    wait_for_the_tombstone_of_a(&s);
+    let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
+    let held = tsvz::lock::lock(&part).unwrap();
+    let mut stop = tsvz()
+        .current_dir(dir.path())
+        .args(["stop", "s.tsvz"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // FINISH after the stop began, the answer the client does not read is cut off, and the
+    // put-back waits for the lock (10 s more: a host busy enough to need them).
+    wait_for_a_writer_within(
+        &s,
+        tsvz::handler::server::FINISH + Duration::from_secs(10),
+        tsvz::handler::server::FINISH + Duration::from_secs(1),
+    );
+    std::thread::sleep(Duration::from_millis(300)); // a stop that did not wait would be back by now
+    assert!(
+        stop.try_wait().unwrap().is_none(),
+        "`tsvz stop` returned with the put-back still to be written"
+    );
+    assert!(pointer::path_of(&s).exists(), "the pointer file went first");
+    drop(held);
+    let stop = stop.wait_with_output().unwrap();
+    assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
+    // The row is back by the time `tsvz stop` returns, not only once `serve` has ended.
+    let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
+    assert_eq!(left.get("a").map(|r| r.to_vec()), Some(vec![big]));
+    assert!(left.get("b").is_some());
+    assert_eq!(served.wait(), 0, "{}", served.stderr());
     drop(conn);
 }
 
