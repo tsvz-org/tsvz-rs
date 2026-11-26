@@ -1238,6 +1238,29 @@ fn a_stale_pointer_is_taken_over() {
     assert_eq!(ask(&s, "len").lines, ["1"]);
 }
 
+#[test]
+fn a_serve_that_takes_over_from_a_killed_one_removes_the_socket_it_left() {
+    // A handler killed (SIGKILL) runs no clean-up: its socket and the directory made for it stay,
+    // until the next `serve` of the store takes over its pointer file (0.2.3 left them for good).
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), "k\tv\n");
+    let mut killed = Served::start(&s, &[]);
+    let info = pointer::lookup(&s).unwrap().unwrap();
+    let socket = PathBuf::from(&info.address["unix:".len()..]);
+    killed.signal(libc::SIGKILL);
+    assert_eq!(killed.wait(), -1, "killed");
+    assert!(socket.exists(), "left by the handler that was killed");
+    let mut next = Served::start(&s, &[]);
+    assert!(
+        !socket.parent().unwrap().exists(),
+        "the socket directory is removed"
+    );
+    assert_eq!(ask(&s, "len").lines, ["1"]);
+    let stop = run(dir.path(), &["stop", "s.tsvz"], b"");
+    assert_eq!(stop.status.code(), Some(0), "{}", text(&stop.stderr));
+    assert_eq!(next.wait(), 0, "{}", next.stderr());
+}
+
 fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }

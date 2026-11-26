@@ -355,3 +355,15 @@ entries go last, in the same commit as the change:
   before it waits for the pops' answers, so the put-backs the stop itself causes had no writer left.
 - Lesson: when a shutdown can cause the failure that a repair handles, leave the repair a way to write after the
   shutdown's own writer has closed (as any other writer of the files would), and end the shutdown after it.
+
+## 2026-11-25 A serve that takes over from a killed handler removes the socket it left
+- Changed: a `serve` that takes over a pointer file no process holds (its handler was killed) removes the socket the
+  file names, and then the directory made for it if empty, when the socket is this user's, on this host, named `s`
+  in a `tsvz-` directory, and nobody listens on it (a connection to it is refused). 0.2.3 left both for good, under
+  `$XDG_RUNTIME_DIR` or the temporary directory.
+- Why we had to change: each handler that was killed left a directory behind (0.2.2's build).
+- Original design was wrong because: the clean-up was in the handler's own stop, and a killed process runs none; the
+  one that learns the handler is gone is the next one to take over its pointer file.
+- Lesson: leave the clean-up of what a killed process made to whoever next finds it dead by the kernel's word (its
+  lock let go of), and remove only what that process's own layout makes and the system shows unused (a refused
+  connection), since the record that names it is a file others can write.

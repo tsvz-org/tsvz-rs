@@ -99,16 +99,21 @@ fn read(
             path.display()
         ));
     }
-    let text = String::from_utf8_lossy(&data);
+    Ok(Some((parse(&data), meta)))
+}
+
+/// The fields of a pointer file's bytes; None when it is not a pointer file of protocol 1.
+fn parse(data: &[u8]) -> Option<HashMap<String, String>> {
+    let text = String::from_utf8_lossy(data);
     let mut lines = text.split('\n');
     if lines.next() != Some(MAGIC) {
-        return Ok(Some((None, meta)));
+        return None;
     }
     let fields = lines
         .filter_map(|line| line.split_once('\t'))
         .map(|(name, value)| (name.to_string(), decode(value)))
         .collect();
-    Ok(Some((Some(fields), meta)))
+    Some(fields)
 }
 
 /// What a trusted pointer file says.
@@ -481,8 +486,8 @@ pub struct Held {
 }
 
 /// Take over the pointer file of `store` (§21.2.3): busy when another handler holds its lock;
-/// a stale one is removed, never written into, and a new one created exclusively without
-/// following a link, mode 0600 until it is published.
+/// a stale one is removed, never written into, with the socket its handler left ([`remove_left`]),
+/// and a new one created exclusively without following a link, mode 0600 until it is published.
 pub fn take(store: &Path) -> Result<Held, Take> {
     let path = path_of(store);
     let other = |e: io::Error| Take::Other(format!("{}: {e}", path.display()));
@@ -507,6 +512,7 @@ pub fn take(store: &Path) -> Result<Held, Take> {
             return Err(busy(&path));
         }
         if names(&path, old) {
+            remove_left(old);
             std::fs::remove_file(&path).map_err(other)?;
         }
     }
@@ -530,6 +536,52 @@ pub fn take(store: &Path) -> Result<Held, Take> {
             let _ = std::fs::remove_file(&path);
             Err(other(e))
         }
+    }
+}
+
+/// Remove the socket that the handler of the stale pointer file `old` left (a handler that is
+/// killed removes nothing), and the directory made for it, if then empty. Only a socket of this
+/// user's, on this host, named `s` in a directory named `tsvz-…` (both tools make their sockets
+/// so) that nobody listens on (a connection to it is refused): whatever else a pointer file names
+/// stays, a handler's that still serves too (a copy of its store's directory holds its pointer).
+fn remove_left(old: &File) {
+    let mut data = Vec::new();
+    if Read::by_ref(&mut &*old)
+        .take(SIZE_LIMIT + 1)
+        .read_to_end(&mut data)
+        .is_err()
+    {
+        return;
+    }
+    let Some(fields) = parse(&data) else {
+        return;
+    };
+    let (Some(address), Some(host)) = (fields.get("address"), fields.get("host")) else {
+        return;
+    };
+    let Some(socket) = address.strip_prefix("unix:").map(Path::new) else {
+        return;
+    };
+    let Some(dir) = socket.parent() else {
+        return;
+    };
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: geteuid only reads the process's user id.
+    let me = unsafe { libc::geteuid() };
+    let ours = *host == hostname()
+        && socket.file_name() == Some("s".as_ref())
+        && dir
+            .file_name()
+            .is_some_and(|name| name.as_bytes().starts_with(b"tsvz-"))
+        && std::fs::symlink_metadata(socket)
+            .is_ok_and(|m| m.file_type().is_socket() && m.uid() == me);
+    let refused = || {
+        connect_within(socket, Duration::ZERO)
+            .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
+    };
+    if ours && refused() {
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_dir(dir);
     }
 }
 
@@ -687,6 +739,59 @@ mod tests {
             text("unix:/gone", &hostname())
         );
         held.release();
+    }
+
+    #[test]
+    fn a_stale_pointer_s_dead_socket_goes_with_it_and_nothing_else_it_names() {
+        // A handler that is killed leaves its socket and the directory it made for it: the next
+        // one to take over its pointer file removes them (0.2.3 left them), and nothing else a
+        // pointer file can name: a socket someone listens on, another file, another layout, a
+        // socket named for another host.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // A socket nobody listens on any more, in a directory of its own.
+        let left = |name: &str| {
+            let d = dir.path().join(name);
+            fs::create_dir(&d).unwrap();
+            drop(UnixListener::bind(d.join("s")).unwrap());
+            d
+        };
+        let host = hostname();
+        let taken = |address: String, host: &str| {
+            plant(&s, &text(&address, host), 0o600);
+            take(&s).unwrap().release();
+        };
+        let dead = left("tsvz-a1B2c3");
+        taken(format!("unix:{}", dead.join("s").display()), &host);
+        assert!(
+            !dead.exists(),
+            "the dead handler's socket and directory are gone"
+        );
+        // Someone listens: it stays.
+        let live = dir.path().join("tsvz-live01");
+        fs::create_dir(&live).unwrap();
+        let _listener = UnixListener::bind(live.join("s")).unwrap();
+        taken(format!("unix:{}", live.join("s").display()), &host);
+        assert!(live.join("s").exists(), "a socket someone listens on stays");
+        // Not a socket.
+        let file = dir.path().join("tsvz-file01");
+        fs::create_dir(&file).unwrap();
+        fs::write(file.join("s"), "keep").unwrap();
+        taken(format!("unix:{}", file.join("s").display()), &host);
+        assert_eq!(fs::read_to_string(file.join("s")).unwrap(), "keep");
+        // Another layout: the directory, or the socket's name.
+        let other = left("mine");
+        taken(format!("unix:{}", other.join("s").display()), &host);
+        assert!(other.join("s").exists());
+        let named = dir.path().join("tsvz-name01");
+        fs::create_dir(&named).unwrap();
+        drop(UnixListener::bind(named.join("sock")).unwrap());
+        taken(format!("unix:{}", named.join("sock").display()), &host);
+        assert!(named.join("sock").exists());
+        // Named for another host: not this host's socket.
+        let far = left("tsvz-far001");
+        taken(format!("unix:{}", far.join("s").display()), "elsewhere");
+        assert!(far.join("s").exists());
     }
 
     #[test]
