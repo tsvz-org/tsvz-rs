@@ -112,3 +112,28 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 0.2.5.
 - Noted: 2026-11-25, in 0.2.4's re-read (the step back after the second finding in the part); a deferral under the
   user's standing rule that deferrals are noted, not asked.
+
+### A loose scrub does not follow a TSVZ.py reader given a one-column header for a multi-column file
+- Kind: known limitation
+- What the operator sees: a TSVZ.py program that reads a multi-column loose file through a header of one cell (or
+  through a header line 1 does not hold, when the first keyed line after line 1 is a key alone) can, after a scrub,
+  lose the keys the command line reads as deleted. Measured on random files: 3,112 of 4,129 such files read
+  otherwise given line 1's header, and 10,274 of 13,494 given another; 0.2.3 changed 3,206 and 10,294, and TSVZ.py's
+  own scrub changes them too.
+- Why: that reader reads every key ever written as a row, so following it would let the scrub remove nothing (a
+  399,981-line queue file stayed 399,981 lines). Only the line that sets its column count stays.
+- Revisit when: someone reads a loose file that way.
+- Approved: chief's decision C250, 2026-11-25 (not the user's words; the user may reverse it: "leave the
+  one-column-header reader an open finding").
+
+### A loose scrub does not follow a strict TSVZ.py reader told its own column count or defaults, or a last-line read
+- Kind: known limitation
+- What the operator sees: a strict TSVZ.py reader given its own column count or its own defaults, or a
+  `lastLineOnly` read, can read a scrubbed loose file otherwise. Measured on random files: with its own column count
+  12.7% (0.2.3 15.6%, TSVZ.py's own scrub 11.9%), with its own defaults 5.2% (0.2.3 10.3%, TSVZ.py 6.1%), a
+  `lastLineOnly` read 20.8% (0.2.3 23.4%, TSVZ.py 25.1%).
+- Why: each column count would be a reader of its own for the scrub to follow, and a last-line read is positional,
+  so following them leaves little to remove.
+- Revisit when: a user of such a reader appears.
+- Approved: chief's decision C251, 2026-11-25 (not the user's words; the user may reverse it: "leave the
+  strict-reader scrub cases open findings").
