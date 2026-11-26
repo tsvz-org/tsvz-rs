@@ -337,171 +337,373 @@ fn ended(raw: &[u8]) -> Box<[u8]> {
     }
 }
 
-/// The lines that set a loose file's column count, as a rewrite pins them: the first keyed line
-/// (read as something, [`parse`]), and the first after line 1, which a reader that takes line 1
-/// for its header counts from; and line 1.
+/// The line that sets a loose file's column count, as `clear` and a one-column `delete` count it:
+/// the first keyed line (read as something, [`parse`]).
 #[derive(Default)]
 struct Pins {
     n: usize,
     width_line: Option<usize>,
-    after_first: Option<usize>,
     one: bool,
-    /// The column count, the cells of the first keyed line.
-    width: usize,
 }
 
 impl Pins {
-    /// Count the next line, of `cells` cells when it is read as something: its number, and
-    /// whether it is pinned.
-    fn next(&mut self, cells: Option<usize>) -> (usize, bool) {
+    /// Count the next line, of `cells` cells when it is read as something: its number.
+    fn next(&mut self, cells: Option<usize>) -> usize {
         let i = self.n;
         self.n += 1;
-        if let Some(cells) = cells {
-            if self.width_line.is_none() {
-                self.width_line = Some(i);
-                self.one = cells == 1;
-                self.width = cells;
+        if let (Some(cells), None) = (cells, self.width_line) {
+            self.width_line = Some(i);
+            self.one = cells == 1;
+        }
+        i
+    }
+}
+
+/// How many readers a scrub follows ([`READERS`]).
+const N: usize = 5;
+
+/// A reader of a loose file, as far as a rewrite follows it: TSVZ.py 5.18's `_processLine` for one
+/// line, less the cells. It tells which lines the reader applies, as a row of their key or as its
+/// deletion, by its own column count and `#_defaults_#` state, which decide that.
+#[derive(Clone, Copy)]
+struct Reader {
+    /// It drops a line that holds a value and is narrower than its column count, while no
+    /// `#_defaults_#` cell that holds a value is in force (`readTSV(strict=True)`).
+    strict: bool,
+    /// It takes line 1 for its header, and reads from line 2.
+    header: bool,
+    /// Its header is the one line 1 holds, so its column count is line 1's cells
+    /// (`_headerCellsMatch`); any other reader's is that of the first keyed line it reads.
+    matched: bool,
+    /// Its column count, once set.
+    count: Option<usize>,
+    /// `#_defaults_#` cells that hold a value are in force (`any(defaults[1:])`).
+    active: bool,
+}
+
+/// What a reader needs of a keyed line ([`Split`]).
+#[derive(Clone, Copy)]
+struct Shape {
+    /// Its cells, its key's included.
+    cells: usize,
+    /// Its cells after the key are none or all empty ([`Split::valueless`]).
+    valueless: bool,
+    /// Its key is `#_defaults_#`.
+    defaults: bool,
+}
+
+impl Shape {
+    fn of(line: &Split<'_>) -> Shape {
+        Shape {
+            cells: line.count(),
+            valueless: line.valueless(),
+            defaults: line.key == DEFAULTS,
+        }
+    }
+}
+
+/// What a reader does with a keyed line: nothing (it drops it, or it is a `#_defaults_#` line), or
+/// it applies it to its key, as a row or as the key's deletion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    No,
+    Row,
+    Delete,
+}
+
+impl Reader {
+    const fn new(strict: bool, header: bool, matched: bool) -> Reader {
+        Reader {
+            strict,
+            header,
+            matched,
+            count: None,
+            active: false,
+        }
+    }
+
+    /// The reader before line 1 of a file, `raw`: a header that line 1 holds has as many cells.
+    fn start(&mut self, raw: &[u8], d: u8) {
+        if self.matched {
+            self.count = Some(1 + memchr::memchr_iter(d, raw).count());
+        }
+    }
+
+    /// What the reader does with the keyed line `i`, of shape `s`, and whether that line set its
+    /// column count.
+    fn line(&mut self, i: usize, s: Shape) -> (Applied, bool) {
+        if self.header && i == 0 {
+            return (Applied::No, false); // its header
+        }
+        let counted = self.count.is_none();
+        let count = *self.count.get_or_insert(s.cells);
+        let applied = if s.valueless {
+            if count == 1 {
+                Applied::Row // a key alone is a row in a one-column file, `#_defaults_#` too
+            } else if s.defaults {
+                self.active = false; // a reset
+                Applied::No
+            } else {
+                Applied::Delete
             }
-            if i > 0 && self.after_first.is_none() {
-                self.after_first = Some(i);
+        } else if self.strict && s.cells < count && !self.active {
+            Applied::No // a strict reader drops a narrower line
+        } else if s.defaults {
+            self.active = true;
+            Applied::No
+        } else {
+            Applied::Row
+        };
+        (applied, counted)
+    }
+}
+
+/// The readers whose readings a scrub keeps, in this order: the command line's (both tools': lenient,
+/// no header; TSVZ.py's lenient library read too); TSVZ.py's strict library read (`readTSV`'s
+/// default); a lenient one given the header line 1 holds (TSVZ.py's `--x-header` and `TSVZed` too);
+/// a lenient one given another header; a strict one given the header line 1 holds. A strict one
+/// given another header raises, so it reads nothing.
+const READERS: [Reader; N] = [
+    Reader::new(false, false, false),
+    Reader::new(true, false, false),
+    Reader::new(false, true, true),
+    Reader::new(false, true, false),
+    Reader::new(true, true, true),
+];
+
+/// A key to one reader: its last deletion of the key, and the first and the last line it read as a
+/// row of the key since (the key's place among the keys, and its value); `usize::MAX` for none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Life {
+    deleted: usize,
+    first: usize,
+    last: usize,
+}
+
+impl Life {
+    /// A key the reader applied no line of.
+    const NONE: Life = Life {
+        deleted: usize::MAX,
+        first: usize::MAX,
+        last: usize::MAX,
+    };
+
+    /// The first and the last line the reader read as a row of the key since its last deletion.
+    fn rows(&self) -> Option<(usize, usize)> {
+        (self.first != usize::MAX).then_some((self.first, self.last))
+    }
+
+    /// The reader applied line `i` to the key; whether it held a row of the key already.
+    fn apply(&mut self, applied: Applied, i: usize) -> bool {
+        match applied {
+            Applied::Row => {
+                let again = self.first != usize::MAX;
+                self.first = self.first.min(i);
+                self.last = i;
+                again
+            }
+            Applied::Delete => {
+                *self = Life {
+                    deleted: i,
+                    ..Life::NONE
+                };
+                false
+            }
+            Applied::No => false,
+        }
+    }
+}
+
+/// A key to the readers: one life each, readers that did the same with every line of the key
+/// sharing one, so that while all did (nearly every key) there is one.
+enum Lives {
+    Same(Life),
+    /// Reader `r`'s life is `lives[of[r]]`; reader 0's is the first.
+    Apart {
+        of: [u8; N],
+        lives: Box<[Life]>,
+    },
+}
+
+impl Lives {
+    /// The lives, each once.
+    fn all(&self) -> &[Life] {
+        match self {
+            Lives::Same(life) => std::slice::from_ref(life),
+            Lives::Apart { lives, .. } => lives,
+        }
+    }
+
+    /// Reader `r` applied line `i` as `applied[r]` says; whether one held a row of the key already.
+    fn apply(&mut self, applied: &[Applied; N], i: usize) -> bool {
+        let of = match self {
+            Lives::Same(life) if applied.iter().all(|a| *a == applied[0]) => {
+                return life.apply(applied[0], i);
+            }
+            Lives::Same(_) => [0; N],
+            Lives::Apart { of, .. } => *of,
+        };
+        // Readers that shared a life go on sharing one where they do the same with this line.
+        let mut shared = [(0, Applied::No); N];
+        let mut lives = [Life::NONE; N];
+        let mut new_of = [0; N];
+        let mut n = 0;
+        for ((&was, &a), slot) in of.iter().zip(applied).zip(&mut new_of) {
+            *slot = match shared[..n].iter().position(|s| *s == (was, a)) {
+                Some(c) => c as u8,
+                None => {
+                    shared[n] = (was, a);
+                    lives[n] = self.all()[usize::from(was)];
+                    n += 1;
+                    n as u8 - 1
+                }
+            };
+        }
+        let mut again = false;
+        for (life, (_, a)) in lives.iter_mut().zip(shared).take(n) {
+            again |= life.apply(a, i);
+        }
+        match self {
+            // As many lives as before: the same readers share each.
+            Lives::Apart { lives: was, .. } if was.len() == n => was.copy_from_slice(&lives[..n]),
+            _ => {
+                *self = Lives::Apart {
+                    of: new_of,
+                    lives: lives[..n].into(),
+                }
             }
         }
-        (i, self.pinned(i))
-    }
-
-    /// Whether line `i`, already counted, is pinned.
-    fn pinned(&self, i: usize) -> bool {
-        i == 0 || Some(i) == self.width_line || Some(i) == self.after_first
+        again
     }
 }
 
-/// What the first read of a scrub keeps of a key: the line of a key seen once (and whether a strict
-/// reader takes it, [`ScrubPlan`]), or its lines so far.
-enum KeyLines {
-    Once(usize, bool),
-    More(Box<Run>),
+/// What the first read keeps of a key: the line of a key that every reader read as a row and that
+/// has no other line (most keys of a file of keys written once), or its [`Lines`].
+enum Key {
+    Row(usize),
+    More(Box<Lines>),
 }
 
-/// A key's lines so far ([`ScrubPlan`]).
-#[derive(Default)]
-struct Run {
-    /// A pinned line of the key so far.
-    pinned: bool,
-    /// Its last deletion, and whether a pinned line of the key lies before it.
-    last_delete: Option<(usize, bool)>,
-    /// The key's lines after its last deletion: the first and the last, each with its count of
-    /// delimiters; whether a pinned line, or a `#_defaults_#` line, follows the first; and the
-    /// last line's bytes when it is not the first.
-    first: Option<(usize, usize)>,
-    last: (usize, usize),
-    pinned_after_first: bool,
-    defaults_between: bool,
+/// A key's lives, and the last line a reader read as a row of the key again, as the file has it.
+struct Lines {
+    lives: Lives,
     last_raw: Option<Box<[u8]>>,
-    /// The last of those lines that a strict reader takes ([`ScrubPlan`]).
-    taken: Option<usize>,
 }
 
-impl Run {
-    /// The key's line `i` deletes it: the lines after it begin a new run.
-    fn delete(&mut self, i: usize, pinned: bool) {
-        self.last_delete = Some((i, self.pinned));
-        self.first = None;
-        self.last_raw = None;
-        self.taken = None;
-        self.pinned |= pinned;
+impl Key {
+    fn lines(&mut self) -> &mut Lines {
+        if let Key::Row(first) = *self {
+            *self = Key::More(Box::new(Lines {
+                lives: Lives::Same(Life {
+                    first,
+                    last: first,
+                    ..Life::NONE
+                }),
+                last_raw: None,
+            }));
+        }
+        match self {
+            Key::More(lines) => lines,
+            Key::Row(_) => unreachable!("made above"),
+        }
     }
 }
 
-/// The first read of a loose `scrub`: what it keeps of each line, and each live key's latest line,
-/// so that the second read writes the kept lines as it reads them (memory follows the keys, not
-/// the lines). Comments, empty lines, superseded lines and dead keys' lines go; line 1, every
-/// `#_defaults_#` line, the lines that set the column count, and for each live key the line that
-/// places it and the one that gives its value stay. A key's value line takes the place of its
-/// first line when no `#_defaults_#` line (which changes how a reader fills a row) and no other
-/// line of the key kept lies between them, and that place is not line 1 (unless the two lines are
-/// the same) nor a line that sets the column count (unless the two have as many cells). A reader
-/// (tsvz-rs, and TSVZ.py as its command line reads, given no header) reads the result as the file;
-/// line 1, and the first keyed line after it, stay for a TSVZ.py program that takes line 1 for its
-/// header. So does TSVZ.py's strict reader (`readTSV(strict=True)`, given no header), which skips
-/// a line that holds a value but is narrower than the column count: the last line of a key that it
-/// takes stays too, and the value line moves only when it is one it takes, or it takes none of the
-/// key's lines. (Not where a `#_defaults_#` line that holds a value is in force, and not always in
-/// the order of the keys it reads: docs/limitations.md.)
+/// A line kept whatever its key's lives: line 1 when it is keyed, and a line that set a reader's
+/// column count; with its key and its cells.
+struct Pin {
+    line: usize,
+    key: Box<str>,
+    cells: usize,
+}
+
+/// The first read of a loose `scrub`: each reader of [`READERS`] reads the lines by its own rule
+/// ([`Reader`]), and a line stays where a reader needs it, in its place and as the file has it:
+/// line 1; every `#_defaults_#` line; each line that sets a reader's column count (so that each
+/// line kept is read in the state it was read in); for each reader and key, the first and the last
+/// line it reads as a row of the key since its last deletion (the key's place among its keys, and
+/// its value); and a reader's last deletion of a key where a line of the key kept lies before it,
+/// which the deletion undoes. Comments, empty lines, keys of only whitespace and every other line
+/// go. One change of place: a key's last line takes the place of its first where every reader that
+/// reads a row of the key reads its first and its last there (to one that reads none the key stays
+/// gone), no `#_defaults_#` line lies between them, the first is not line 1, nor a line that sets
+/// a column count unless the two have as many cells, the last ends in a newline, and the key is not
+/// `#_defaults_#` (every such line stays where it is). Each reader then reads each key from lines
+/// read in the state they were read in, so as before. A header reader that reads at one column a
+/// file that the command line reads at more is not followed (it reads as a row every key ever
+/// written, so nothing could go): only the line that sets its column count stays. The second read
+/// writes the lines kept as it reads them, so memory follows the keys, not the lines: a key that
+/// every reader read once, as a row, is its line's number.
 pub(crate) struct ScrubPlan {
     d: u8,
-    pins: Pins,
-    /// Per line: its kind.
-    kinds: Vec<Kind>,
-    /// The delimiters of the pinned lines.
-    pinned_fields: Vec<(usize, usize)>,
-    first_raw: Vec<u8>,
-    last_defaults: Option<usize>,
-    keys: HashMap<Box<str>, KeyLines>,
+    readers: [Reader; N],
+    /// Per line: whether it stays whatever its key's lives (line 1, a pin, a `#_defaults_#` line).
+    keep: Vec<bool>,
+    pins: Vec<Pin>,
+    /// The `#_defaults_#` lines, in order.
+    defaults: Vec<usize>,
+    keys: HashMap<Box<str>, Key>,
 }
 
 impl ScrubPlan {
     pub(crate) fn new(d: u8) -> ScrubPlan {
         ScrubPlan {
             d,
-            pins: Pins::default(),
-            kinds: Vec::new(),
-            pinned_fields: Vec::new(),
-            first_raw: Vec::new(),
-            last_defaults: None,
+            readers: READERS,
+            keep: Vec::new(),
+            pins: Vec::new(),
+            defaults: Vec::new(),
             keys: HashMap::new(),
         }
     }
 
     /// The lines to keep, and the bytes to write in place of some of them.
     pub(crate) fn finish(&mut self) -> Kept {
-        let pins = &self.pins;
-        let mut keep: Vec<bool> = (0..self.kinds.len())
-            .map(|i| match self.kinds[i] {
-                Kind::Row | Kind::Delete => pins.pinned(i),
-                k => pins.pinned(i) || k != Kind::Skip,
-            })
-            .collect();
+        let mut keep = std::mem::take(&mut self.keep);
         let mut put = HashMap::new();
-        for key in std::mem::take(&mut self.keys).into_values() {
-            let run = match key {
-                KeyLines::Once(first, _) => {
-                    keep[first] = true;
+        for (name, key) in std::mem::take(&mut self.keys) {
+            let Lines { lives, last_raw } = match key {
+                Key::Row(i) => {
+                    keep[i] = true;
                     continue;
                 }
-                KeyLines::More(run) => run,
+                Key::More(lines) => *lines,
             };
-            // A pinned line of the key before its last deletion is undone by that deletion.
-            if let Some((at, true)) = run.last_delete {
-                keep[at] = true;
+            let lives = lives.all();
+            let mut first = usize::MAX;
+            for (a, l) in lives.iter().filter_map(Life::rows) {
+                keep[a] = true;
+                keep[l] = true;
+                first = first.min(a);
             }
-            let Some((first, first_fields)) = run.first else {
-                continue; // dead to both
+            let pinned_before = |at: usize| self.pins.iter().any(|p| p.line < at && p.key == name);
+            for life in lives.iter().filter(|x| x.deleted != usize::MAX) {
+                if first < life.deleted || pinned_before(life.deleted) {
+                    keep[life.deleted] = true;
+                }
+            }
+            let (Some(raw), Some((a, l))) = (last_raw, lives[0].rows()) else {
+                continue;
             };
-            let (last, last_fields) = run.last;
-            keep[first] = true;
-            keep[last] = true;
-            // The line a strict reader reads the key from, when that is not the last.
-            let taken = run.taken.filter(|&t| t != last);
-            if let Some(t) = taken {
-                keep[t] = true;
-            }
-            let Some(raw) = run.last_raw else {
-                continue; // one line
+            let after = self.defaults.partition_point(|&x| x <= a);
+            let defaults_between = self.defaults.get(after).is_some_and(|&x| x < l);
+            let as_wide = || {
+                let (text, terminated) = text_of(&raw);
+                let cells = split(&text, self.d, terminated).map_or(0, |s| s.count());
+                self.pins.iter().all(|p| p.line != a || p.cells == cells)
             };
-            if taken.is_some() {
-                continue; // kept last: moved before `t`, it would lose to `t` for a reader of a key's last line
-            }
-            if raw.last() != Some(&b'\n') {
-                continue; // an unterminated last line stays last: the end of a line is read otherwise
-            }
-            let fits = if first == 0 {
-                self.first_raw[..] == *raw.strip_suffix(b"\n").unwrap_or(&raw)
-            } else {
-                !pins.pinned(first) || first_fields == last_fields
-            };
-            if fits && !run.pinned_after_first && !run.defaults_between {
-                put.insert(first, raw);
-                keep[last] = false;
+            if a != 0
+                && a != l
+                && &*name != DEFAULTS
+                && lives
+                    .iter()
+                    .all(|x| x.rows().is_none_or(|rows| rows == (a, l)))
+                && !defaults_between
+                && raw.last() == Some(&b'\n')
+                && as_wide()
+            {
+                put.insert(a, raw);
+                keep[l] = false;
             }
         }
         Kept { keep, put }
@@ -511,74 +713,65 @@ impl ScrubPlan {
 impl Planner for ScrubPlan {
     fn line(&mut self, raw: &[u8]) {
         let d = self.d;
-        let (text, terminated) = text_of(raw);
-        let cells = parse(&text, d, terminated);
-        let f = cells.as_ref().map_or(0, |c| c.len() - 1);
-        let (i, pinned) = self.pins.next(cells.as_ref().map(Vec::len));
+        let i = self.keep.len();
         if i == 0 {
-            self.first_raw = raw.strip_suffix(b"\n").unwrap_or(raw).to_vec();
+            for reader in &mut self.readers {
+                reader.start(raw, d);
+            }
+        }
+        let (text, terminated) = text_of(raw);
+        let Some(line) = split(&text, d, terminated) else {
+            self.keep.push(i == 0);
+            return;
+        };
+        let s = Shape::of(&line);
+        let mut applied = [Applied::No; N];
+        let mut pinned = i == 0;
+        for (a, reader) in applied.iter_mut().zip(&mut self.readers) {
+            let (did, counted) = reader.line(i, s);
+            *a = did;
+            pinned |= counted;
+        }
+        // A header reader that reads at one column where the command line reads more is not
+        // followed: to the plan it reads as the command line, but for its column-count line.
+        let one = self.readers[0].count == Some(1);
+        let lenient = applied[0];
+        for (a, reader) in applied.iter_mut().zip(&self.readers) {
+            if reader.header && reader.count == Some(1) && !one {
+                *a = lenient;
+            }
         }
         if pinned {
-            self.pinned_fields.push((i, f));
+            self.pins.push(Pin {
+                line: i,
+                key: line.key.as_ref().into(),
+                cells: s.cells,
+            });
         }
-        // A strict reader skips a row narrower than the column count.
-        let taken = f + 1 >= self.pins.width;
-        let (k, key) = kind(cells, self.pins.one);
-        self.kinds.push(k);
-        match k {
-            Kind::Defaults => self.last_defaults = Some(i),
-            Kind::Row | Kind::Delete => {
-                let Some(lines) = self.keys.get_mut(&*key) else {
-                    let lines = if k == Kind::Row {
-                        KeyLines::Once(i, taken)
-                    } else {
-                        let mut run = Box::<Run>::default();
-                        run.delete(i, pinned);
-                        KeyLines::More(run)
-                    };
-                    self.keys.insert(key.into(), lines);
-                    return;
-                };
-                if let KeyLines::Once(first, first_taken) = *lines {
-                    // the cells of its line matter only where it is pinned
-                    let fields = self.pinned_fields.iter().find(|p| p.0 == first);
-                    let fields = fields.map_or(0, |p| p.1);
-                    *lines = KeyLines::More(Box::new(Run {
-                        pinned: self.pins.pinned(first),
-                        first: Some((first, fields)),
-                        last: (first, fields),
-                        taken: first_taken.then_some(first),
-                        ..Run::default()
-                    }));
-                }
-                let KeyLines::More(run) = lines else {
-                    unreachable!("made a run above")
-                };
-                if k == Kind::Delete {
-                    run.delete(i, pinned);
-                    return;
-                }
-                if taken {
-                    run.taken = Some(i);
-                }
-                if let Some((first, _)) = run.first {
-                    run.pinned_after_first |= pinned;
-                    run.defaults_between = self.last_defaults.is_some_and(|l| l > first);
-                    run.last = (i, f);
-                    match &mut run.last_raw {
-                        Some(last) if last.len() == raw.len() => last.copy_from_slice(raw),
-                        last => *last = Some(raw.into()),
-                    }
-                    run.pinned |= pinned;
-                } else {
-                    run.first = Some((i, f));
-                    run.last = (i, f);
-                    run.pinned_after_first = false;
-                    run.defaults_between = false;
-                    run.pinned |= pinned;
-                }
+        if s.defaults {
+            self.defaults.push(i);
+        }
+        self.keep.push(pinned || s.defaults);
+        let Some(key) = self.keys.get_mut(&*line.key) else {
+            let key = if applied.iter().all(|a| *a == Applied::Row) {
+                Key::Row(i)
+            } else {
+                let mut lives = Lives::Same(Life::NONE);
+                lives.apply(&applied, i);
+                Key::More(Box::new(Lines {
+                    lives,
+                    last_raw: None,
+                }))
+            };
+            self.keys.insert(line.key.as_ref().into(), key);
+            return;
+        };
+        let lines = key.lines();
+        if lines.lives.apply(&applied, i) {
+            match &mut lines.last_raw {
+                Some(last) if last.len() == raw.len() => last.copy_from_slice(raw),
+                last => *last = Some(raw.into()),
             }
-            Kind::Skip => {}
         }
     }
 }
@@ -690,7 +883,7 @@ impl Planner for ClearPlan {
         let (text, terminated) = text_of(raw);
         let parsed = parse(&text, d, terminated);
         let cells = parsed.as_ref().map(Vec::len);
-        let (i, _) = self.pins.next(cells);
+        let i = self.pins.next(cells);
         if Some(i) == self.pins.width_line {
             self.width_cells = cells.unwrap_or(1);
         }
@@ -790,7 +983,7 @@ impl Planner for WithoutPlan {
         let (text, terminated) = text_of(raw);
         let parsed = parse(&text, d, terminated);
         let cells = parsed.as_ref().map(Vec::len);
-        let (i, _) = self.pins.next(cells);
+        let i = self.pins.next(cells);
         let defaults = parsed.as_ref().is_some_and(|p| p[0] == DEFAULTS);
         let empty = parsed.as_deref().is_some_and(valueless);
         let (k, key) = kind(parsed, true);
@@ -1006,8 +1199,8 @@ mod tests {
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
                 "x\t0\nb\t1\ny\t5\nb\t\nb\t2\n",
             ),
-            // A line that sets the column count and a later one of the key that is pinned
-            // between its first and last lines keep their places: `a` still reads 2.
+            // Line 1 stays, and so does the first row of a key to a reader that takes line 1
+            // for its header (`a<TAB>2`, which also sets its column count).
             ("a\t1\na\t2\nb\t0\na\t1\n", "a\t1\na\t2\nb\t0\na\t1\n"),
             // Every line it keeps is as it was, its `\r` too.
             (
@@ -1019,8 +1212,10 @@ mod tests {
                 "#h\n#_defaults_#x\t1\n#_defaults_#x\t2\n",
                 "#h\n#_defaults_#x\t2\n",
             ),
-            // One column: a key alone is a row.
-            ("a\nb\t1\na\n", "a\nb\t1\n"),
+            // One column: a key alone is a row. A reader given the header `a` reads line 3 as
+            // the row `a` (0.2.3 dropped it, and that reader lost `a`), and one given another
+            // header, which counts two columns from `b<TAB>1`, as a deletion.
+            ("a\nb\t1\na\n", "a\nb\t1\na\n"),
             ("#h\na\nb\nc\nb\n", "#h\na\nb\nc\n"),
             // A key is read without the whitespace at its end, so `a ` is `a`; a byte-order mark
             // is part of line 1's key.
@@ -1032,10 +1227,13 @@ mod tests {
             ("#h\na\t1\nb\t2\na\tx\0", "#h\na\t1\nb\t2\na\tx\0"),
             ("#h\na\t1\nb\t2", "#h\na\t1\nb\t2"),
             ("#h\nb\t2\na\t1\nb\t3\na\t4", "#h\nb\t3\na\t1\na\t4"),
-            // A strict reader (TSVZ.py's `readTSV(strict=True)`) skips a line narrower than the
-            // column count, three here: `K` reads `[K, 1, 2]` to it, and so it stays (0.2.1 moved
-            // `K<TAB>9` into its place, and `K` was gone to that reader); a line it takes between a
-            // key's first and last stays; a last line it takes moves, as before.
+            // A strict reader (TSVZ.py's `readTSV(strict=True)`) drops a line that holds a value
+            // and is narrower than the column count, three here: `K` reads `[K, 1, 2]` to it, and
+            // so that line stays (0.2.1 moved `K<TAB>9` into its place, and `K` was gone to that
+            // reader). Its first and last row of a key stay beside the command line's, so a key's
+            // last line moves only where both read the key from the same two lines: `K<TAB>1` is
+            // the command line's first row of `K`, `K<TAB>2<TAB>2` the strict reader's, and both
+            // stay (0.2.3 moved the second into the place of the first).
             (
                 "#h\nx\t0\t0\ny\t5\t5\nK\t1\t2\nK\t9\n",
                 "#h\nx\t0\t0\ny\t5\t5\nK\t1\t2\nK\t9\n",
@@ -1044,11 +1242,242 @@ mod tests {
                 "#h\nx\t0\t0\nK\t1\nK\t2\t2\nz\t0\t0\nK\t3\nK\t4\n",
                 "#h\nx\t0\t0\nK\t1\nK\t2\t2\nz\t0\t0\nK\t4\n",
             ),
-            ("#h\nx\t0\t0\nK\t1\nK\t2\t2\n", "#h\nx\t0\t0\nK\t2\t2\n"),
-            // It takes none of `K`'s lines: the last moves.
+            (
+                "#h\nx\t0\t0\nK\t1\nK\t2\t2\n",
+                "#h\nx\t0\t0\nK\t1\nK\t2\t2\n",
+            ),
+            // It reads none of `K`'s lines: the last moves.
             ("#h\nx\t0\t0\nK\t1\nK\t3\n", "#h\nx\t0\t0\nK\t3\n"),
+            // Where a `#_defaults_#` line that holds a value is in force, it takes a narrower line,
+            // padded: `K<TAB>9` stays, which it reads as `[K, 9, Q]` (0.2.3 dropped it).
+            (
+                "#h\nx\t0\t0\nK\t1\t2\n#_defaults_#\tP\tQ\nK\t9\n#_defaults_#\nK\t8\n",
+                "#h\nx\t0\t0\nK\t1\t2\n#_defaults_#\tP\tQ\nK\t9\n#_defaults_#\nK\t8\n",
+            ),
+            // Its first row of `L` is `L<TAB>8<TAB>1`, after `M`'s: it reads x, M, L, and the
+            // command line x, L, M (0.2.3 moved `L<TAB>8<TAB>1` up, so that it read x, L, M).
+            (
+                "x\t0\t0\nL\nL\t2\nM\t9\t9\t1\nL\t8\t1\n",
+                "x\t0\t0\nL\nL\t2\nM\t9\t9\t1\nL\t8\t1\n",
+            ),
+            // A reader given line 1 for its header reads keys a, Name, b: its first row of `Name`
+            // is `Name<TAB>2`, which stays (0.2.3 dropped it, so that reader read a, b, Name).
+            (
+                "Name\tv\na\t1\nName\t2\nb\t3\nName\t4\na\t5\n",
+                "Name\tv\na\t5\nName\t2\nb\t3\nName\t4\n",
+            ),
         ] {
             assert_eq!(scrub(input), output, "{input:?}");
+        }
+    }
+
+    /// Where each key's row comes from, in the order of the keys, as `reader` reads `text`
+    /// ([`Reader`]): what TSVZ.py gives as `readTabularFile(storeOffset=True)`.
+    fn read_by(mut reader: Reader, text: &str) -> String {
+        let mut rows: Vec<(String, usize)> = Vec::new();
+        for (i, raw) in lines(text).iter().enumerate() {
+            if i == 0 {
+                reader.start(raw, b'\t');
+            }
+            let (text, terminated) = text_of(raw);
+            let Some(line) = split(&text, b'\t', terminated) else {
+                continue;
+            };
+            match reader.line(i, Shape::of(&line)).0 {
+                Applied::Row => match rows.iter_mut().find(|(k, _)| *k == *line.key) {
+                    Some(row) => row.1 = i,
+                    None => rows.push((line.key.to_string(), i)),
+                },
+                Applied::Delete => rows.retain(|(k, _)| *k != *line.key),
+                Applied::No => {}
+            }
+        }
+        let rows: Vec<String> = rows.iter().map(|(k, i)| format!("{k}@{i}")).collect();
+        rows.join(" ")
+    }
+
+    /// Each reader a scrub follows ([`READERS`], in its order) applies the lines TSVZ.py 5.18's
+    /// does: where each key's row comes from, in the order of the keys, as TSVZ.py read these
+    /// files (`readTabularFile(storeOffset=True)`, given no header, line 1's cells, or another
+    /// header; 2026-11-25). `-`: line 1 holds no cell, so no reader takes it for a header.
+    #[test]
+    fn a_reader_applies_the_lines_tsvz_py_applies() {
+        let cases: [(&str, [&str; N]); 13] = [
+            (
+                "#h\nx\t0\t0\nK\t1\t2\n#_defaults_#\tP\tQ\nK\t9\n#_defaults_#\nK\t8\n",
+                [
+                    "x@1 K@6",
+                    "x@1 K@4",
+                    "x@1 K@6 #_defaults_#@5",
+                    "x@1 K@6",
+                    "x@1 K@6 #_defaults_#@5",
+                ],
+            ),
+            (
+                "x\t0\t0\nL\nL\t2\nM\t9\t9\t1\nL\t8\t1\n",
+                [
+                    "x@0 L@4 M@3",
+                    "x@0 M@3 L@4",
+                    "L@4 M@3",
+                    "L@4 M@3",
+                    "M@3 L@4",
+                ],
+            ),
+            (
+                "a\nb\t1\na\n",
+                ["a@2 b@1", "a@2 b@1", "b@1 a@2", "b@1", "b@1 a@2"],
+            ),
+            (
+                "Name\tv\na\t1\nName\t2\nb\t3\nName\t4\na\t5\n",
+                [
+                    "Name@4 a@5 b@3",
+                    "Name@4 a@5 b@3",
+                    "a@5 Name@4 b@3",
+                    "a@5 Name@4 b@3",
+                    "a@5 Name@4 b@3",
+                ],
+            ),
+            (
+                "a\n#_defaults_#\nb\n#_defaults_#\nc\na\n",
+                [
+                    "a@5 #_defaults_#@3 b@2 c@4",
+                    "a@5 #_defaults_#@3 b@2 c@4",
+                    "#_defaults_#@3 b@2 c@4 a@5",
+                    "#_defaults_#@3 b@2 c@4 a@5",
+                    "#_defaults_#@3 b@2 c@4 a@5",
+                ],
+            ),
+            (
+                "x\t0\t0\n#_defaults_#\tP\nk\t1\n#_defaults_#\tP\tQ\nk\t2\n#_defaults_#\t\tR\nj\t3\n#_defaults_#\t\t\nj\t4\n",
+                [
+                    "x@0 k@4 j@8",
+                    "x@0 k@4 j@6",
+                    "k@4 j@8",
+                    "k@4 j@8",
+                    "k@4 j@6",
+                ],
+            ),
+            (
+                "#h\tv\n#c\n\na\t1\nb\nb\t2\t3\na\t\n",
+                ["b@5", "b@5", "b@5", "b@5", "b@5"],
+            ),
+            (
+                "\0\0\na\t1\r\nb\t\r\n\0c\t2\nb\t \t\n",
+                [
+                    "a@1 c@3",
+                    "a@1 c@3",
+                    "a@1 b@4 c@3",
+                    "a@1 c@3",
+                    "a@1 b@4 c@3",
+                ],
+            ),
+            (
+                "k\nx\t1\ny\nx\n",
+                ["k@0 x@3 y@2", "k@0 x@3 y@2", "x@3 y@2", "", "x@3 y@2"],
+            ),
+            (
+                "Name\tA\tB\nk\t1\nk\t1\t2\nk\t9\nj\t\t\n",
+                ["Name@0 k@3", "Name@0 k@2", "k@3", "k@3", "k@2"],
+            ),
+            (
+                "a\t1\nb\t2\na\t3",
+                ["a@2 b@1", "a@2 b@1", "b@1 a@2", "b@1 a@2", "b@1 a@2"],
+            ),
+            (
+                "#_defaults_#\tP\tQ\na\t\t\nb\t1\n#_defaults_#\nb\t\t2\na\t1\n",
+                ["b@4 a@5", "b@4", "b@4 a@5", "b@4 a@5", "b@4"],
+            ),
+            (
+                "  \t1\nk\t1\t2\n#_defaults_#x\t3\nk\t5\n",
+                [
+                    "k@3 #_defaults_#x@2",
+                    "k@1",
+                    "k@3 #_defaults_#x@2",
+                    "k@3 #_defaults_#x@2",
+                    "k@3 #_defaults_#x@2",
+                ],
+            ),
+        ];
+        for (text, readings) in cases {
+            for (r, (reader, want)) in READERS.iter().zip(readings).enumerate() {
+                if want != "-" {
+                    assert_eq!(read_by(*reader, text), want, "reader {r} of {text:?}");
+                }
+            }
+        }
+    }
+
+    /// A second scrub changes nothing, on random files of the shapes the design's probe drew
+    /// (dc024s, 2026-11-25): line 1 a comment, empty, a header, a row, a `#_defaults_#` line or a
+    /// key alone; rows narrower and wider than the column count, keys alone, keys with empty cells,
+    /// `#_defaults_#` lines that hold a value (narrower ones too), resets, comments and empty lines;
+    /// CRs, NULs and an unterminated last line. (A rule that blocked the move where a reader had
+    /// deleted the key made a second scrub compact 1.5% of such files further.)
+    #[test]
+    fn a_second_scrub_changes_nothing() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..5_000 {
+            let d = [b'\t', b'\t', b',', 0][next(4)];
+            let ds = (d as char).to_string();
+            let width = 1 + next(4);
+            let keys = ["a", "b", "c", "d", "Name"];
+            let cells = |n: usize, next: &mut dyn FnMut(usize) -> usize| {
+                let values = ["0", "1", "x", "", ""];
+                (0..n)
+                    .map(|_| values[next(values.len())])
+                    .collect::<Vec<_>>()
+            };
+            let mut lines: Vec<String> = Vec::new();
+            let header = (1..width).map(|i| format!("{ds}v{i}")).collect::<String>();
+            match next(6) {
+                0 => lines.push("#h\n".into()),
+                1 => lines.push("\n".into()),
+                2 => lines.push(format!("Name{header}\n")),
+                3 => lines.push(format!("{DEFAULTS}{ds}P\n")),
+                4 => lines.push(format!("{}\n", keys[next(keys.len())])),
+                _ => {}
+            }
+            for _ in 0..1 + next(25) {
+                let key = keys[next(keys.len())];
+                let line = match next(10) {
+                    0 => ["#c", "", "\0", DEFAULTS][next(4)].to_string(),
+                    1 => DEFAULTS.to_string() + &ds.repeat(next(width)),
+                    2 => {
+                        let n = 1 + next(width + 1);
+                        [DEFAULTS]
+                            .iter()
+                            .copied()
+                            .chain(cells(n, &mut next))
+                            .collect::<Vec<_>>()
+                            .join(&ds)
+                    }
+                    3 => key.to_string(),
+                    4 => key.to_string() + &ds.repeat(1 + next(width)),
+                    _ => {
+                        let n = [1, width - 1, width, width, width + 1][next(5)].max(1);
+                        [key]
+                            .iter()
+                            .copied()
+                            .chain(cells(n - 1, &mut next))
+                            .collect::<Vec<_>>()
+                            .join(&ds)
+                    }
+                };
+                let end = ["\n", "\n", "\n", "\r\n", "\0\n"][next(5)];
+                lines.push(line + end);
+            }
+            let mut text = lines.concat();
+            if next(5) == 0 {
+                text = text.trim_end_matches('\n').to_string();
+            }
+            let once = scrubbed(&text, d);
+            assert_eq!(scrubbed(&once, d), once, "{text:?}");
         }
     }
 
