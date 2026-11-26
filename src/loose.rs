@@ -464,7 +464,10 @@ impl Reader {
 /// no header; TSVZ.py's lenient library read too); TSVZ.py's strict library read (`readTSV`'s
 /// default); a lenient one given the header line 1 holds (TSVZ.py's `--x-header` and `TSVZed` too);
 /// a lenient one given another header; a strict one given the header line 1 holds. A strict one
-/// given another header raises, so it reads nothing.
+/// given another header raises, so it reads nothing. Where line 1 holds no cell (an empty line, or
+/// delimiters and blanks only), TSVZ.py takes no header from it (`any(header)`), and the two
+/// readers given line 1's header are modelled all the same, as a header of that many cells: an
+/// extra reader only keeps lines, and no reading changes.
 const READERS: [Reader; N] = [
     Reader::new(false, false, false),
     Reader::new(true, false, false),
@@ -1393,7 +1396,8 @@ mod tests {
     /// Each reader a scrub follows ([`READERS`], in its order) applies the lines TSVZ.py 5.18's
     /// does: where each key's row comes from, in the order of the keys, as TSVZ.py read these
     /// files (`readTabularFile(storeOffset=True)`, given no header, line 1's cells, or another
-    /// header; 2026-11-25). `-`: line 1 holds no cell, so no reader takes it for a header.
+    /// header; 2026-11-25). No case has a line 1 that holds no cell: TSVZ.py takes no header from
+    /// one, so there is no reader of it to compare the two modelled ones with ([`READERS`]).
     #[test]
     fn a_reader_applies_the_lines_tsvz_py_applies() {
         let cases: [(&str, [&str; N]); 13] = [
@@ -1494,9 +1498,7 @@ mod tests {
         ];
         for (text, readings) in cases {
             for (r, (reader, want)) in READERS.iter().zip(readings).enumerate() {
-                if want != "-" {
-                    assert_eq!(read_by(*reader, text), want, "reader {r} of {text:?}");
-                }
+                assert_eq!(read_by(*reader, text), want, "reader {r} of {text:?}");
             }
         }
     }

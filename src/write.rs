@@ -1463,8 +1463,8 @@ mod tests {
     fn a_loose_file_the_writer_creates_begins_with_an_empty_line_1() {
         // As TSVZ.py creates one: a program that reads it with a header takes line 1 for it (0.2.3
         // wrote the first row there). Also for an append of nothing (a delete of a missing file),
-        // and compressed: line 1 is in the decoded text. A file that exists, empty, gets none, as
-        // in TSVZ.py; nor does a strict store.
+        // and compressed: line 1 is in the decoded text. A file that exists and holds no byte gets
+        // none, as in TSVZ.py (`clear` writes its line 1 either way); nor does a strict store.
         let dir = tempfile::tempdir().unwrap();
         let row = [Record::from_args("k", &["v".into()])];
         let text = |p: &Path| {
