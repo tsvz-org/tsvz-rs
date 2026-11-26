@@ -72,7 +72,7 @@ Its socket is private to its user; `--x-group G` lets a group connect, `--x-mode
 socket's mode. Rust programs talk to a handler with `tsvz::handler::Client`. On a store on a cifs
 (SMB) mount from an older Linux client (6.1 and RHEL 8's 4.18 were measured; 7.0 is not affected), the other commands cannot read the handler's pointer
 file: they warn `ignoring the pointer file` and work on the files, and `tsvz stop` fails: stop the
-handler with a signal or let `--x-idle-timeout` do it (deferred to 0.2.4,
+handler with a signal or let `--x-idle-timeout` do it (deferred until TSVZ.py's next version,
 [docs/limitations.md](docs/limitations.md)).
 
 ## Library
@@ -107,6 +107,18 @@ against TSVZ.py on random stores, with and without its handler. Rust and Python 
 share a store: their file locks exclude each other. Where the specification leaves a choice open,
 tsvz-rs does what TSVZ.py does, except where [docs/silent-choices.md](docs/silent-choices.md), which
 lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading to 0.2.4 from 0.2.3
+
+Stores need nothing; the library's documented API does not change.
+
+- Loose files: one that `set`, `append`, `setdefault` or `delete` creates begins with an empty
+  line 1, as TSVZ.py's do (0.2.3 wrote the first row there, which a TSVZ.py program that reads a
+  header took for one).
+- Through a handler: a `pop` whose answer a stop cuts off (its client did not read it) gets its
+  row put back on the files before `serve` ends; while writes fail, a request the handler cannot
+  parse is warned of it too; a `serve` that takes over from a handler that was killed removes the
+  socket directory it left.
 
 ## Upgrading to 0.2.3 from 0.2.2
 

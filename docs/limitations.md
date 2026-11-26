@@ -59,17 +59,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   a mandatory SMB byte-range lock over the file, so another process's read of it fails with EACCES; the append's
   lock (whole-file on Linux in tsvz-rs, byte 1 in TSVZ.py, the layout of §18.6) is made mandatory the same way.
   Measured on Samba 4.17 with 7.0, 6.1 and 4.18 clients (2026-11-23).
-- Revisit when: 0.2.4, together with TSVZ.py (moved from 0.2.2: TSVZ 5.19 is paused at the user's ask, and tsvz-rs
-  alone cannot take the new lock, below). The plan, measured on all three kernels: a handler holds a write
-  lock (an open file description lock) on one byte far past the pointer file's content (offset 2^62), where no
-  reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a second handler is
-  refused. Both tools must change together: on a local file system `flock` and such a lock do not exclude each
-  other, so a handler of one tool that took the new lock would not exclude a handler of the other that takes
-  `flock`. TSVZ.py's lookup must also catch an error of the read. The append lock's range is a spec matter (§18.6)
+- Revisit when: TSVZ 5.19 resumes, together with TSVZ.py (moved from 0.2.2 and from 0.2.4: TSVZ 5.19 is paused at
+  the user's ask, and tsvz-rs alone cannot take the new lock, below). The plan, measured on all three kernels: a
+  handler holds a write lock (an open file description lock) on one byte far past the pointer file's content
+  (offset 2^62), where no reader reads, and treats EACCES and EAGAIN as busy; readers then read the pointer, and a
+  second handler is refused. Both tools must change together: on a local file system `flock` and such a lock do
+  not exclude each other, so a handler of one tool that took the new lock would not exclude a handler of the other
+  that takes `flock`. TSVZ.py's lookup must also catch an error of the read. The append lock's range is a spec matter (§18.6)
   and goes to the TSVZ session; with a reachable handler the command line reads through its socket and never meets
   it.
 - Noted: 2026-11-17, in the 0.2.0 build; measured and planned 2026-11-23, in the 0.2.1 build; moved to 0.2.3 on
-  2026-11-25, and to 0.2.4 the same day (0.2.3 is the musl build fix alone); a deferral under the user's standing rule that deferrals are noted, not asked.
+  2026-11-25, to 0.2.4 the same day (0.2.3 is the musl build fix alone), and out of 0.2.4 the same day (0.2.4
+  takes the deferrals tsvz-rs can settle alone); a deferral under the user's standing rule that deferrals are
+  noted, not asked.
 
 ### A routed `pop` or `popitem` can lose its row when its answer does not arrive
 - Kind: deferred
