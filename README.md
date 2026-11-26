@@ -116,9 +116,10 @@ Stores need nothing; the library's documented API does not change.
   line 1, as TSVZ.py's do (0.2.3 wrote the first row there, which a TSVZ.py program that reads a
   header took for one).
 - Through a handler: a `pop` whose answer a stop cuts off (its client did not read it) gets its
-  row put back on the files before `serve` ends; while writes fail, a request the handler cannot
-  parse is warned of it too; a `serve` that takes over from a handler that was killed removes the
-  socket directory it left.
+  row put back on the files before `serve` ends; on macOS that cut now happens (0.2.3's stop waited
+  for good for a client that did not read its answer); while writes fail, a request the handler
+  cannot parse is warned of it too; a `serve` that takes over from a handler that was killed
+  removes the socket directory it left.
 
 ## Upgrading to 0.2.3 from 0.2.2
 

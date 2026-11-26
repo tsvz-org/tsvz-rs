@@ -508,13 +508,16 @@ fn settle(shared: &Shared, done: impl Fn(&HashMap<u64, Conn>) -> bool) {
 }
 
 /// Cut off every open connection, but with `spare_owing` those a pop is in. A connection cut off
-/// begins no other request ([`begin`]).
+/// begins no other request ([`begin`]). Each side is shut on its own: macOS refuses to shut both
+/// once the read side is shut, as [`finish`] shuts it (ENOTCONN), and then leaves an answer that
+/// waits for a client that does not read waiting (0.2.3's stop waited there for good).
 fn cut(shared: &Shared, spare_owing: bool) {
     lock(&shared.open).retain(|_, conn| {
         if spare_owing && conn.owes {
             return true;
         }
-        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+        let _ = conn.stream.shutdown(std::net::Shutdown::Read);
+        let _ = conn.stream.shutdown(std::net::Shutdown::Write);
         false
     });
 }

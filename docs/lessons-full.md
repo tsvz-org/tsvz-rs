@@ -378,3 +378,18 @@ entries go last, in the same commit as the change:
   that makes line 1, the writer's first append to a file it creates, as it was.
 - Lesson: when you copy how another program writes a position (line 1), copy it at every path that makes that
   position: a rewrite and the first write to a new file both do.
+
+## 2026-11-25 A stop shuts a connection's write side on its own
+- Changed: when a stop cuts a connection off, it shuts its read side and then its write side, each on its own.
+  0.2.3 shut both at once, which on macOS failed (ENOTCONN) once the stop had shut the read side at its start, and
+  left the write side open: an answer waiting for a client that did not read it (a large `read`, a `pop` of a large
+  row) kept waiting, and `serve` waited for that connection's thread for good, after it had removed its pointer
+  file. Linux shuts both either way.
+- Why we had to change: found by this version's test of a pop whose answer a stop cuts off, which hung on macOS;
+  measured there: `shutdown(SHUT_RD)`, then `shutdown(SHUT_RDWR)` from another thread fails with ENOTCONN and the
+  blocked write stays blocked; `SHUT_WR` instead ends it with EPIPE.
+- Original design was wrong because: it took "shut both" to mean the same on every system, and every test of the cut
+  on macOS had a client that read or closed.
+- Lesson: to cut off a socket whose read side you have already shut, shut its write side on its own: macOS refuses a
+  shutdown of both then (ENOTCONN) and leaves the write side open, so a write blocked on a peer that does not read
+  stays blocked.
