@@ -598,10 +598,11 @@ fn wait_for_a_writer_within(part: &Path, within: Duration, otherwise: Duration) 
 }
 
 #[test]
-fn a_pop_whose_answer_a_stop_cuts_off_gets_its_row_put_back_on_the_files() {
-    // A stop gives a pop's answer FINISH to be read, then cuts its connection off: the stop has
-    // closed the engine by then, so the handler puts the row back on the files, as any other
-    // writer, before `serve` ends (0.2.3 printed the row on standard error and left it deleted).
+fn a_pop_whose_answer_a_stop_cuts_off_gets_its_row_put_back() {
+    // A stop gives a pop's answer FINISH to be read, then cuts its connection off: the handler
+    // puts the row back through its engine, which the stop closes only after it, before `serve`
+    // ends (0.2.3 printed the row on standard error and left it deleted; 0.2.4 put it back on the
+    // files, beside the engine it had closed).
     let dir = tempfile::tempdir().unwrap();
     // More than a socket's buffer holds (about 200 KiB on Linux, 8 KiB on macOS): the answer waits.
     let big = "v".repeat(4 << 20);
