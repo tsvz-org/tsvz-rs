@@ -517,6 +517,37 @@ fn stopping_the_handler_loses_no_row_a_pop_in_flight_took() {
     assert!(lost.is_empty(), "deleted and never answered: {lost:?}");
 }
 
+/// Wait until a writer waits for the write lock on the store file `part`, which the test holds:
+/// the handler's writer, stalled as a slow disk would stall it, with the write a request queued
+/// (the test's next step needs it queued, and a host busy enough may not give the handler any
+/// fixed time). Linux lists it in /proc/locks (`->`: a lock waited for, on the file's inode); macOS
+/// has no such list, and there the test waits 200 ms, as these tests did before.
+fn wait_for_a_writer_on(part: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let inode = format!(":{} ", fs::metadata(part).unwrap().ino());
+        // 10 s: how long `Served::start` gives a process to start.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let locks = fs::read_to_string("/proc/locks").unwrap();
+            if locks
+                .lines()
+                .any(|l| l.contains(" -> ") && l.contains(&inode))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no writer waits for {}: {locks}",
+                part.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    std::thread::sleep(Duration::from_millis(200));
+}
+
 /// Wait until the handler has begun to stop (it says why on its standard error).
 fn wait_until_stopping(served: &Served) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -543,7 +574,7 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
     let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
     let held = tsvz::lock::lock(&part).unwrap();
     let popper = std::thread::spawn(move || client.pop("a"));
-    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    wait_for_a_writer_on(&s); // the pop's tombstone is queued
     served.signal(libc::SIGTERM);
     std::thread::sleep(tsvz::handler::server::FINISH + Duration::from_secs(1));
     drop(held);
@@ -552,11 +583,15 @@ fn a_pop_whose_write_outlasts_the_stop_s_window_still_gets_its_row() {
     let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
     match popped {
         Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
-        // Not read before the stop (macOS drops a request queued on the connection): not taken.
-        other => assert!(
-            left.get("a").is_some(),
-            "deleted and never answered: {other:?}"
-        ),
+        // Not read before the stop: not taken. Only where the wait above was a time (macOS, which
+        // also drops a request queued on the connection at the stop).
+        other => {
+            assert!(!cfg!(target_os = "linux"), "the pop was queued: {other:?}");
+            assert!(
+                left.get("a").is_some(),
+                "deleted and never answered: {other:?}"
+            );
+        }
     }
     assert!(left.get("b").is_some());
 }
@@ -570,18 +605,23 @@ fn a_second_signal_during_a_stop_does_not_end_serve() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path(), "a\t1\nb\t2\n");
     let mut served = Served::start(&s, &[]);
-    let mut client = tsvz::handler::Client::connect(&s).unwrap();
     let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
     let held = tsvz::lock::lock(&part).unwrap();
-    let popper = std::thread::spawn(move || client.pop("a"));
-    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    // Answered once queued (the store acknowledges from memory): the stop has it to write, so it
+    // waits for the lock whatever the timing (0.2.3 timed a pop with a sleep, and on a busy host
+    // the stop could end before the signals came).
+    assert_eq!(ask(&s, "set\tc\t3").status, 0);
     served.signal(libc::SIGTERM);
     wait_until_stopping(&served);
     served.signal(libc::SIGHUP);
     served.signal(libc::SIGINT);
     std::thread::sleep(Duration::from_millis(300)); // the signals are taken; the stop still waits
+    assert!(
+        !served.stderr().contains("stopped serving"),
+        "the stop did not wait for the write: {}",
+        served.stderr()
+    );
     drop(held);
-    let popped = popper.join().unwrap();
     assert_eq!(served.wait(), 0, "{}", served.stderr()); // -1: ended by a signal
     assert!(
         served.stderr().contains("stopped serving"),
@@ -590,10 +630,10 @@ fn a_second_signal_during_a_stop_does_not_end_serve() {
     );
     assert_eq!(served.stderr().matches("; stopping").count(), 1);
     let left = tsvz::Store::open(&s, tsvz::Options::default()).unwrap();
-    match popped {
-        Ok(Some(row)) => assert_eq!(row, ["a", "1"]),
-        other => assert!(left.get("a").is_some(), "lost: {other:?}"),
-    }
+    assert_eq!(
+        left.get("c").map(|r| r.to_vec()),
+        Some(vec!["3".to_string()])
+    );
 }
 
 #[test]
@@ -629,6 +669,14 @@ fn signals_sent_without_pause_through_the_stop_and_past_it_do_not_end_the_comman
     );
 }
 
+/// End the connection `conn` as a client that goes away does: shut down, then closed. A close
+/// alone may not end it: a child that another test is starting holds a copy of every descriptor
+/// until it execs, and the handler's answer is then written to the copy (0.2.3: 8 of 20 runs of
+/// this binary failed so on a host at a load of about 200, none with the shutdown).
+fn hang_up(conn: UnixStream) {
+    conn.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
 #[test]
 fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
     // The handler deletes the row before it answers: a client that hangs up meanwhile (killed, or
@@ -642,8 +690,7 @@ fn a_pop_whose_client_went_away_before_its_answer_puts_its_row_back() {
     let held = tsvz::lock::lock(&part).unwrap();
     let mut conn = connect(&s).unwrap();
     conn.write_all(b"pop\ta\n").unwrap();
-    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
-    drop(conn);
+    hang_up(conn); // whether the handler has read the pop yet or not: it reads it all the same
     drop(held);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !served.stderr().contains("could not be written") {
@@ -671,15 +718,11 @@ fn a_pop_whose_client_went_away_after_its_key_was_written_prints_the_row_taken_e
     let held = tsvz::lock::lock(&part).unwrap();
     let mut conn = connect(&s).unwrap();
     conn.write_all(b"pop\ta\n").unwrap();
-    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
-    let writer = {
-        let s = s.clone();
-        std::thread::spawn(move || ask(&s, "set\ta\t9"))
-    };
-    std::thread::sleep(Duration::from_millis(200)); // queued behind the pop's tombstone
-    drop(conn);
+    wait_for_a_writer_on(&s); // the pop's tombstone is queued
+    // Answered once queued (the store acknowledges from memory): behind the pop's tombstone.
+    assert_eq!(ask(&s, "set\ta\t9").status, 0);
+    hang_up(conn);
     drop(held);
-    assert_eq!(writer.join().unwrap().status, 0);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !served.stderr().contains("the row taken was") {
         assert!(Instant::now() < deadline, "{}", served.stderr());
@@ -706,7 +749,7 @@ fn a_pop_that_finds_a_handler_stopping_never_takes_the_row_its_pop_took() {
     let part = fs::OpenOptions::new().append(true).open(&s).unwrap();
     let held = tsvz::lock::lock(&part).unwrap();
     let popper = std::thread::spawn(move || client.popitem(false));
-    std::thread::sleep(Duration::from_millis(200)); // the pop is under way
+    wait_for_a_writer_on(&s); // the pop's tombstone is queued
     served.signal(libc::SIGTERM);
     wait_until_stopping(&served);
     let mut other = tsvz()
