@@ -109,6 +109,10 @@ share a store: their file locks exclude each other. Where the specification leav
 tsvz-rs does what TSVZ.py does, except where [docs/silent-choices.md](docs/silent-choices.md), which
 lists those choices, says it departs. Benchmarks against TSVZ.py are in [bench/RESULTS.md](bench/RESULTS.md).
 
+## Upgrading to 0.2.5 from 0.2.4
+
+Nothing to do: stores, the library's documented API and what a stop does are as in 0.2.4.
+
 ## Upgrading to 0.2.4 from 0.2.3
 
 Stores need nothing; the library's documented API does not change.

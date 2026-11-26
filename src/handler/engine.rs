@@ -24,7 +24,7 @@ use crate::{Error, Options, Scope, Store, WarnFn, Warning, escape, parts};
 
 /// The message of a read operation on a store that does not exist (§20.2.2).
 pub const NO_STORE: &str = "no such store";
-/// The message of a request that came once the engine was closed by a stop.
+/// The message of a request that came once a stop had the engine refuse requests.
 pub const STOPPING: &str = "the handler is stopping";
 /// The message of a read that skipped a part or stopped at damaged data (§21.8.5).
 pub const INCOMPLETE: &str = "could not read every part of the store";
@@ -326,11 +326,23 @@ fn sync(files: &[(PathBuf, u64, File)]) -> Result<(), Error> {
     first
 }
 
+/// Which requests the engine takes.
+#[derive(Clone, Copy, PartialEq)]
+enum Door {
+    /// Every one.
+    Open,
+    /// Only put-backs ([`Engine::put_back`]): a stop has cut off the connections no pop is in
+    /// ([`Engine::refuse_requests`]); the writer goes on.
+    PutBacks,
+    /// None: the writer is ending, or has ended ([`Engine::close`]).
+    Closed,
+}
+
 struct State {
     store: Option<Store>,
     /// Warnings raised while handling the current request: its `#!` lines.
     said: Arc<Mutex<Vec<String>>>,
-    closed: bool,
+    door: Door,
     /// The sequence number of the last `#_write_ack_#` queued: until the store follows the files
     /// past it, later writes are made durable, whatever it says (its batch may fail).
     queued_ack: Option<u64>,
@@ -459,7 +471,7 @@ impl Engine {
             state: Mutex::new(State {
                 store: Some(store),
                 said,
-                closed: false,
+                door: Door::Open,
                 queued_ack: None,
                 queued_member_size: None,
                 reflected: 0,
@@ -505,18 +517,24 @@ impl Engine {
         }
     }
 
-    /// Run `f` on the state under the mutex; also return the warnings raised meanwhile.
+    /// Run `f` on the state under the mutex, unless the door is shut to it (a `put_back` passes
+    /// it once a stop has the engine refuse requests); also return the warnings raised meanwhile.
     fn locked<R>(
         &self,
+        put_back: bool,
         f: impl FnOnce(&mut State) -> Result<R, Error>,
     ) -> (Result<R, Error>, Vec<String>) {
         let mut st = lock(&self.state);
-        // Closed: the writer thread is on its way out and would not wait for a write made now
-        // (a request still running when a stop cut its connection off).
-        let result = if st.closed {
-            Err(Error::Refused(STOPPING.into()))
-        } else {
+        let open = match st.door {
+            Door::Open => true,
+            Door::PutBacks => put_back,
+            // The writer thread is on its way out and would not write a write made now.
+            Door::Closed => false,
+        };
+        let result = if open {
             f(&mut st)
+        } else {
+            Err(Error::Refused(STOPPING.into()))
         };
         let said = std::mem::take(&mut *lock(&st.said));
         (result, said)
@@ -657,7 +675,7 @@ impl Engine {
         match req.op.as_str() {
             "read" | "get" | "has" | "len" | "keys" => self.read(req),
             "set" | "append" | "delete" => self.write(req, bulk, arrived),
-            "pop" | "popitem" | "setdefault" => self.change(req, arrived),
+            "pop" | "popitem" | "setdefault" => self.change(req, arrived, false),
             "clear" | "scrub" => self.maintain(req.op == "clear"),
             "verify" => self.verify(),
             "parts" => self.parts(),
@@ -673,7 +691,7 @@ impl Engine {
     }
 
     fn read(&self, req: &Request) -> Response {
-        let (result, said) = self.locked(|st| {
+        let (result, said) = self.locked(false, |st| {
             self.fresh(st)?;
             let Some(store) = &st.store else {
                 return Ok(Response::failed(1, NO_STORE));
@@ -719,7 +737,7 @@ impl Engine {
         } else {
             vec![record(&req.raw[0], &req.args[0], &req.args[1..])]
         };
-        let (result, said) = self.locked(|st| {
+        let (result, said) = self.locked(false, |st| {
             let d = self.format.delimiter;
             if delete && ops::delete_needs_store(&records, d) {
                 // Naming a key a reader would strip needs the store as it is now (§20.2.7),
@@ -746,8 +764,9 @@ impl Engine {
         Engine::answer(result.map(|()| Response::status(0)), said)
     }
 
-    fn change(&self, req: &Request, arrived: Instant) -> Response {
-        let (result, said) = self.locked(|st| {
+    /// `pop`, `popitem` and `setdefault`; with `put_back`, the `setdefault` of a put-back.
+    fn change(&self, req: &Request, arrived: Instant, put_back: bool) -> Response {
+        let (result, said) = self.locked(put_back, |st| {
             self.fresh(st)?;
             let plan = match (req.op.as_str(), &st.store) {
                 ("setdefault", store) => {
@@ -779,8 +798,11 @@ impl Engine {
                     record,
                     member_size,
                 } => {
+                    // A put-back is answered, and said to be back, only once it is synced: else a
+                    // failed sync would leave the row in no file and in no log.
+                    let sync = req.sync || put_back;
                     let queued =
-                        self.submit(st, arrived, &[record], req.sync, Some(member_size), true)?;
+                        self.submit(st, arrived, &[record], sync, Some(member_size), true)?;
                     (Engine::row(&key, &cells), queued)
                 }
             })
@@ -805,7 +827,7 @@ impl Engine {
     }
 
     fn maintain(&self, clear: bool) -> Response {
-        let (result, said) = self.locked(|st| {
+        let (result, said) = self.locked(false, |st| {
             self.batcher.barrier();
             let options = Engine::options(&st.said, &self.log);
             let outcome = if clear {
@@ -834,7 +856,7 @@ impl Engine {
     }
 
     fn verify(&self) -> Response {
-        let (result, said) = self.locked(|st| {
+        let (result, said) = self.locked(false, |st| {
             self.batcher.barrier();
             let options = Options {
                 scope: Scope::KeysOnly,
@@ -860,7 +882,7 @@ impl Engine {
     }
 
     fn parts(&self) -> Response {
-        let (result, said) = self.locked(|_| {
+        let (result, said) = self.locked(false, |_| {
             self.batcher.barrier();
             let mut out = Lines::default();
             match ops::parts(&self.path, &mut out) {
@@ -876,58 +898,12 @@ impl Engine {
     }
 
     /// Put back the row a `pop` or `popitem` took, whose answer could not be written: `req` is the
-    /// `setdefault` of it, which keeps a row written for its key since. Through the engine while it
-    /// serves; once it is closed, on the files, as any other writer of them, and synced: the
-    /// stop's last write, made once the writer has written its queue and ended ([`Engine::end`]
-    /// waits for that), so that the files are read as the queue left them: a read made before the
-    /// queue's last batch and an append after it would overwrite a write the handler had
-    /// acknowledged; and one put-back at a time ([`Engine::end`] returns what holds the others
-    /// back), so that each reads what the one before it wrote.
+    /// `setdefault` of it, which keeps a row written for its key since. Made as that request is,
+    /// under the engine's mutex and through its queue, so that it reads every write queued before
+    /// it and the next put-back reads it, and synced before it is answered: also once a stop has
+    /// the engine refuse requests ([`Engine::refuse_requests`]); refused once it is closed.
     pub(crate) fn put_back(&self, req: &Request) -> Response {
-        let response = self.handle(req, None);
-        // Not put back, and the engine is closed: it was closed before the request, which it
-        // refused, or the request failed before it was (the files are then tried once more).
-        if response.status == 0 || !lock(&self.state).closed {
-            return response;
-        }
-        // One put-back on the files at a time, each reading what the one before it wrote: two
-        // pops of one key whose answers a stop cut off both found the key gone, and both
-        // appended. The writer thread's mutex, which nothing else holds once the writer has
-        // ended, is held from that end on, with no moment between the two.
-        let _alone = self.end();
-        let (key, values) = (&req.args[0], &req.args[1..]);
-        let options = Options {
-            scope: Scope::Keys(vec![key.clone()]),
-            ..Engine::options(&Arc::default(), &self.log)
-        };
-        let put = || {
-            let store = match Store::open(&self.path, options) {
-                Ok(store) => Some(store),
-                Err(Error::Missing(_)) => None,
-                Err(e) => return Err(e),
-            };
-            Ok(
-                match ops::setdefault(store.as_ref(), self.format, key, values) {
-                    Plan::Show { key, cells } => Engine::row(&key, &cells),
-                    Plan::Put {
-                        key,
-                        cells,
-                        record,
-                        member_size,
-                    } => {
-                        Writer::open(&self.path)?
-                            .warnings(self.log.clone())
-                            .member_size(member_size as usize)
-                            .fsync(true)
-                            .append(std::slice::from_ref(&record))?;
-                        Engine::row(&key, &cells)
-                    }
-                    // (setdefault exits only for a store it could not read whole)
-                    Plan::Exit(_) | Plan::Take { .. } => Response::failed(1, INCOMPLETE),
-                },
-            )
-        };
-        Engine::answer(put(), Vec::new())
+        self.change(req, Instant::now(), true)
     }
 
     /// Make every acknowledged write durable (`stop`, §21.9.3): an error when one was lost, now or
@@ -942,24 +918,29 @@ impl Engine {
         self.batcher.lost()
     }
 
-    /// Answer no more requests; write and fsync everything queued, and end the writer thread. It
-    /// returns once the writer has ended, for a second caller too: that one waits for the first's
-    /// join, which is why the thread's mutex is held across it.
-    pub fn close(&self) {
-        drop(self.end());
+    /// Refuse every request but put-backs ([`Engine::put_back`]), as a stop does once it has cut
+    /// off the connections no pop is in, and wait until every write queued is written. The writer
+    /// goes on, for the put-backs, until [`Engine::close`].
+    pub(crate) fn refuse_requests(&self) {
+        {
+            let mut st = lock(&self.state);
+            if st.door == Door::Open {
+                st.door = Door::PutBacks;
+            }
+        }
+        self.batcher.barrier();
     }
 
-    /// [`Engine::close`], returning the writer thread's mutex, held: its caller is the only one
-    /// to write once the writer has ended, until it lets the guard go.
-    fn end(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
-        lock(&self.state).closed = true;
+    /// Answer no more requests, put-backs included; write and fsync everything queued, and end the
+    /// writer thread.
+    pub fn close(&self) {
+        lock(&self.state).door = Door::Closed;
         lock(&self.batcher.queue).closing = true;
         self.batcher.changed.notify_all();
-        let mut thread = lock(&self.thread);
-        if let Some(thread) = thread.take() {
+        let thread = lock(&self.thread).take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
-        thread
     }
 }
 
@@ -1757,13 +1738,23 @@ mod tests {
         assert_eq!(r.status, 1, "a closed engine answers no more: {r:?}");
     }
 
+    /// Wait (up to `secs`) until `done`, failing with `what`.
+    fn within(secs: u64, what: &str, done: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(secs);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
-    fn a_put_back_made_while_a_stop_still_writes_its_queue_waits_for_the_writer() {
-        // A stop closes the engine before its writer has written the queue (here the part's lock,
-        // held by the test, stalls it): a put-back on the files made then read them before the
-        // queue's last batch and appended after it, and so overwrote a write the handler had
-        // acknowledged (0.2.4's final review: 13 of 3,000 forced stops). It decides from the
-        // files as the writer left them: the row written since stays, and nothing is appended.
+    fn a_stop_s_refusal_takes_a_put_back_through_the_queue_behind_the_writes_answered() {
+        // A stop has the engine refuse requests while its writer still writes the queue (here the
+        // part's lock, held by the test, stalls it). A put-back made then goes through the engine,
+        // under its mutex and in its queue: it reads the write answered before it, the row written
+        // since stays, and nothing is appended (0.2.4 made it on the files, once the writer had
+        // ended: a read made before the queue's last batch overwrote that write, 13 of 3,000
+        // forced stops at its final review). A request is refused meanwhile.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "b\t2\n").unwrap();
@@ -1772,54 +1763,41 @@ mod tests {
         let held = crate::lock::lock(&file).unwrap();
         // Acknowledged from memory, and queued: the writer has it and waits for the lock.
         assert_eq!(ask(&e, "set\tk\tnew").status, 0);
-        let within = |secs, what: &str, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + std::time::Duration::from_secs(secs);
-            while !done() {
-                assert!(Instant::now() < deadline, "{what}");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        };
         within(10, "the writer never waited", &|| {
             crate::lock::waiters_on(&p) == 1
         });
-        let closer = {
+        let refuser = {
             let e = e.clone();
-            std::thread::spawn(move || e.close())
+            std::thread::spawn(move || e.refuse_requests())
         };
-        within(10, "the engine was never closed", &|| lock(&e.state).closed);
+        within(10, "requests were never refused", &|| {
+            lock(&e.state).door == Door::PutBacks
+        });
+        let r = ask(&e, "len");
+        assert_eq!((r.status, r.message.as_str()), (1, STOPPING), "{r:?}");
         let putter = {
             let e = e.clone();
             let back = parse("setdefault\tk\told").unwrap();
             std::thread::spawn(move || e.put_back(&back))
         };
-        // A put-back that does not wait for the writer reads the files now (no `k`) and waits for
-        // the lock as the writer does; one that waits has nothing to show, and gets as long as
-        // it takes a thread that is not starved to reach the lock (1 s).
-        let end = Instant::now() + std::time::Duration::from_secs(1);
-        while crate::lock::waiters_on(&p) < 2 && Instant::now() < end {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         drop(held);
-        closer.join().unwrap();
+        refuser.join().unwrap();
         let back = putter.join().unwrap();
         assert_eq!((back.status, back.lines), (0, lines(&["k\tnew"])));
         assert_eq!(fs::read_to_string(&p).unwrap(), "b\t2\nk\tnew\n");
     }
 
     #[test]
-    fn two_put_backs_of_one_key_on_the_files_are_made_one_at_a_time() {
-        // Two pops of one key whose answers a stop cut off both put their row back on the closed
-        // engine's files: each read the key gone and both appended, the later row won, and both
-        // said it was put back (0.2.4's re-read: 55 of 64 forced stops). Here the part's lock is
-        // held, so that two put-backs that are not made one at a time both read the files (no
-        // `k`) and both wait for the lock, and a pair that is made one at a time has one waiting
-        // for the other, which gets as long as it takes a thread that is not starved to reach
-        // the lock (1 s): the second then reads the first's row, writes nothing, and says it.
+    fn two_put_backs_of_one_key_during_a_stop_are_made_one_at_a_time() {
+        // Two pops of one key whose answers a stop cut off put their rows back: the second reads
+        // the first's row, writes nothing, and says it (0.2.4's re-read found both appended, on the
+        // files, 55 of 64 forced stops). Here the part's lock is held, so that the first's row is
+        // still queued when the second comes.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.tsvz");
         fs::write(&p, "b\t2\n").unwrap();
         let e = Arc::new(engine(dir.path(), "s.tsvz"));
-        e.close();
+        e.refuse_requests();
         let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
         let held = crate::lock::lock(&file).unwrap();
         let putters: Vec<_> = ["one", "two"]
@@ -1830,14 +1808,14 @@ mod tests {
                 std::thread::spawn(move || e.put_back(&back))
             })
             .collect();
-        let end = Instant::now() + std::time::Duration::from_secs(1);
-        while crate::lock::waiters_on(&p) < 2 && Instant::now() < end {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        within(10, "no put-back was queued", &|| {
+            crate::lock::waiters_on(&p) == 1
+        });
         drop(held);
         let answers: Vec<_> = putters
             .into_iter()
-            .map(|t| t.join().unwrap().lines)
+            .map(|t| t.join().unwrap())
+            .map(|r| (r.status, r.lines))
             .collect();
         let text = fs::read_to_string(&p).unwrap();
         assert_eq!(text.matches("\nk\t").count(), 1, "{text:?}");
@@ -1845,6 +1823,45 @@ mod tests {
             answers[0], answers[1],
             "both read the row the first put back"
         );
+    }
+
+    #[test]
+    fn a_put_back_is_synced_before_it_is_answered() {
+        // Under `#_write_ack_# memory` too, while serving and once a stop refuses requests: what
+        // is said of it ("it was put back") is said of a row on the disk.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "b\t2\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let r = e.put_back(&parse("setdefault\tk\tv").unwrap());
+        assert_eq!((r.status, r.lines), (0, lines(&["k\tv"])));
+        assert!(e.batcher.unsynced().is_empty(), "synced with its batch");
+        e.refuse_requests();
+        let r = e.put_back(&parse("setdefault\tm\tv").unwrap());
+        assert_eq!((r.status, r.lines), (0, lines(&["m\tv"])));
+        assert!(e.batcher.unsynced().is_empty(), "synced with its batch");
+    }
+
+    #[test]
+    fn a_closed_engine_refuses_a_put_back() {
+        // Its writer has ended: a put-back queued then would never be written, and would wait for
+        // good. It is refused, and the row is printed by the caller.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "b\t2\n").unwrap();
+        let e = Arc::new(engine(dir.path(), "s.tsvz"));
+        e.refuse_requests();
+        e.close();
+        let (done, answer) = std::sync::mpsc::channel();
+        let putter = e.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(putter.put_back(&parse("setdefault\tk\tv").unwrap()));
+        });
+        let r = answer
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the put-back waited for a writer that has ended");
+        assert_eq!((r.status, r.message.as_str()), (1, STOPPING), "{r:?}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "b\t2\n");
     }
 
     #[test]

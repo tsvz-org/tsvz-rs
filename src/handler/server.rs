@@ -44,7 +44,8 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
 /// An open connection: a handle on it, to end it when the handler stops, and whether a `pop` or
 /// `popitem` is in it, whose row is deleted once its answer is made: a stop does not cut it off
 /// before that answer is written, until [`FINISH`] has passed after the queue was written (a
-/// client that still reads nothing then is cut off, as it is at the first window).
+/// client that still reads nothing then is cut off, as it is at the first window, and its row is
+/// put back).
 struct Conn {
     stream: UnixStream,
     owes: bool,
@@ -53,8 +54,9 @@ struct Conn {
 /// What the connections and the stoppers share.
 struct Shared {
     stopping: AtomicBool,
-    /// Set once the stop has ended the connections and written every queued write: the accept
-    /// loop, which closes every connection it accepts meanwhile, then ends.
+    /// Set once the stop has ended the connections, made their put-backs and written and synced
+    /// every queued write: the accept loop, which closes every connection it accepts meanwhile,
+    /// then ends.
     finished: AtomicBool,
     /// Why the handler stops, said by serve once its accept loop ends: set by the one that
     /// claimed the stop (the idle timeout, a signal), under this mutex.
@@ -429,9 +431,9 @@ fn run(store: &Path, config: Config, restore: bool) -> Result<(), Error> {
         threads.extend(thread);
         reap(&mut threads);
     }
-    // Every queued write is written and every put-back made (`finish` waited for the connections'
-    // threads): the pointer file goes first, so that a command that finds the listener closed
-    // finds no handler (`tsvz stop` waits for this).
+    // Every put-back is made and every queued write written and synced (`finish` closed the engine
+    // once the connections' threads had ended): the pointer file goes first, so that a command
+    // that finds the listener closed finds no handler (`tsvz stop` waits for this).
     held.release();
     drop(listener); // the clients still in its queue find their connection closed
     let _ = std::fs::remove_dir_all(&dir);
@@ -481,28 +483,29 @@ pub const FINISH: Duration = Duration::from_secs(5);
 /// is read; the ones already read finish and are answered, and on Linux so do those already
 /// queued on a connection, which the shutdown leaves readable (macOS drops them). After
 /// [`FINISH`], every connection is cut off but those a `pop` or `popitem` is in: its row is
-/// deleted once its answer is made, so the answer is its only copy. Then the engine closes:
-/// requests not yet begun are refused, and every queued write is written and synced (§21.9.3), as
-/// long as that takes: the stop waited for it before as well. The pops' answers are given
-/// [`FINISH`] more to be written, then the rest is cut off: a row whose answer is cut off is put
-/// back on the files by its connection's thread ([`give_back`]). `finished` is set only once every
-/// connection's thread has ended, so that the pointer file goes after the put-backs, and a
-/// `tsvz stop` that returns, or a new `serve` that starts, finds them written. That wait has no
-/// bound beyond the writes' own: a cut connection's thread ends at once, but for the one write
-/// of a put-back.
+/// deleted once its answer is made, so the answer is its only copy. Then the engine refuses
+/// requests not yet begun, and every queued write is written, as long as that takes. The pops'
+/// answers are given [`FINISH`] more to be written, then the rest is cut off: a row whose answer
+/// is cut off is put back by its connection's thread ([`give_back`]) through the engine, whose
+/// writer goes on until every connection's thread has ended; then the engine is closed, its last
+/// writes synced (§21.9.3). `finished` is set only then, so that the pointer file goes after the
+/// put-backs, and a `tsvz stop` that returns, or a new `serve` that starts, finds them written.
+/// That wait has no bound beyond the writes' own: a cut connection's thread ends at once, but for
+/// the one write of a put-back.
 fn finish(shared: &Shared, engine: &Engine) {
     for conn in lock(&shared.open).values() {
         let _ = conn.stream.shutdown(std::net::Shutdown::Read);
     }
     settle(shared, |open| open.values().all(|c| c.owes));
     cut(shared, true);
-    engine.close();
+    engine.refuse_requests();
     settle(shared, HashMap::is_empty);
     cut(shared, false);
     // Counted as each is accepted and none is accepted once stopping: this ends.
     while lock(&shared.activity).0 > 0 {
         std::thread::sleep(Duration::from_millis(5));
     }
+    engine.close();
     shared.finished.store(true, Ordering::SeqCst);
     shared.wake();
 }
@@ -719,11 +722,11 @@ fn answer(
 /// Put back the row a `pop` or `popitem` took, when its answer, the row's only copy, could not be
 /// written (its client hung up, gave up waiting, or was cut off by a stop): `setdefault` of the
 /// row, which keeps a row written for its key since, as the command line puts back a row it could
-/// not print; on the files once a stop has closed the engine ([`Engine::put_back`]), which the stop
-/// waits for ([`finish`]: this thread has ended before the pointer file goes). Said on `serve`'s
-/// standard error: that it was put back as a notice (`-q` hides it), and the row taken as an error
-/// when it is not in its place (a row written since stays; the files could not be written), which
-/// `-q` shows: else the row is in no file and in no log.
+/// not print; through the engine, synced before it is said to be back, also during a stop
+/// ([`Engine::put_back`]), which closes the engine only once this thread has ended ([`finish`]).
+/// Said on `serve`'s standard error: that it was put back as a notice (`-q` hides it), and the
+/// row taken as an error when it is not in its place (a row written since stays; the files could
+/// not be written or synced), which `-q` shows: else the row is in no file and in no log.
 fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
     let Some(row) = response.lines.first() else {
         return;
@@ -749,11 +752,14 @@ fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
 }
 
 /// How long `tsvz stop` waits, from its request, for the handler to be gone. Once it has
-/// answered, a handler stops (`finish`): at most [`FINISH`] for the requests in flight,
-/// their writes, and [`FINISH`] more for the pops' answers; the 20 s beyond those two windows are
-/// room for the writes and syncs of a slow disk, and the put-backs. Measured on a local disk, two overlapping stops a
-/// round under 24 command lines: 300 stops took at most 0.15 s (median 0.06 s) with
-/// `#_write_ack_# memory`, and 300 at most 0.14 s (median 0.05 s) with `disk`.
+/// answered, a handler stops (`finish`): at most [`FINISH`] for the requests in flight (but one
+/// that holds the engine's mutex past it, a scrub or a read of a large store, is waited for to
+/// its end: a `tsvz stop` that gives up first exits 1, and the handler stops when the request
+/// ends), their writes, and [`FINISH`] more for the pops' answers; the 20 s beyond those two
+/// windows are room for the writes and syncs of a slow disk, the put-backs' among them. Measured
+/// on a local disk, two overlapping stops a round under 24 command lines: 300 stops took at most
+/// 0.15 s (median 0.06 s) with `#_write_ack_# memory`, and 300 at most 0.14 s (median 0.05 s)
+/// with `disk`.
 pub const STOP_WAIT: Duration = Duration::from_secs(2 * FINISH.as_secs() + 20);
 
 /// Ask the handler of `store` to stop and wait until it has (§21.13.2): Ok once its pointer file
@@ -1176,8 +1182,9 @@ mod tests {
     fn a_pop_s_row_is_put_back_or_printed_by_what_became_of_it() {
         // The row taken is said to have been put back only when its key reads it again; else it
         // is printed as an error (which `-q` does not hide), with the row its key reads: a row
-        // written since stays. Once a stop has closed the engine, it is put back on the files
-        // (0.2.3 put back nothing then), and printed when they cannot be written.
+        // written since stays. Once a stop has the engine refuse requests, it is still put back
+        // through the engine (0.2.3 put back nothing then, 0.2.4 on the files), and printed when the
+        // files cannot be written.
         use crate::Warning;
         let dir = tempfile::tempdir().unwrap();
         let notices = Arc::new(Mutex::new(Vec::new()));
@@ -1217,9 +1224,9 @@ mod tests {
             "{said:?}"
         );
         assert!(said[0].ends_with("the row taken was: b\t2"), "{said:?}");
-        // A closed engine (a stop has written its queue): put back on the files, synced.
+        // A stop has the engine refuse requests: put back through it all the same.
         let (third, fourth) = (taken("c"), taken("d"));
-        engine.close();
+        engine.refuse_requests();
         give_back(&engine, &third, &info);
         let notes = lock(&notices).clone();
         assert_eq!(notes.len(), 2, "{notes:?}");
@@ -1231,10 +1238,11 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         give_back(&engine, &fourth, &info);
+        // The last error: the write's own failure can come before it.
         let said = lock(&errors).clone();
-        assert_eq!(said.len(), 2, "{said:?}");
-        assert!(said[1].contains("it could not be put back ("), "{said:?}");
-        assert!(said[1].ends_with("): d\t4"), "{said:?}");
+        let last = said.last().unwrap();
+        assert!(last.contains("it could not be put back ("), "{said:?}");
+        assert!(last.ends_with("): d\t4"), "{said:?}");
         assert_eq!(lock(&notices).len(), 2);
     }
 
