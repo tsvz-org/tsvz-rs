@@ -80,7 +80,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   answer is: the row is gone and the command exits 1 (`lost the handler`), naming no row. (2) The answer is
   written and never read (the command is killed in between): the row is gone. When the answer cannot be written
   (the client hung up, gave up waiting, or did not read an answer too large for the socket's buffer before a stop cut it off), the handler puts the row
-  back (0.2.2 while it serves, 0.2.4 also while it stops, on the files; 0.2.1 lost it), unless a row was written
+  back (0.2.2 while it serves, 0.2.4 also while it stops; 0.2.1 lost it), unless a row was written
   for its key since, which stays (the row taken is then printed on `serve`'s standard error).
 - Why: the pop is delete, then answer; a written answer is all the handler can see.
 - Revisit when: TSVZ 5.19 resumes, with the TSVZ session: a client acknowledgement for `pop` and `popitem` (§21.7,
@@ -88,30 +88,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   acknowledgement (a handler that dies before it then leaves the row; one that dies after it and before the
   deletion leaves a row that was delivered); or accept (1) and (2) as a known limitation (the user's OK).
 - Noted: 2026-11-23, in the 0.2.1 final review; narrowed 2026-11-25 in 0.2.2 (the put-back on a failed write) and
-  in 0.2.4 (the put-back during a stop, on the files); a deferral under the user's standing rule that deferrals
-  are noted, not asked.
-
-### A stop's put-back of a cut-off `pop` is made on the files, beside the engine
-- Kind: deferred (0.2.5)
-- What the operator sees: nothing different from a put-back made while serving: a `pop` or `popitem` whose answer a
-  stop cuts off has its row put back with `setdefault` (which keeps a row written for its key since) before `tsvz
-  stop` returns. The stop makes it by a write path of its own, on the files, after the engine is closed
-  (`Engine::put_back`: a read of the files and an append, synced, one put-back at a time under the writer thread's
-  mutex), where a put-back while serving goes through the engine's queue. Two findings of 0.2.4's rounds were in
-  that path (a put-back made before the writer's last batch overwrote an acknowledged write: 13 of 3,000 forced
-  stops; two put-backs of one key both appended: 55 of 64), both fixed there; the path stays a part with an
-  interleaving of its own.
-- Why: `finish` closes the engine before it settles the pops' answers, so a cut-off pop's put-back finds the
-  engine closed. Closing it later needs the stop's order changed (its tests, the two forced-stop harnesses and a
-  review again), which is a change of its own, not a patch of the round that found the second finding.
-- The plan (0.2.5): `finish` closes the engine only after the connection threads have ended, with `begin` refusing
-  every request after the first cut (what the early close does today: a spared connection begins nothing new). A
-  cut-off pop's put-back then goes through the engine, under its state mutex and in its queue, as it does while
-  serving. The files path (about 35 lines), `close`'s wait for a second caller and the hold that makes the
-  put-backs one at a time (`Engine::end`) go, and the stop's last write is still the queue's, synced by `close`.
-- Revisit when: 0.2.5.
-- Noted: 2026-11-25, in 0.2.4's re-read (the step back after the second finding in the part); a deferral under the
-  user's standing rule that deferrals are noted, not asked.
+  in 0.2.4 (the put-back during a stop, on the files; through the engine since 0.2.5); a deferral under the user's
+  standing rule that deferrals are noted, not asked.
 
 ### A loose scrub does not follow a TSVZ.py reader given a one-column header for a multi-column file
 - Kind: known limitation

@@ -364,6 +364,8 @@ entries go last, in the same commit as the change:
   shutdown's own writer has ended (a flag that says closed is not that: wait for the end), as any other writer of the
   files would, and end the shutdown after the repair, not before; and make the repairs one at a time, each reading
   what the one before it wrote.
+- Reversed in part: 0.2.5 sends the repair through the writer, which ends after it ("A stop's put-back goes through
+  the engine's queue", below); ending the shutdown after the repairs, one at a time, still holds.
 
 ## 2026-11-25 A serve that takes over from a killed handler removes the socket it left
 - Changed: a `serve` that takes over a pointer file no process holds (its handler was killed) removes the socket the
@@ -420,3 +422,21 @@ entries go last, in the same commit as the change:
 - Lesson: when a rewrite must keep several readers' readings, run each reader's own decision over the lines, its
   state included, and keep a line where any of them needs it; a flag that stands for a reader is a second rule,
   and the step back after repeated findings asks what the flags approximate.
+
+## 2026-11-25 A stop's put-back goes through the engine's queue
+- Changed: at its cut, a stop has the engine refuse requests, as 0.2.4's close did, but the engine's writer goes on
+  until every connection's thread has ended, and a pop's put-back whose answer the stop cuts off goes through the
+  engine, under its mutex and in its queue, as while it serves; the engine is closed, its last writes synced, after
+  the put-backs. 0.2.4 closed the engine at the cut and made the put-back on the files, as any other writer, once the
+  writer had ended, one at a time under the writer thread's mutex. What an operator sees does not change.
+- Why we had to change: both of 0.2.4's findings in the stop were in that path (a put-back read before the queue's
+  last batch overwrote a write the handler had acknowledged, 13 of 3,000 forced stops; two put-backs of one key both
+  appended, 55 of 64), each an ordering the engine's mutex and queue make already; its re-read's step back chose to
+  remove the path rather than patch it a third time.
+- Original design was wrong because: it took the engine's close for one step, so the repairs the stop itself causes
+  came after the writer had ended and needed a write path of their own. Refusing requests and ending the writer are
+  two steps, and only the first has to come before the repairs.
+- Lesson: when a shutdown can cause the failure that a repair handles, make closing the door to new work and ending
+  the writer two steps, the repairs between them, and send the repairs through the writer's own queue: a second
+  write path beside the writer has every interleaving its queue already orders, and the fixes to it were orderings
+  the queue made already.
