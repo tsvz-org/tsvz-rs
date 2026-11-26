@@ -1346,6 +1346,20 @@ mod tests {
                 "Name\tv\na\t1\nName\t2\nb\t3\nName\t4\na\t5\n",
                 "Name\tv\na\t5\nName\t2\nb\t3\nName\t4\n",
             ),
+            // A key whose readers come apart a second time, and a third (the memory layout holds
+            // two lives of a key in the key's own block, and more in a box): its readers keep
+            // reading the lines they read. A scrub that grouped the third life's readers as the
+            // first's passed every row above and changed a followed reader's reading on random
+            // files.
+            (
+                "-\t\t\nb\t9\n-\t0\nb\tx\t1\n-\tx\t2\n-\t0\ts\n-\t7\n-\t0\tx\n",
+                "-\t\t\nb\t9\n-\t0\nb\tx\t1\n-\tx\t2\n-\t0\tx\n",
+            ),
+            // The same with `#_defaults_#`, and an unterminated last line: the file stays as it is.
+            (
+                "#Name\tv1\tv2\n0\nName\n0\t7\ny\tv\ny\n0\t2\ny\t7\n#_defaults_#\tv",
+                "#Name\tv1\tv2\n0\nName\n0\t7\ny\tv\ny\n0\t2\ny\t7\n#_defaults_#\tv",
+            ),
         ] {
             assert_eq!(scrub(input), output, "{input:?}");
         }
