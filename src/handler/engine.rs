@@ -331,7 +331,7 @@ fn sync(files: &[(PathBuf, u64, File)]) -> Result<(), Error> {
 enum Door {
     /// Every one.
     Open,
-    /// Only put-backs ([`Engine::put_back`]): a stop has cut its connections off
+    /// Only put-backs ([`Engine::put_back`]): a stop has cut off the connections no pop is in
     /// ([`Engine::refuse_requests`]); the writer goes on.
     PutBacks,
     /// None: the writer is ending, or has ended ([`Engine::close`]).
@@ -798,8 +798,11 @@ impl Engine {
                     record,
                     member_size,
                 } => {
+                    // A put-back is answered, and said to be back, only once it is synced: else a
+                    // failed sync would leave the row in no file and in no log.
+                    let sync = req.sync || put_back;
                     let queued =
-                        self.submit(st, arrived, &[record], req.sync, Some(member_size), true)?;
+                        self.submit(st, arrived, &[record], sync, Some(member_size), true)?;
                     (Engine::row(&key, &cells), queued)
                 }
             })
@@ -897,8 +900,8 @@ impl Engine {
     /// Put back the row a `pop` or `popitem` took, whose answer could not be written: `req` is the
     /// `setdefault` of it, which keeps a row written for its key since. Made as that request is,
     /// under the engine's mutex and through its queue, so that it reads every write queued before
-    /// it and the next put-back reads it: also once a stop has the engine refuse requests
-    /// ([`Engine::refuse_requests`]); refused once it is closed.
+    /// it and the next put-back reads it, and synced before it is answered: also once a stop has
+    /// the engine refuse requests ([`Engine::refuse_requests`]); refused once it is closed.
     pub(crate) fn put_back(&self, req: &Request) -> Response {
         self.change(req, Instant::now(), true)
     }
@@ -916,8 +919,8 @@ impl Engine {
     }
 
     /// Refuse every request but put-backs ([`Engine::put_back`]), as a stop does once it has cut
-    /// its connections off, and wait until every write queued is written. The writer goes on, for
-    /// the put-backs, until [`Engine::close`].
+    /// off the connections no pop is in, and wait until every write queued is written. The writer
+    /// goes on, for the put-backs, until [`Engine::close`].
     pub(crate) fn refuse_requests(&self) {
         {
             let mut st = lock(&self.state);
@@ -1820,6 +1823,23 @@ mod tests {
             answers[0], answers[1],
             "both read the row the first put back"
         );
+    }
+
+    #[test]
+    fn a_put_back_is_synced_before_it_is_answered() {
+        // Under `#_write_ack_# memory` too, while serving and once a stop refuses requests: what
+        // is said of it ("it was put back") is said of a row on the disk.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "b\t2\n").unwrap();
+        let e = engine(dir.path(), "s.tsvz");
+        let r = e.put_back(&parse("setdefault\tk\tv").unwrap());
+        assert_eq!((r.status, r.lines), (0, lines(&["k\tv"])));
+        assert!(e.batcher.unsynced().is_empty(), "synced with its batch");
+        e.refuse_requests();
+        let r = e.put_back(&parse("setdefault\tm\tv").unwrap());
+        assert_eq!((r.status, r.lines), (0, lines(&["m\tv"])));
+        assert!(e.batcher.unsynced().is_empty(), "synced with its batch");
     }
 
     #[test]

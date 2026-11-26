@@ -722,11 +722,11 @@ fn answer(
 /// Put back the row a `pop` or `popitem` took, when its answer, the row's only copy, could not be
 /// written (its client hung up, gave up waiting, or was cut off by a stop): `setdefault` of the
 /// row, which keeps a row written for its key since, as the command line puts back a row it could
-/// not print; through the engine, also during a stop ([`Engine::put_back`]), which closes the
-/// engine only once this thread has ended ([`finish`]). Said on `serve`'s
-/// standard error: that it was put back as a notice (`-q` hides it), and the row taken as an error
-/// when it is not in its place (a row written since stays; the files could not be written), which
-/// `-q` shows: else the row is in no file and in no log.
+/// not print; through the engine, synced before it is said to be back, also during a stop
+/// ([`Engine::put_back`]), which closes the engine only once this thread has ended ([`finish`]).
+/// Said on `serve`'s standard error: that it was put back as a notice (`-q` hides it), and the
+/// row taken as an error when it is not in its place (a row written since stays; the files could
+/// not be written or synced), which `-q` shows: else the row is in no file and in no log.
 fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
     let Some(row) = response.lines.first() else {
         return;
@@ -752,11 +752,14 @@ fn give_back(engine: &Engine, response: &Response, info: &InfoFn) {
 }
 
 /// How long `tsvz stop` waits, from its request, for the handler to be gone. Once it has
-/// answered, a handler stops (`finish`): at most [`FINISH`] for the requests in flight,
-/// their writes, and [`FINISH`] more for the pops' answers; the 20 s beyond those two windows are
-/// room for the writes and syncs of a slow disk, the put-backs' among them. Measured on a local disk, two overlapping stops a
-/// round under 24 command lines: 300 stops took at most 0.15 s (median 0.06 s) with
-/// `#_write_ack_# memory`, and 300 at most 0.14 s (median 0.05 s) with `disk`.
+/// answered, a handler stops (`finish`): at most [`FINISH`] for the requests in flight (but one
+/// that holds the engine's mutex past it, a scrub or a read of a large store, is waited for to
+/// its end: a `tsvz stop` that gives up first exits 1, and the handler stops when the request
+/// ends), their writes, and [`FINISH`] more for the pops' answers; the 20 s beyond those two
+/// windows are room for the writes and syncs of a slow disk, the put-backs' among them. Measured
+/// on a local disk, two overlapping stops a round under 24 command lines: 300 stops took at most
+/// 0.15 s (median 0.06 s) with `#_write_ack_# memory`, and 300 at most 0.14 s (median 0.05 s)
+/// with `disk`.
 pub const STOP_WAIT: Duration = Duration::from_secs(2 * FINISH.as_secs() + 20);
 
 /// Ask the handler of `store` to stop and wait until it has (§21.13.2): Ok once its pointer file
