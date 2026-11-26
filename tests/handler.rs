@@ -584,7 +584,10 @@ fn wait_for_a_writer_on(part: &Path) {
         }
     }
     #[cfg(not(target_os = "linux"))]
-    std::thread::sleep(Duration::from_millis(200));
+    {
+        let _ = part; // no list to find its writer in
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[test]
