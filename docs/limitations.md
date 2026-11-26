@@ -79,7 +79,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   are left. (1) The handler's process dies (killed, out of memory) after the deletion is written and before the
   answer is: the row is gone and the command exits 1 (`lost the handler`), naming no row. (2) The answer is
   written and never read (the command is killed in between): the row is gone. When the answer cannot be written
-  (the client hung up, gave up waiting, or did not read it before a stop cut it off), the handler puts the row
+  (the client hung up, gave up waiting, or did not read an answer too large for the socket's buffer before a stop cut it off), the handler puts the row
   back (0.2.2 while it serves, 0.2.4 also while it stops, on the files; 0.2.1 lost it), unless a row was written
   for its key since, which stays (the row taken is then printed on `serve`'s standard error).
 - Why: the pop is delete, then answer; a written answer is all the handler can see.

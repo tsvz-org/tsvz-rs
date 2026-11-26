@@ -353,8 +353,14 @@ entries go last, in the same commit as the change:
   of the pop's lost row).
 - Original design was wrong because: the put-back went through the engine alone, and the stop closes the engine
   before it waits for the pops' answers, so the put-backs the stop itself causes had no writer left.
+- Found wrong at the final review: the first build made the put-back as soon as the engine was marked closed,
+  before its writer had written the queue (a read of the files before the queue's last batch and an append after it
+  overwrote a write the handler had acknowledged: 13 of 3,000 forced stops), and removed the pointer file before the
+  put-backs were made (a `tsvz stop` that returned, or a new `serve`, found them not yet written). `Engine::close` now
+  returns only once the writer has ended, for every caller, and the stop ends after the last connection's thread.
 - Lesson: when a shutdown can cause the failure that a repair handles, leave the repair a way to write after the
-  shutdown's own writer has closed (as any other writer of the files would), and end the shutdown after it.
+  shutdown's own writer has ended (a flag that says closed is not that: wait for the end), as any other writer of the
+  files would, and end the shutdown after the repair, not before.
 
 ## 2026-11-25 A serve that takes over from a killed handler removes the socket it left
 - Changed: a `serve` that takes over a pointer file no process holds (its handler was killed) removes the socket the
@@ -366,12 +372,12 @@ entries go last, in the same commit as the change:
   one that learns the handler is gone is the next one to take over its pointer file.
 - Lesson: leave the clean-up of what a killed process made to whoever next finds it dead by the kernel's word (its
   lock let go of), and remove only what that process's own layout makes and the system shows unused (a refused
-  connection), since the record that names it is a file others can write.
+  connection), since the record that names it can be a file someone else put there.
 
 ## 2026-11-25 A loose file tsvz-rs creates begins with the empty line 1 TSVZ.py writes
 - Changed: `set`, `append`, `setdefault` and `delete` on a missing loose file create it with an empty line 1 (a
   newline; compressed, inside the first member), as TSVZ.py creates one; 0.2.3 wrote the first row as line 1, and
-  `delete` left the file empty. A file that exists, empty, gets none, as in TSVZ.py.
+  `delete` left the file empty. A file that exists and holds no byte gets none, as in TSVZ.py.
 - Why we had to change: a TSVZ.py program that reads the file with a header took its first row for the header
   (0.2.2's final review, F6).
 - Original design was wrong because: 0.2.2 wrote TSVZ.py's line 1 where a `clear` makes it, and left the other place
