@@ -890,6 +890,10 @@ impl Engine {
             return response;
         }
         self.close();
+        // One put-back on the files at a time, each reading what the one before it wrote: two
+        // pops of one key whose answers a stop cut off both found the key gone, and both
+        // appended.
+        let _alone = lock(&self.thread);
         let (key, values) = (&req.args[0], &req.args[1..]);
         let options = Options {
             scope: Scope::Keys(vec![key.clone()]),
@@ -1792,6 +1796,47 @@ mod tests {
         let back = putter.join().unwrap();
         assert_eq!((back.status, back.lines), (0, lines(&["k\tnew"])));
         assert_eq!(fs::read_to_string(&p).unwrap(), "b\t2\nk\tnew\n");
+    }
+
+    #[test]
+    fn two_put_backs_of_one_key_on_the_files_are_made_one_at_a_time() {
+        // Two pops of one key whose answers a stop cut off both put their row back on the closed
+        // engine's files: each read the key gone and both appended, the later row won, and both
+        // said it was put back (0.2.4's re-read: 55 of 64 forced stops). Here the part's lock is
+        // held, so that two put-backs that are not made one at a time both read the files (no
+        // `k`) and both wait for the lock, and a pair that is made one at a time has one waiting
+        // for the other, which gets as long as it takes a thread that is not starved to reach
+        // the lock (1 s): the second then reads the first's row, writes nothing, and says it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.tsvz");
+        fs::write(&p, "b\t2\n").unwrap();
+        let e = Arc::new(engine(dir.path(), "s.tsvz"));
+        e.close();
+        let file = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let held = crate::lock::lock(&file).unwrap();
+        let putters: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|v| {
+                let e = e.clone();
+                let back = parse(&format!("setdefault\tk\t{v}")).unwrap();
+                std::thread::spawn(move || e.put_back(&back))
+            })
+            .collect();
+        let end = Instant::now() + std::time::Duration::from_secs(1);
+        while crate::lock::waiters_on(&p) < 2 && Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(held);
+        let answers: Vec<_> = putters
+            .into_iter()
+            .map(|t| t.join().unwrap().lines)
+            .collect();
+        let text = fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("\nk\t").count(), 1, "{text:?}");
+        assert_eq!(
+            answers[0], answers[1],
+            "both read the row the first put back"
+        );
     }
 
     #[test]

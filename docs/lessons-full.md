@@ -358,15 +358,18 @@ entries go last, in the same commit as the change:
   overwrote a write the handler had acknowledged: 13 of 3,000 forced stops), and removed the pointer file before the
   put-backs were made (a `tsvz stop` that returned, or a new `serve`, found them not yet written). `Engine::close` now
   returns only once the writer has ended, for every caller, and the stop ends after the last connection's thread.
+  And at its re-read: two put-backs of one key, made at once after the stop's writer had ended, both read the key
+  gone and both appended (55 of 64 forced stops); they are made one at a time.
 - Lesson: when a shutdown can cause the failure that a repair handles, leave the repair a way to write after the
   shutdown's own writer has ended (a flag that says closed is not that: wait for the end), as any other writer of the
-  files would, and end the shutdown after the repair, not before.
+  files would, and end the shutdown after the repair, not before; and make the repairs one at a time, each reading
+  what the one before it wrote.
 
 ## 2026-11-25 A serve that takes over from a killed handler removes the socket it left
 - Changed: a `serve` that takes over a pointer file no process holds (its handler was killed) removes the socket the
-  file names, and then the directory made for it if empty, when the socket is this user's, on this host, named `s`
-  in a `tsvz-` directory, and nobody listens on it (a connection to it is refused). 0.2.3 left both for good, under
-  `$XDG_RUNTIME_DIR` or the temporary directory.
+  file names, and then the directory made for it if empty, when the pointer file and the socket are this user's, on
+  this host, named `s` in a `tsvz-` directory, and nobody listens on it (a connection to it is refused). 0.2.3 left
+  both for good, under `$XDG_RUNTIME_DIR` or the temporary directory.
 - Why we had to change: each handler that was killed left a directory behind (0.2.2's build).
 - Original design was wrong because: the clean-up was in the handler's own stop, and a killed process runs none; the
   one that learns the handler is gone is the next one to take over its pointer file.
